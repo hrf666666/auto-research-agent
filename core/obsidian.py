@@ -126,7 +126,7 @@ class ObsidianExporter:
                 current = "milestones"
             elif stripped == "## Recent Decisions":
                 current = "decisions"
-            elif stripped.startswith("["):
+            elif stripped.startswith("[") or stripped.startswith("★"):
                 if current == "milestones":
                     milestones.append(stripped)
                 elif current == "decisions":

@@ -392,6 +392,7 @@ python -m core.loop --project .   # Restart from scratch
 | `/paper-analyze ARXIV_ID` | Deep paper analysis |
 | `/conf-search --venue CVPR2025 --query "xxx"` | Conference search |
 | `/progress-report` | Generate report |
+| **Auto: paper-research** | Agent triggers deep literature search when stuck (internal) |
 | `echo "instruction" > workspace/HUMAN_DIRECTIVE.md` | Redirect agent |
 | `python install.py --uninstall` | Remove all skills |
 

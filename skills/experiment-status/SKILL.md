@@ -40,6 +40,16 @@ Train ViT-B/16 on ImageNet to 78%+ accuracy
 ## Latest Training Log
 Epoch 45/90 | loss: 2.134 | acc: 77.1% | lr: 1.2e-4
 
+## Dead Ends (⚠️ Do Not Retry)
+| Method | Lesson |
+|--------|--------|
+| ViT lr=1e-3 | lr > 5e-4 不适合 ViT，训练发散 |
+
+## Active Problems
+| Problem | Severity | Status |
+|---------|----------|--------|
+| 跨域泛化不足 | P1 | 进行中 |
+
 ## Recent Decisions
 1. [04-08 14:45] Target reached with mixup, trying stronger augmentation
 2. [04-08 06:00] Cosine schedule helped, adding regularization

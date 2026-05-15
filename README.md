@@ -12,8 +12,7 @@
 <p align="center">
   <a href="README.md">English</a> |
   <a href="docs/README_CN.md">中文</a> |
-  <a href="docs/README_JP.md">日本語</a> |
-  <a href="docs/README_KR.md">한국어</a>
+
 </p>
 
 <p align="center">
@@ -36,6 +35,306 @@
 ---
 
 ## Recent Updates
+
+**2026-05-13 (v11) — Simulation Sandbox: Pre-Training Model Validation & A/B Evaluation**
+
+### Problem Solved
+Agent修改模型后直接训练，无法回答：
+1. **修改有没有用？** — 加了模块但模块可能根本没激活
+2. **和修改前比怎样？** — 参数量翻了倍但指标没变
+3. **能不能继续放大？** — 不知道瓶颈在哪，盲目扩展导致OOM
+4. **是否背离项目初衷？** — PROJECT_BRIEF说要解决X，修改却在优化Y
+
+### New Module
+- **`core/simulation_sandbox.py`** (~600 lines): 5层评价体系
+
+| Layer | Name | When | What |
+|-------|------|------|------|
+| 0 | Feasibility Check | PRE-VERIFY | 模型能不能跑？shape对不对？GPU够不够？ |
+| 1 | Design Comparison | REFLECT | A/B结构对比：参数变化、模块占比、信息瓶颈 |
+| 2a | Reference Evaluation | REFLECT | vs GT指标 + vs 修改前指标 + 参数效率 |
+| 2b | Internal Behavior | REFLECT | 模块活性/贡献度/梯度健康/参数利用率 |
+| 3 | Synthesis Judgment | REFLECT | 综合判定：有效/部分/无效/有害 + 项目初衷对齐 |
+| 4 | Scaling Guidance | REFLECT | 可扩展模块/瓶颈/显存预算/规模扩展建议 |
+
+### Key Design Decisions
+- **Model snapshots**: 每次PRE-VERIFY自动保存当前模型快照到`model_snapshots/`，下一cycle的A/B对比用
+- **Verdict caching**: 评价结果缓存到`_sandbox_last_verdict.json`，下一cycle的THINK阶段读取作为设计指引
+- **Subprocess isolation**: 所有模型运行都在subprocess中，主循环不受影响
+- **Format as prompt**: `format_report_prompt()` 将结构化数据转换为LLM可理解的中文prompt
+
+### Context Keys Added
+- THINK: `sandbox_design_guidance` (from previous cycle's scaling guidance)
+- REFLECT: `sandbox_evaluation` (full 5-layer report)
+
+**2026-05-13 (v10) — Constraint Engine: LLM Behavior Control**
+
+### Problem Solved
+LLMs as agent brains have three critical weaknesses that no amount of prompt engineering can fix:
+- **Hallucination**: Claims to have done things it didn't actually do
+- **Metric Fabrication**: Reports great metrics while the model outputs garbage
+- **Corner-cutting**: Skips difficult modules, uses stub/empty implementations
+
+v10 introduces **hard verifiable constraints** — every check is machine-verifiable, not relying on LLM self-reporting.
+
+### New Module
+- **`core/constraint_engine.py`** (~580 lines): 6 constraint mechanisms:
+
+| # | Mechanism | Phase | LLM Problem Addressed |
+|---|-----------|-------|-----------------------|
+| 1 | **PlannerChecker** | REFLECT | Code Agent freelancing — implements different architecture than planned |
+| 2 | **StrategyConstraintEngine** | THINK | Repeating failed approaches, ignoring historical lessons |
+| 3 | **QuickBenchmark** | REFLECT | Metric fabrication — reported metrics don't match actual computation |
+| 4 | **AdaptiveThresholds** | THINK | Fixed thresholds causing false diagnoses on different metric scales |
+| 5 | **ImplementationTracker** | THINK+REFLECT | "Pretending to be done" — skipping planned modules silently |
+| 6 | **ContextPruner** | THINK+REFLECT | Information overload causing LLM confusion (30+ keys → top 20) |
+
+### How It Works
+
+**PlannerChecker**: Scans `models/*.py` AST to find all `nn.Module` subclasses and `self.xxx = SomeModule()` assignments. Fuzzy-matches against planned module names. Detects stub patterns: `pass` bodies, `NotImplementedError`, hardcoded return values, `forward()` shorter than 5 lines. Generates `PlanComplianceReport` with compliance score (0-1) and fabrication risk rating.
+
+**StrategyConstraintEngine**: Reads SQLite history (hypothesis calibration, dead ends, Pareto frontier) and generates executable constraint rules. Example: "edge loss failed 5 times → FORBIDDEN", "hypothesis accuracy < 30% → must cite evidence before proposing experiments". Rules persist in `STRATEGY_RULES.json`. Violations are checked after THINK dispatch and injected back into memory.
+
+**QuickBenchmark**: Loads model checkpoint, runs forward pass on random input (dynamic shape inference from state_dict). Compares output statistics against reported metrics. Flags discrepancy > 20% as anomaly. Runs as subprocess with 120s timeout, never blocks the main loop.
+
+**AdaptiveThresholds**: Reads `best_metric`/`worst_metric` from SQLite, auto-calibrates all diagnostic thresholds relative to actual metric range (e.g., `domain_gap_critical = range * 0.8`). Falls back to sensible defaults when no history exists.
+
+**ImplementationTracker**: Persistent JSON tracking of planned module status across cycles (`pending → implemented → verified`). Updated by PlannerChecker compliance reports. Injects "STILL PENDING: [ModuleB, ModuleC]" prompt to force Leader to complete before adding new features.
+
+**ContextPruner**: 4-tier priority system (always > situational > conditional > rare). Trims context dict to 20 keys max before dispatching to LLM. Ensures critical constraints aren't drowned out by low-priority information.
+
+### Context Key Registry Update
+- THINK keys: 19 → 21 (added `adaptive_thresholds`, `implementation_progress`)
+- REFLECT keys: 24 → 27 (added `plan_compliance_warning`, `quick_benchmark_warning`, `implementation_progress`)
+- Total: 48 registered context keys with validation
+
+### Bug Fixes (v9→v10)
+- **`memory.py` dead code bug (CRITICAL)**: `__init__` initialization code (`mkdir`, `_init_log()`, `_init_db()`) was unreachable after `return []` in `_infer_domain_keys()` — persistent memory system silently failed
+- **`experiment_evaluator.py` hardcoded input shapes**: `IndependentProbe` had `(1, 81, 3, 64, 64)` — replaced with dynamic inference from state_dict
+- **`loop.py` `_last_architecture_plan` never assigned**: Architecture plan generated but thrown away each cycle, so `_reflect()` always re-generated
+- **`verifier.py`/`loop.py` private attribute access**: `VerifyReport._independent_assessment` → formal `independent_assessment` dataclass field
+- **13 silent `except Exception: pass` blocks** in `loop.py` → replaced with `logger.warning/debug`
+- **`idea_planner.py` dependency chains**: Secondary pattern modules incorrectly depended on previous module instead of backbone
+
+### Module Size After v10
+
+| Module | v8 | v9 | v10 | v11 |
+|--------|-----|-----|------|------|
+| `core/tools.py` | 1,667 | 1,740 | 1,739 | 1,739 |
+| `core/loop.py` | 2,268 | 2,355 | ~2,450 | ~2,660 |
+| `core/verifier.py` | 2,010 | 2,099 | 2,102 | 2,102 |
+| `core/model_analyzer.py` | 2,282 | 2,323 | 2,323 | 2,323 |
+| `core/memory.py` | 831 | 852 | 852 | 852 |
+| `core/visual_analyzer.py` | 853 | 853 | 848 | 848 |
+| `core/idea_planner.py` | (new) | 1,053 | 1,053 | 1,053 |
+| `core/experiment_evaluator.py` | (new) | 786 | 784 | 784 |
+| `core/constraint_engine.py` | — | — | ~580 | ~580 |
+| `core/context_keys.py` | — | — | 194 | 194 |
+| `core/simulation_sandbox.py` | — | — | — | ~600 |
+| `core/domain_knowledge.py` | 559 | 559 | 559 | 559 |
+| `core/mcp_client.py` | 724 | 724 | 724 | 724 |
+| **Total** | **~13,307** | **~15,244** | **~16,604** | **~17,204** |
+
+**2026-05-13 (v9) — Forward Design Pipeline, Post-Experiment Evaluation & Domain-Agnostic Cleanup**
+
+### New Modules
+- **`core/idea_planner.py`** (1053 lines): `IdeaPlanner` — 9-phase forward design pipeline that generates PhD-level architecture plans from `PROJECT_BRIEF.md` before any model code is written:
+  - Idea Formalization → Module Decomposition → Capacity Planning → Fusion Strategy → Integration Plan → Verification Plan → Risk Assessment → Implementation Order → Alignment Score
+  - `IDEA_PATTERNS` database: 6 generic architectural patterns (multi_branch_fusion, frequency_domain_analysis, domain_adaptive, component_aware, attention_mechanism, progressive_refinement)
+  - Vocabulary-to-concept mapping for innovation detection (natural language terms → abstract concept categories)
+- **`core/experiment_evaluator.py`** (786 lines): Three post-experiment analysis classes:
+  - `ExperimentEvaluator`: Plan-vs-result comparison, 5-type failure diagnosis (architecture/data/training/alignment/capacity), priority-sorted iteration guidance
+  - `IndependentProbe`: Third-party verification using model checkpoint + forward pass on random input to detect output anomalies (collapsed, NaN, range mismatch)
+  - `IterationGuidance` + `FailureDiagnosis`: Structured analysis with root cause chain and actionable next-step recommendations
+
+### Pipeline Integration
+- **`plan_model` tool** registered in ToolRegistry — Leader and Code Agent can invoke architecture planning
+- **THINK phase** (cycle ≤ 1): Auto-injects `architecture_plan` + `architecture_plan_summary` context from IdeaPlanner
+- **REFLECT phase**: Auto-injects `experiment_evaluation` + `iteration_guidance_prompt` + `independent_assessment_warning` from ExperimentEvaluator
+- **VERIFY phase**: New Layer 10 (`_verify_independent_probe`) runs IndependentProbe as third-party assessment
+- **Agent prompts** (`leader.md`, `code_agent.md`): Added plan_model usage guide, post-evaluation response table, independent assessment handling
+
+### Domain-Agnostic Hardcoding Cleanup
+Systematic removal of all project-specific hardcoding across 10 files. The principle: **only knowledge organization methods may be hardcoded; project-specific data/scenarios must be dynamic**.
+
+- **Agent prompts** (`agents/*.md`): All project-specific examples generalized (EPI/Lambertian/HCInew/UnifiedLFDataset/81-angular-views → generic domain/method/dataset language)
+- **`core/loop.py`**: Cross-domain analysis from hardcoded metric names → dynamic `self.memory.domain_keys` + pattern scanning; domain breakdown prompts → generic
+- **`core/verifier.py`**: Dataset→domain mapping from hardcoded dict → `DATASET_MANIFEST.json` `type` field + heuristic fallback; class discovery from hardcoded list → AST-based dynamic scanning
+- **`core/model_analyzer.py`**: Default input shape from `[1,81,3,64,64]` → `_infer_input_shape()` reading Conv3d/Conv2d `in_channels`; assumption descriptions → generic scientific knowledge
+- **`core/memory.py`**: Default keywords/domains from depth-estimation-specific → `_default_method_keywords()` / `_infer_domain_keys()` reading manifest
+- **`core/visual_analyzer.py`**: Removed inference script hardcoding; domain gap examples → generic
+- **`core/idea_planner.py`**: Added docstrings explaining vocabulary-to-concept mapping design principle; fixed duplicate domain entry
+
+### Knowledge Organization Architecture (6 Layers)
+1. **Static prompts** (`agents/*.md`): Generic workflow guidance, now zero project-specific references
+2. **Persistent memory** (`MEMORY_LOG.md` + SQLite): Accumulated experimental results and dead ends
+3. **Domain knowledge** (`METHOD_PROPERTIES`): Generic scientific method properties (assumptions, failure symptoms, alternatives)
+4. **Architecture patterns** (`IDEA_PATTERNS`): 6 reusable architectural patterns for plan generation
+5. **Runtime context injection** (27 keys in `loop.py`): Dynamic knowledge from project state (manifest, metrics, plan, evaluation)
+6. **Tool chain knowledge**: `domain_knowledge.py`, `idea_planner.py`, `experiment_evaluator.py` as organizational methods
+
+### Module Size After v9
+
+| Module | v8 | v9 |
+|--------|-----|-----|
+| `core/tools.py` | 1,667 | 1,740 |
+| `core/loop.py` | 2,268 | 2,355 |
+| `core/verifier.py` | 2,010 | 2,099 |
+| `core/model_analyzer.py` | 2,282 | 2,323 |
+| `core/memory.py` | 831 | 852 |
+| `core/visual_analyzer.py` | 853 | 853 |
+| `core/idea_planner.py` | (new) | 1,053 |
+| `core/experiment_evaluator.py` | (new) | 786 |
+| `core/domain_knowledge.py` | 559 | 559 |
+| `core/mcp_client.py` | 724 | 724 |
+| **Total** | **~13,307** | **~~15,244** |
+
+**2026-05-13 (v8) — Architectural Refactoring & Research Intelligence**
+
+This version addresses fundamental limitations identified through a comprehensive capability assessment. Key changes fall into two categories: code architecture refactoring and research intelligence improvements.
+
+### Code Architecture Refactoring
+- **`core/tools.py` split** (4714 → 1667 lines): Extracted ~3000 lines into two new mixin modules:
+  - `core/mcp_client.py` (724 lines): `MCPClientMixin` — all MCP transport logic (SSE + stdio), service detection, vision tools, image analysis
+  - `core/model_analyzer.py` (2282 lines): `ModelAnalyzerMixin` — all 9 layers of AST analysis, data flow tracing, bottleneck detection, gradient path analysis, structural soundness scoring, domain assumption detection, idea-architecture alignment, decoder adequacy, runtime model probe, diagnostic script generation, ablation experiment design
+- **`core/loop.py` split** (2550 → 2268 lines): Extracted into:
+  - `core/domain_knowledge.py` (559 lines): `DomainKnowledgeMixin` — domain knowledge injection and cross-experiment meta-pattern analysis
+- **`ToolRegistry` now inherits `MCPClientMixin` + `ModelAnalyzerMixin`**; `ResearchLoop` now inherits `DomainKnowledgeMixin`
+- **`visual_analyzer.py` duplicate MCP code removed**: `_call_zai_direct_spawn` (132 lines) deleted — always uses `ToolRegistry`'s MCP session instead of spawning a separate subprocess
+- **`memory.py` domain keywords configurable**: `MemoryManager.__init__` accepts `method_keywords` and `domain_keys` parameters for cross-domain reuse
+- **`gpu/keeper.py` labeled**: Docstring clearly marks as standalone utility not used by core research loop
+- **Bug fixes**: `_find_last_assistant_text` handles tool_calls-only messages, `_tail_file` returns `list` not `deque`, `_get_gpu_status` always returns `"gpus"` key
+
+### Research Intelligence Improvements
+- **Dynamic domain knowledge** (replaces hardcoded logic): `domain_knowledge.py` no longer contains project-specific hardcoded domain mappings. Instead:
+  - `METHOD_PROPERTIES` database: 7 generic method entries (EPI, FFT, attention, ResNet, sigmoid, Conv3D, contrastive) with scientific knowledge only (assumptions, failure symptoms, alternatives)
+  - `_infer_domain_compatibility()`: Dynamically infers method-domain compatibility from PROJECT_BRIEF text using violation condition matching
+  - `_extract_data_constraints()`: Detects data scarcity (< 10 training samples) and data imbalance from brief text
+  - `_detect_implemented_methods()`: Scans `models/` directory to detect which methods are actually implemented in code
+  - `_extract_domain_names()`: Generic domain name extraction (Lambertian, Non-Lambertian, Mixed, outdoor, indoor, etc.)
+- **Idea Guardian** (leader.md + loop.py): Every 5 cycles, forces the Leader to re-read PROJECT_BRIEF phase goals, rate progress on core idea implementation (0-10), phase completion (0-10), and data-first verification (0-10). Any score < 5 triggers a mandatory course correction instead of another training run
+- **Direction Circuit Breaker** (loop.py): When `_direction_stagnation_count` exceeds threshold, injects a `direction_circuit_breaker` context forcing the Leader to re-evaluate the research direction and record the current direction as a dead end
+- **Data Analysis Experiment support** (code_agent.md): New section explicitly supports non-training experiments — data feasibility verification, Phase 1 analysis, assumption validation. Uses `run_shell` not `launch_experiment`
+- **Data Scarcity Awareness** (leader.md + loop.py): When `data_constraints` detects < 10 training samples for a domain, the Leader is instructed NOT to propose architecture changes (hard wall) and to focus on data augmentation, transfer learning, or accepting the limitation
+
+### Module Size After Refactoring
+
+| Module | Before | After |
+|--------|--------|-------|
+| `core/tools.py` | 4,714 | 1,667 |
+| `core/loop.py` | 2,550 | 2,268 |
+| `core/visual_analyzer.py` | 985 | 853 |
+| `core/mcp_client.py` | (new) | 724 |
+| `core/model_analyzer.py` | (new) | 2,282 |
+| `core/domain_knowledge.py` | (new) | 559 |
+| **Total** | **~13,000** | **~13,307** |
+
+**2026-05-12 (v7) — Idea-Architecture Alignment Analysis**
+- **Layer 9: Idea-Architecture Alignment** (new in `analyze_model`): Compares model architecture against `PROJECT_BRIEF.md` to verify the core research idea is faithfully implemented. This catches a critical class of errors where the agent builds a model that loosely follows the idea but structurally under-represents key innovations.
+  - **Idea Component Detection**: Parses PROJECT_BRIEF for 10 key patterns (angular frequency, dual mask, EPI, BRDF, component-aware depth, non-Lambertian handling, attention, adaptive fusion, etc.) and maps them to model branches.
+  - **Channel Allocation Analysis**: Computes per-branch channel ratios and flags when a KEY INNOVATION branch gets < 15% of fusion channels (the "FFT is only 9%" problem). Provides specific improvement suggestions (e.g., "INCREASE fft_branch from 32 to ~72 channels").
+  - **Structural Gap Detection**: Checks for missing architectural patterns implied by the idea (skip connections, multi-scale processing, attention for multi-branch fusion). Only flags patterns relevant to the specific idea.
+  - **Decoder Adequacy Analysis**: Evaluates decoder depth, skip connections, and domain-awareness. Warns when a shallow decoder must handle large fusion inputs or when the idea requires domain prediction but the model lacks it.
+  - **Alignment Score (0-10)**: Deducts points for missing idea components (-3 for high-importance), under-represented branches (-2), missing structural patterns (-1). Provides an overall assessment with specific action guidance.
+- **Enhanced Branch Detection**: `_extract_branch_info` now traces into custom class definitions (e.g., `AngularFFTBranch`) to find output channel counts, rather than only supporting direct `nn.Conv2d`/`nn.Sequential` calls. Also matches `center_*` pattern.
+- **Leader Prompt v7**: Added "Idea-Architecture Alignment" section requiring `analyze_model` after model creation/modification. Provides action guidance based on alignment score (< 5: major revision, 5-7: address top findings, ≥ 8: focus on training).
+- **Code Agent Prompt v7**: Updated Step 1.5 with idea-alignment guidance — must check `idea_architecture_alignment` section before coding, verify key innovation branches have sufficient channel allocation.
+
+**2026-05-12 (v6) — PhD-Level Research Capabilities**
+- **Training Curve Analysis**: VERIFY now performs rich training curve diagnostics beyond simple "loss decreasing?": detects overfitting (loss rises after minimum), oscillation (direction change ratio), convergence speed (too slow = under-capacity), and plateau detection (flat loss for extended periods). Results injected into REFLECT for the Leader.
+- **Pareto Frontier Tracking**: New `pareto_matrix` SQLite table tracks method×domain MAE across all experiments. Automatically identifies Pareto-optimal methods (best for at least one domain) and dominated methods (never best). Injected into THINK so the Leader avoids repeating suboptimal methods.
+- **`generate_diagnostic` Tool** (new): Generates targeted diagnostic scripts based on natural language questions. Unlike `probe_model` (random data), this creates scripts that answer specific questions like "Is the FFT branch dead for Non-Lambertian inputs?" or "What do EPI slopes look like on specular surfaces?" Four diagnostic types: domain_analysis, branch_analysis, gradient_analysis, attention_analysis.
+- **`design_ablation` Tool** (new): AST-based systematic ablation experiment design. Identifies all model components (branches, backbone, heads, fusion, normalization), groups by functional category, and generates prioritized ablation experiments (component removal, freeze, single-branch, fusion replacement) with estimated information value. Available to Code agent.
+- **Experiment Value of Information (VOI)**: Before running experiments, the system estimates the value of information (expected_improvement × success_probability). Low-VOI experiments get a warning. Tracks calibration (how often hypotheses are actually correct) to improve future estimates.
+- **Structured Meta-Pattern Learning**: `_build_cross_experiment_insights` now uses structured SQLite queries (`get_method_domain_effect_matrix`, `get_stuck_domains_structured`) instead of fragile regex on markdown text. Falls back to regex only if database is empty. Detects dominant methods, hypothesis accuracy trends, and calibration feedback.
+- **Adaptive Experiment Granularity (Pilot Experiments)**: High-risk hypotheses (prior probability < 0.4) automatically get a pilot experiment recommendation (2-3 epochs). Low-value experiments get warnings. Injected into task descriptions.
+- **Causal Chain Tracking**: New `causal_chain` SQLite table records design_decision → architectural_property → metric_affected links. THINK records expected effects, REFLECT updates with actual effects. History injected into THINK so the Leader avoids repeating failed causal chains.
+- **New SQLite Tables**: `pareto_matrix`, `causal_chain`, `experiment_value` — all with indexes for efficient queries.
+- **Leader Prompt v6**: Added sections for Pareto frontier awareness, experiment value estimation, pilot experiments, causal chain tracking, and training curve analysis interpretation.
+
+**2026-05-11 (v5) — Deep Model Analysis & Runtime Diagnostics**
+- **`analyze_model` Deep Architecture Analysis**: Upgraded from surface-level AST analysis to 8-layer deep analysis: (1) parameter counts, (2) data flow graph, (3) information bottleneck detection (compression ratio > 8:1), (4) gradient path analysis, (5) structural soundness scoring (0-10), (6) domain assumption detection (EPI→Lambertian, FFT→frequency stability, etc.), (7) data feasibility + GPU memory, (8) result-to-architecture diagnosis. Available to Leader, Code, and Researcher agents.
+- **`probe_model` Runtime Diagnostics** (new tool): Instantiates the model, runs forward+backward with dummy data, captures REAL tensor statistics — activation mean/std/dead_ratio per module, gradient norms per module, gradient balance analysis (detects > 100x imbalance), input sensitivity testing (detects output collapse), and parameter distribution. Can optionally load trained checkpoint for post-training diagnosis. This closes the gap between static analysis and real model behavior.
+- **Result→Architecture Feedback Loop**: When domain gap > 0.10 (e.g., Non-Lambertian MAE 2x worse than Lambertian), REFLECT now injects a mandatory reasoning chain: identify the worst domain → state the architectural assumption → verify if the assumption holds → diagnose root cause → propose fix. Explicitly forbids incremental tuning for structural problems.
+- **Hypothesis Pre-Validation (THINK Step 6)**: Before any architectural change, the Leader must state the core assumption, check if it holds in the data, pre-validate via `analyze_model`, and define the minimum experiment.
+- **Code Agent Structural Analysis (Step 1.5 & 1.6)**: Code agent must run `analyze_model` before modifying architectures (check structural score, bottlenecks, dead branches). After failed training, must run `probe_model` to get runtime evidence (dead activations, gradient-dead branches, output collapse).
+- **VERIFY Layer 9 — Model Structural Soundness**: New verification layer detects dead modules (declared in `__init__` but unused in `forward()`) and multi-branch fusion warnings.
+- **Bug Fixes**: `import ast` missing in verifier.py (Layer 9 was silent NameError), `_check_model_fusion_balance` was no-op (now produces warnings), WORKER_CONFIGS tool lists synced with actual `get_tools_for()`, NaN values filtered in domain gap calculation, duplicate Step 3.5 in leader.md renamed to Step 3.6.
+
+**2026-05-11 (v4) — Agent Capability Upgrade**
+- **Output Quality Awareness**: Agent now tracks per-domain metrics and detects when experiments produce "successful bad results" (e.g., Non-Lambertian MAE degrades from 0.30 to 0.41). Two consecutive quality degradations force paper research with hypothesis validation.
+- **Forced Visual Analysis**: When any domain MAE exceeds 0.35, visual analysis is triggered immediately regardless of streak count. The agent MUST visually inspect its own predictions.
+- **Strategic Abandonment**: Research direction stagnation detection — same direction for 3+ cycles without improvement forces paper research for fundamentally different approaches.
+- **Infrastructure Degradation**: After 3 consecutive infrastructure failures (API timeout, process crash), VERIFY no longer blocks experiments. Infrastructure issues are logged but don't halt progress.
+- **Audit Death Loop Protection**: After 5 consecutive audit directives, the agent auto-clears the directive and continues with real work. Infrastructure issues are logged as known limitations.
+- **Cross-Domain Analysis Prompt**: REFLECT phase now forces the Leader to analyze WHY different domains perform differently, identify violated method assumptions, and estimate the current approach's ceiling.
+- **Hypothesis Validation Prompt**: When quality degrades repeatedly, the agent must state the core assumption of its method, identify which domain violates it, and propose a method that doesn't rely on the violated assumption.
+- **Configuration Consistency Verification**: New VERIFY layer checks for checkpoint mismatches (size mismatch / missing keys) and hardcoded parameters that may not match actual data.
+- **Direction Signature Extraction**: Research direction is extracted from task descriptions using methodology keywords (edge/loss/pretrain/epi/angular/etc.) with hyphen/underscore normalization.
+- **Dataset Quality Verification** (new Layer 8): Agent now detects when validation splits are statistically unreliable — flags domains with < 3 validation scenes, warns when metrics are based on single scenes (fluctuations = noise, not signal), and records dataset issues for REFLECT to address. Prevents the agent from making decisions based on noisy metrics.
+- **Model Architect Skill** (`skills/model-architect/SKILL.md` + `analyze_model` tool): Agent can now analyze model architecture before training — extracts parameter counts, branch channel ratios, GPU memory estimates, data-to-parameter ratios, and physical reasonableness checks. Detects design flaws like branches with < 10% fusion channels (will be gradient-drowned) and severe overfitting risk (< 10 samples per K params).
+
+**2026-05-08 (v3)**
+- **MCP SSE Dual-Connection Protocol**: Fixed all GLM platform MCP services (web_search_prime, web_reader, zread) — switched from broken `POST /mcp` to correct `GET /sse` + `POST /message` dual-connection SSE transport. Background reader thread collects JSON-RPC responses from the persistent SSE stream.
+- **MCP stdio Transport for Vision**: `zai-mcp-server` runs as a **local npx subprocess** (stdio transport), not a remote SSE service. Requires Node.js 18+ and npx. Communicates via stdin/stdout JSON-RPC. If Node.js is absent, the vision degradation chain skips MCP and falls through to direct API calls.
+- **4 MCP Services Verified Working**: web_search_prime ✅, web_reader ✅, zread ✅, zai-mcp-server (stdio) ✅
+- **Vision Degradation Chain** (updated):
+  ```
+  MCP zai-mcp-server (stdio, requires Node.js)
+    → Direct API: glm-5v-turbo → glm-4.6v (GLM Coding Plan)
+    → Direct API: qwen3.6-plus (Ali Token Plan)
+    → Direct API: qwen3.6-plus → qwen3.5-plus (Ali DashScope)
+  ```
+- **Parameter Compatibility**: Auto-remaps `image_path` → `image_source` and `image_analysis` → `analyze_image` for zai-mcp-server compatibility.
+- **Node.js Requirement**: Vision MCP requires `npx` (Node.js 18+). Without it, vision analysis still works via direct API fallback but without specialized MCP tools.
+
+**2026-05-07 (v2)**
+- **Vision MCP Full Integration**: `@z_ai/mcp-server` 8 vision tools integrated into `core/tools.py`. Agent-facing tools: `analyze_image` (researcher) and `diagnose_error` (code agent).
+- **Three-Provider Vision Fallback**: Strict separation of 3 API providers (GLM Coding Plan / Ali Token Plan / Ali DashScope), each with its own key and endpoint.
+- **REFLECT Phase Deep Analysis**: Leader gets `read_file` + `list_files` tools during REFLECT (20 max turns, 16384 max tokens) for cross-validation — reading model code, data manifests, and training logs alongside visual analysis findings.
+- **Lazy MCP Detection**: MCP service availability detected lazily on first access (property-based) instead of blocking `__init__`, preventing startup delays.
+- **Auto Code-Cleanup v2**: New conditions for scripts/ naming pollution (> 10 files) and archive bloat (> 20 entries). Cleanup now targets .pt checkpoints as #1 disk priority, deletes final_checkpoint.pt, dry-run outputs, and archive dirs without SUMMARY.md.
+- **Script Naming Convention**: Code agent now enforces `train_{model_short_name}.py` naming — no incremental suffixes (`_v2`, `_fix`). One-time diagnostics use `_` prefix and must be deleted after use.
+- **Bug Fix**: API fallback chain includes ALI_TOKEN_PLAN_API_KEY provider. `AngularAwareDepthModelV12` now exported from `models/__init__.py`.
+
+**2026-05-07 (v1)**
+- **Visual Analysis Module**: New `core/visual_analyzer.py` — when training results are consistently poor (>= 5 consecutive cycles), automatically runs inference, generates prediction images, and sends them to a multimodal LLM for visual failure diagnosis. Catches problems invisible to numeric metrics alone (e.g., uniform depth maps, domain collapse, structural failures).
+- **MCP Multimodal Integration**: Supports `@z_ai/mcp-server` for vision-capable analysis when primary LLM (GLM-5.1) lacks multimodal input. Fallback to GLM-5V-Turbo → GLM-4.6V direct API calls if MCP unavailable.
+- **Visual diagnosis injected into REFLECT phase**: Leader agent now receives structured visual findings (diagnosis categories, severity, recommended actions) alongside VERIFY report, enabling data-informed experiment planning.
+
+**2026-04-28**
+- **Code Agent turn budget tightened**: `max_turns` reduced from 40→25 to prevent endless exploration. Turn budget reminder injected into tool results — agent gets explicit "CRITICAL: Almost out of turns" warnings at 80% budget.
+- **Consecutive `list_files` rate-limit**: Max 3 consecutive `list_files` calls before forced stop. Prevents the agent from repeatedly browsing directories instead of doing actual work.
+- **`run_shell` security regex fix**: Device redirect pattern now correctly allows `/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/fd/`, `/dev/stdin|stdout|stderr` while blocking unsafe device writes.
+- **`write_file` datasets registration allowlist**: Agents can now write to `datasets/__init__.py` and `datasets/unified_lf_dataset.py` (previously blocked). Other dataset files remain protected.
+- **Synthetic data detection in training scripts**: When writing to `scripts/*.py`, the tool scans for random noise patterns (`np.random.rand`, `torch.rand`, `SyntheticLF`, `RandomDataset`) and returns a warning. VERIFY will block experiments using synthetic data.
+- **AUDIT escalation Level 4 (unfixable)**: New `mark_unfixable` level (count ≥ threshold×4) records the issue as a dead_end and stops escalating — preventing infinite retry on truly unsolvable problems.
+- **Code-Cleanup trigger tightened**: No-progress streak threshold raised from 2→4 cycles before triggering code-cleanup. Reduces false positives.
+- **Memory log budget doubled**: `log_max` increased from 2,000→4,000 chars. Old entries are now **compressed** (summarized) instead of deleted — preserving knowledge while fitting the budget. New `get_log_summary()` method for LLM context.
+- **Session statistics injection**: Leader context now includes SQLite session stats (total cycles, experiments launched, launch rate, dead ends count) and recent failure patterns — enabling better decision-making.
+- **Runtime data fingerprint verification**: VERIFY phase now runs a quick Python check to load one dataset sample and verify it's not random noise (checks spatial correlation and constant values). The most reliable defense against LLMs secretly swapping in synthetic data.
+
+**2026-04-24**
+- **Anti-Deception Architecture**: `ToolTrace` and `ToolCallRecord` now record every tool call's actual system-returned result. Key facts (PIDs, log files, exit codes) are extracted from tool execution results — never from LLM narrative text. VERIFY cross-checks tool trace against LLM claims to detect fabrication.
+- **Multi-provider Token Plan support**: Added `glm_token_plan` (Zhipu GLM) alongside `ali_token_plan`. Automatic failover between providers with health tracking and cooldown.
+- **Tiered model strategy**: `STRONG_MODEL_TASKS` (think/reflect/idea/researcher) use strong model, routine tasks (code/writing) use fast model. Configurable via `"model": "auto"`.
+- **Researcher Agent**: New specialized agent for deep literature search, equipped with `web_search`, `web_fetch`, `search_papers`, `get_paper` tools.
+- **`get_paper` tool**: Fetch paper details by Semantic Scholar ID or arXiv ID (e.g., `"arXiv:2401.12345"`).
+- **Auto code-cleanup trigger**: Automatically dispatches code-cleanup when root `.py` files exceed 15, logs pile up, or experiment fails.
+- **Dataset understanding**: First-cycle mandatory scan validates `data/` directory and produces `DATASET_MANIFEST.json`.
+- **No-progress paper research fallback**: After repeated cycles with no progress on the same plan, agent automatically redirects to paper research to seek breakthrough methods.
+- **Memory compaction fix**: MEMORY_LOG now trims `active_problems` and `dead_ends` sections when over budget (previously only trimmed milestones and decisions).
+- **`★` major event prefix**: `log_major_event()` uses ★ prefix for paper research breakthroughs; `_parse_log()` and Obsidian exporter now correctly handle this prefix.
+- **Bug fixes**: `urllib.parse` import in `_exec_web_search`/`_exec_get_paper`, `_consume_directive` rename collision (uuid suffix), `_dataset_manifest_exists` validates JSON content.
+
+**2026-04-23**
+- **BREAKING**: Upgraded to **THINK → EXECUTE → VERIFY → REFLECT** four-phase pipeline. The new VERIFY phase reverse-engineers whether each module (dataset, model, training, evaluation) actually worked — before REFLECT draws conclusions.
+- Added **Experiment Verifier** (`core/verifier.py`) — zero-LLM-cost module-level verification with structured diagnosis. Checks: dataset validity, model checkpoint sanity, training loss dynamics, metric consistency.
+- Added **Reasoning Principles** system (`skills/REASONING_PRINCIPLES.md`) — 6 mandatory guidelines (Think Before Acting, Simplicity First, Surgical Changes, Goal-Driven Execution, Honesty, Verify-First) injected into every THINK/REFLECT dispatch to reduce common LLM reasoning mistakes.
+- Added **3-level Audit Escalation** system — repeated VERIFY failures are auto-detected and escalated: L1 targeted fix → L2 force error-handler skill → L3 pause for human intervention.
+- Added **error-handler skill** (`skills/error-handler/SKILL.md`) — 7-step diagnostic workflow for systematic root cause analysis.
+- Added **Token Plan provider** support (ali_token_plan) — cost-optimized subscription for code agents with models like qwen3.6-plus, deepseek-v3.2, glm-5.
+- Fixed `run_shell`/`launch_experiment` to use `shell=True` with regex-based safety validation — shell operators (`cd`, `&&`, `|`, `> /dev/null`) now work correctly.
 
 **2026-04-09**
 - Reduced token growth by resetting leader context between cycles.
@@ -194,10 +493,7 @@ So we'd kindly ask that this project not be used to fabricate results, to genera
 > **Science should stay pure. The agent can run the experiments — but the ideas, the interpretation, and the responsibility belong to the human.**
 >
 > **学术应当保持纯粹。** Agent 可以替你跑实验，但 idea、判断与责任，请留给人来承担。我们真心希望每一位使用者都能 **human in the loop 地去思考**，把这个工具省下来的时间，投入到真正属于你自己的研究方向里。
->
-> **科学は純粋であるべきです。** Agent は実験を走らせることができますが、アイデア・解釈・責任は、どうか人間の手に残してください。
->
-> **과학은 순수해야 합니다.** Agent는 실험을 대신 실행해 줄 수 있지만, 아이디어와 해석, 그리고 책임은 부디 사람의 몫으로 남겨주세요.
+
 
 We trust the people who pick up this tool to take that seriously — and we built it because we believe most of you already do. Thank you for being one of them. 💛
 
@@ -211,9 +507,10 @@ You design the experiment. The agent handles the repetitive loop.
 
 1. **Thinks** — Reads your project brief, analyzes previous results, plans the next experiment
 2. **Executes** — Modifies code/configs, runs a dry-run, launches training on GPU
-3. **Monitors** — Watches training at **zero LLM cost** (just process checks + log reads)
-4. **Reflects** — Parses results, compares with baselines, decides what to try next
-5. **Repeats** — 24/7, without human intervention
+3. **Verifies** — Reverse-engineers whether each module actually worked (dataset loaded? loss valid? training progressed?)
+4. **Visual Analyzes** *(when stuck)* — Runs inference, sends prediction images to multimodal LLM, diagnoses WHY model fails (catches problems numeric metrics miss)
+5. **Reflects** — Parses results, compares with baselines, decides what to try next (informed by VERIFY + visual diagnosis)
+6. **Repeats** — 24/7, without human intervention
 
 ```
 You sleep 8 hours     → Agent runs 3 experiment cycles
@@ -246,17 +543,17 @@ Most agent frameworks call the LLM every few minutes to "check progress". That's
 Experiment Agent **sleeps** during training — zero API calls. It only wakes the LLM when training finishes.
 
 ```
-                    LLM Active              Zero Cost              LLM Active
-                  ┌────────────┐    ┌─────────────────────┐    ┌────────────┐
-                  │   THINK    │    │   TRAIN & MONITOR    │    │  REFLECT   │
-                  │ (5-10 min) │    │   (hours/days)       │    │ (5-10 min) │
-                  │            │    │                      │    │            │
-                  │ • Analyze  │    │ • kill -0 $PID       │    │ • Parse    │
-                  │ • Plan     │    │ • nvidia-smi         │    │   logs     │
-                  │ • Code     │    │ • tail log           │    │ • Compare  │
-                  │            │    │                      │    │ • Decide   │
-                  │  ~$0.05    │    │      $0.00           │    │  ~$0.03    │
-                  └────────────┘    └─────────────────────┘    └────────────┘
+                    LLM Active              Zero Cost              Zero Cost           LLM Active
+                  ┌────────────┐    ┌─────────────────────┐    ┌──────────────┐    ┌────────────┐
+                  │   THINK    │    │   TRAIN & MONITOR    │    │   VERIFY     │    │  REFLECT   │
+                  │ (5-10 min) │    │   (hours/days)       │    │  (1-2 min)   │    │ (5-10 min) │
+                  │            │    │                      │    │              │    │            │
+                  │ • Analyze  │    │ • kill -0 $PID       │    │ • File check │    │ • Parse    │
+                  │ • Plan     │    │ • nvidia-smi         │    │ • Loss valid │    │   logs     │
+                  │ • Code     │    │ • tail log           │    │ • Ckpt sane  │    │ • Compare  │
+                  │            │    │                      │    │              │    │ • Decide   │
+                  │  ~$0.05    │    │      $0.00           │    │   $0.00      │    │  ~$0.03    │
+                  └────────────┘    └─────────────────────┘    └──────────────┘    └────────────┘
 ```
 
 **24-hour cycle with 8 hours of training: ~$0.08 in LLM calls.**
@@ -265,21 +562,24 @@ Experiment Agent **sleeps** during training — zero API calls. It only wakes th
 
 ## Architecture
 
-### The THINK → EXECUTE → REFLECT Loop
+### The THINK → EXECUTE → VERIFY → REFLECT Loop
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐       │
-│  │  THINK   │───→│ EXECUTE  │───→│ REFLECT  │──┐    │
-│  │          │    │          │    │          │  │    │
-│  │ Analyze  │    │ Dry-run  │    │ Evaluate │  │    │
-│  │ Plan     │    │ Launch   │    │ Compare  │  │    │
-│  │ Decide   │    │ Monitor  │    │ Update   │  │    │
-│  └──────────┘    └──────────┘    └──────────┘  │    │
-│       ↑                                         │    │
-│       └─────────────────────────────────────────┘    │
-│                    ↻ 24/7 Loop                       │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │
+│  │  THINK   │→│ EXECUTE  │→│  VERIFY  │→│VISUAL    │→│ REFLECT  │──┐    │
+│  │          │  │          │  │          │  │ANALYZE*  │  │          │  │    │
+│  │ Analyze  │  │ Dry-run  │  │ Module   │  │          │  │ Evaluate │  │    │
+│  │ Plan     │  │ Launch   │  │ checks   │  │ Inference │  │ Compare  │  │    │
+│  │ Decide   │  │ Monitor  │  │ Diagnose │  │ Vision    │  │ Decide   │  │    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │    │
+│       ↑                                                    │            │    │
+│       └────────────────────────────────────────────────────┘            │    │
+│                    ↻ 24/7 Loop                                        │
+└──────────────────────────────────────────────────────────────────────────┘
+
+* VISUAL ANALYZE: Only triggers when training is consistently poor (>=5 cycles).
+  Runs inference → sends prediction images to multimodal LLM → diagnoses WHY model fails.
 ```
 
 ### Leader-Worker Agent System
@@ -290,15 +590,15 @@ Only ONE worker runs at a time. Others idle at zero cost.
               ┌───────────────┐
               │    Leader     │  Persistent conversation
               │   (Planner)   │  within each cycle
-              └───┬───┬───┬───┘
-                  │   │   │
-          ┌───────┘   │   └───────┐
-          ↓           ↓           ↓
-    ┌──────────┐ ┌──────────┐ ┌──────────┐
-    │   Idea   │ │   Code   │ │ Writing  │
-    │  Agent   │ │  Agent   │ │  Agent   │
-    │ (4 tools)│ │ (5 tools)│ │ (3 tools)│
-    └──────────┘ └──────────┘ └──────────┘
+              └──┬──┬──┬──┬──┘
+                 │  │  │  │
+         ┌───────┘  │  │  └───────┐
+         ↓          ↓  ↓          ↓
+   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐
+   │   Idea   │ │   Code   │ │ Writing  │ │ Researcher │
+   │  Agent   │ │  Agent   │ │  Agent   │ │   Agent    │
+   │ (4 tools)│ │ (5 tools)│ │ (3 tools)│ │  (4 tools) │
+   └──────────┘ └──────────┘ └──────────┘ └────────────┘
 ```
 
 ### Two-Tier Memory (Constant Size Forever)
@@ -312,9 +612,9 @@ Only ONE worker runs at a time. Others idle at zero cost.
 │ Tier 2: MEMORY_LOG.md                   │
 │ • Key Results (auto-compact at 1,200ch) │
 │ • Recent Decisions (rolling last 15)    │
-│ • Max 2,000 chars                       │
+│ • Max 4,000 chars                       │
 ├─────────────────────────────────────────┤
-│ Total: ~5K chars / ~1,500 tokens        │
+│ Total: ~7K chars / ~2,000 tokens        │
 │ SAME whether running 1 day or 6 months  │
 └─────────────────────────────────────────┘
 ```
@@ -331,6 +631,32 @@ Only ONE worker runs at a time. Others idle at zero cost.
 | 6 | Slim system prompts | Fewer input tokens |
 | 7 | State trimmed before sending | No bloat |
 | 8 | Single worker at a time | No parallel LLM costs |
+
+### Reasoning Principles System
+
+Every THINK and REFLECT dispatch includes a **mandatory reasoning checklist**:
+
+1. **Assumptions** — What am I assuming? Write them out.
+2. **Alternatives** — Is there a simpler way? Am I changing too many variables?
+3. **Success criteria** — Concrete, measurable — not "improve" but "MAE < 0.35".
+4. **Surgical** — Every code change must trace to this experiment's hypothesis.
+5. **Honesty** — If results don't meet criteria, say so — don't spin.
+6. **Verify-first** — If VERIFY found module failures, address those BEFORE judging the experiment.
+
+These are defined in `skills/REASONING_PRINCIPLES.md` and injected into the Leader agent's context at every dispatch via `_REASONING_REMINDER` in `agents.py`. The Code agent also has these principles in its system prompt.
+
+### 4-Level Audit Escalation
+
+When the experiment auditor detects the same issue repeatedly:
+
+| Level | Trigger | Action |
+|-------|---------|--------|
+| L1 | Issue appears ≥ 3 cycles | Inject targeted fix directive into next THINK |
+| L2 | Issue appears ≥ 6 cycles | Force error-handler skill execution |
+| L3 | Issue appears ≥ 9 cycles | Pause agent, write `AGENT_STUCK.md` for human |
+| L4 | Issue appears ≥ 12 cycles | Mark as unfixable dead_end, stop escalating |
+
+This prevents the agent from looping indefinitely on trivial errors (e.g., dataset key mismatches).
 
 ---
 
@@ -478,6 +804,13 @@ The agent will now do everything automatically. Here's what each cycle looks lik
           ...
           17:45 — PID alive, GPU 97%, Epoch 100/100, loss=0.82
           18:00 — PID terminated. Training complete.
+
+[VERIFY] Checking module outputs...
+         Dataset: ✓ loaded 50K images, shape [3,32,32], no zeros
+         Model: ✓ checkpoint 97MB, no NaN in weights
+         Training: ✓ loss 2.34→0.82 (decreasing), GPU used
+         Evaluation: ✓ test accuracy 76.3% in [0,100] range
+         All modules verified. No issues found.
 
 [REFLECT] Parsing logs... test accuracy = 76.3%
           Result: 76.3% — below 80% target
@@ -805,7 +1138,7 @@ After installation, you get **8 slash commands** in Claude Code:
 
 | Command | What It Does |
 |---------|-------------|
-| `/auto-experiment` | Launch the 24/7 autonomous THINK→EXECUTE→REFLECT experiment loop |
+| `/auto-experiment` | Launch the 24/7 autonomous THINK→EXECUTE→VERIFY→REFLECT experiment loop |
 | `/experiment-status` | Check running experiments: progress, metrics, cycle count, GPU usage |
 | `/gpu-monitor` | Quick GPU status: free/busy, memory, utilization, running processes |
 
@@ -890,7 +1223,7 @@ agent:
 
 memory:
   brief_max_chars: 3000           # Tier 1 cap
-  log_max_chars: 2000             # Tier 2 cap
+  log_max_chars: 4000             # Tier 2 cap
   milestone_max_chars: 1200       # Key results cap
   max_recent_entries: 15          # Rolling decision count
 
@@ -905,6 +1238,35 @@ monitor:
 experiment:
   mandatory_dry_run: true         # Always dry-run before real training
   max_parallel: 1                 # Concurrent experiments
+
+# Visual Analysis Module — Inference + Multimodal Diagnosis
+visual_analysis:
+  enabled: true                   # Master switch for visual analysis
+  trigger_threshold: 5            # Trigger after N consecutive poor cycles
+  mcp_timeout: 60                # MCP server timeout (seconds)
+  max_images: 6                  # Max images per analysis session
+
+# MCP Services — Two Transport Types
+# Type 1: SSE (GLM Platform) — web_search, web_reader, zread
+#   GET /sse → receive endpoint event → POST /message (dual-connection)
+# Type 2: stdio (Local npx) — zai-mcp-server (vision tools)
+#   Requires Node.js 18+ and npx
+#   If Node.js absent, vision falls through to direct API calls
+mcp_services:
+  sse:
+    - name: web_search_prime
+      url: https://open.bigmodel.cn/api/mcp/web_search_prime/sse
+    - name: web_reader
+      url: https://open.bigmodel.cn/api/mcp/web_reader/sse
+    - name: zread
+      url: https://open.bigmodel.cn/api/mcp/zread/sse
+  stdio:
+    - name: zai_vision
+      command: npx
+      args: ["-y", "@z_ai/mcp-server"]
+      env:
+        Z_AI_API_KEY: ${GLM_CODING_PLAN_API_KEY}  # Same key as GLM
+        Z_AI_MODE: ZHIPU
 ```
 
 ---
@@ -931,11 +1293,13 @@ experiment:
 ```
 auto-deep-researcher-24x7/
 ├── core/                    # Autonomous experiment loop engine
-│   ├── loop.py              # THINK → EXECUTE → REFLECT cycle
+│   ├── loop.py              # THINK → EXECUTE → VERIFY → VISUAL → REFLECT cycle
 │   ├── memory.py            # Two-Tier constant-size memory
 │   ├── monitor.py           # Zero-LLM experiment monitoring
 │   ├── agents.py            # Leader-Worker agent dispatch
-│   └── tools.py             # Minimal per-agent tool registry
+│   ├── tools.py             # Minimal per-agent tool registry
+│   ├── verifier.py          # Module-level result verification (zero LLM)
+│   └── visual_analyzer.py   # Inference + multimodal visual diagnosis (NEW)
 ├── skills/                  # Claude Code slash commands (python install.py)
 │   ├── auto-experiment/     # 24/7 autonomous experiment loop
 │   ├── experiment-status/   # Check experiment progress
@@ -943,7 +1307,14 @@ auto-deep-researcher-24x7/
 │   ├── daily-papers/        # Daily arXiv recommendations
 │   ├── paper-analyze/       # Deep paper analysis + figure extraction
 │   ├── conf-search/         # Conference paper search
-│   └── progress-report/     # Progress report generation
+│   ├── progress-report/     # Progress report generation
+│   ├── error-handler/       # 7-step diagnostic workflow for systematic fixes
+│   ├── experiment-auditor/  # Post-cycle audit for shortcuts & hallucinations
+│   ├── code-cleanup/        # Automatic code hygiene & log archiving
+│   ├── dataset-understanding/ # Data directory validation & manifest generation
+│   ├── idea-validation/     # Hypothesis validation before committing GPU time
+│   ├── hands-off-issue-handling/ # Autonomous issue resolution protocol
+│   └── REASONING_PRINCIPLES.md # Mandatory reasoning guidelines for all agents
 ├── agents/                  # Agent prompt definitions
 │   ├── leader.md            # Central decision-maker
 │   ├── idea_agent.md        # Literature & hypothesis
@@ -973,34 +1344,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
-## Citation
 
-If you find this work useful, please cite our paper:
 
-```bibtex
-@article{zhang2026autodeepresearcher,
-  title={Deep Researcher Agent: Autonomous Deep Learning Experiment Framework},
-  author={Zhang, Xiangyue},
-  journal={arXiv preprint arXiv:2604.05854},
-  year={2026},
-  url={https://arxiv.org/abs/2604.05854}
-}
-```
-
-Or cite the software release:
-
-```bibtex
-@software{auto_deep_researcher_24x7,
-  title={Deep Researcher Agent: Autonomous Deep Learning Experiment Framework},
-  author={Xiangyue Zhang},
-  year={2026},
-  url={https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7}
-}
-```
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Xiangyue-Zhang/auto-deep-researcher-24x7&type=Date&v=20260408-1)](https://www.star-history.com/#Xiangyue-Zhang/auto-deep-researcher-24x7&Date)
 
 ## License
 

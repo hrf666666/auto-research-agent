@@ -1,5 +1,5 @@
 """
-AutoResearcher GPU Keeper
+AutoResearcher GPU Keeper — STANDALONE UTILITY (not used by core research loop)
 
 Keeps cloud GPU instances alive by maintaining minimal GPU activity.
 Many cloud platforms (e.g., Aliyun PAI-DSW) reclaim instances if
@@ -7,6 +7,12 @@ GPUs are idle for extended periods (typically 3 hours).
 
 This is the basic open-source version. It holds a small tensor on
 the designated GPU to prevent reclamation.
+
+NOTE: This module is NOT imported or used by the core ResearchLoop.
+It is a standalone utility meant to be run independently:
+    python -m gpu.keeper [--gpu 0]
+
+The core flow uses gpu/detect.py for GPU detection only.
 """
 
 import signal

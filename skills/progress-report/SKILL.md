@@ -23,16 +23,25 @@ Generate a structured progress report for the current research project.
 - Total experiments: [N]
 - Current direction: [description]
 
-## Recent Experiments
+## Experiment History
 | # | Config | Metric | Date | Notes |
 |---|--------|--------|------|-------|
+
+## Dead Ends (What NOT to Retry)
+| Method | Why Failed | Lesson |
+|--------|-----------|--------|
+| ... | ... | ... |
+
+## Active Problems
+| Problem | Severity | Status | Notes |
+|---------|----------|--------|-------|
 
 ## Key Insights
 - What we learned
 - What works / doesn't work
 
 ## Next Steps
-1. Planned experiments
+1. Planned experiments (must address Active Problems)
 2. Open questions
 
 ## Blockers
