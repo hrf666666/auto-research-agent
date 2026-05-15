@@ -1,0 +1,67 @@
+% ICCV 2025 Paper Template
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE
+\usepackage[pagenumbers]{iccv} % arXiv version with page numbers
+
+% Import additional packages in the preamble file, before hyperref
+\input{preamble}
+
+\definecolor{iccvblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=iccvblue]{hyperref}
+
+%%%%%%%%% PAPER ID
+\def\paperID{*****}
+\def\confName{ICCV}
+\def\confYear{2025}
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{subcaption}
+\usepackage{bm}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{enumitem}
+\usepackage[font=small, skip=5pt]{caption}
+\setlength{\abovecaptionskip}{5pt}
+\setlength{\belowcaptionskip}{5pt}
+
+\definecolor{thinkcolor}{RGB}{70,130,180}
+\definecolor{execcolor}{RGB}{230,140,50}
+\definecolor{reflectcolor}{RGB}{80,160,80}
+
+%%%%%%%%% TITLE
+\title{Deep Researcher Agent: An Autonomous Framework for \\24/7 Deep Learning Experimentation with Zero-Cost Monitoring}
+
+%%%%%%%%% AUTHORS
+\author{
+    Xiangyue Zhang$^{1}$\\
+    $^{1}$Wuhan University\\
+    {\tt\small https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7}
+}
+
+\begin{document}
+\maketitle
+
+\input{sec/0_abstract}
+\input{sec/1_intro}
+\input{sec/2_related}
+\input{sec/3_method}
+\input{sec/4_experiment}
+\input{sec/5_conclusion}
+
+{\small
+\bibliographystyle{ieeenat_fullname}
+\bibliography{main}
+}
+
+\newpage
+\appendix
+\input{sec/6_appendix}
+
+\end{document}

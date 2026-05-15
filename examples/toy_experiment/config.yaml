@@ -1,0 +1,22 @@
+# Toy experiment config — override defaults for quick demo
+project:
+  name: "mnist-demo"
+  brief: "PROJECT_BRIEF.md"
+
+agent:
+  model: "claude-sonnet-4-6"
+  max_cycles: 3
+  max_steps_per_cycle: 2
+  cooldown_interval: 60
+
+gpu:
+  auto_detect: true
+  reserve_last: false
+
+monitor:
+  poll_interval: 30
+  zero_llm: true
+
+experiment:
+  mandatory_dry_run: true
+  max_parallel: 1

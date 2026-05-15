@@ -1,0 +1,82 @@
+\section{Full Configuration Reference}
+\label{app:config}
+
+The following YAML configuration controls all aspects of the framework. All values have sensible defaults.
+
+{\small
+\begin{verbatim}
+project:
+  name: "my-research"
+  brief: "PROJECT_BRIEF.md"
+  workspace: "./workspace"
+
+agent:
+  model: "claude-sonnet-4-6"
+  max_cycles: -1           # -1 = unlimited
+  max_steps_per_cycle: 3   # worker dispatches/cycle
+  cooldown_interval: 300   # seconds
+
+memory:
+  brief_max_chars: 3000
+  log_max_chars: 2000
+  milestone_max_chars: 1200
+  max_recent_entries: 15
+
+gpu:
+  auto_detect: true
+  reserve_last: true  # last GPU for keep-alive
+
+monitor:
+  poll_interval: 900  # seconds
+  zero_llm: true
+
+experiment:
+  mandatory_dry_run: true
+  max_parallel: 1
+\end{verbatim}
+}
+
+\section{Agent Prompt Structure}
+\label{app:prompts}
+
+Each agent is defined as a Markdown file with YAML frontmatter specifying its name, description, and model. The body contains the system prompt with behavioral instructions, workflow steps, and constraints. An abbreviated example for the Code Agent:
+
+{\small
+\begin{verbatim}
+---
+name: code_agent
+description: Experiment implementation
+model: inherit
+---
+# Code Agent
+You are the Code agent. Your role is to
+implement and run experiments.
+## Mandatory Workflow
+1. Understand the Leader's task
+2. Implement code/config changes
+3. Dry-run (MANDATORY - abort if fails)
+4. Launch via launch_experiment tool
+5. Report PID and log file path
+## Constraints
+- NEVER skip dry-run
+- ALWAYS use launch_experiment for training
+- Do NOT modify protected files
+\end{verbatim}
+}
+
+\section{Human Directive Protocol}
+\label{app:directive}
+
+The human directive mechanism provides an asynchronous communication channel between the researcher and the agent. When a file named \texttt{HUMAN\_DIRECTIVE.md} is placed in the workspace directory, it is consumed at the start of the next cycle with highest priority. The directive is then archived with a timestamp to prevent re-reading:
+
+{\small
+\begin{verbatim}
+workspace/
+  HUMAN_DIRECTIVE.md     # Active directive
+  directive_archive/
+    directive_20260407_143000.md
+    directive_20260410_091500.md
+\end{verbatim}
+}
+
+This mechanism enables mobile human-in-the-loop interaction through companion apps such as Happy Coder~\cite{happy-coder}, which provides push notifications and bidirectional communication with the agent from mobile devices.

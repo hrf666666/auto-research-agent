@@ -1,0 +1,15 @@
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\paragraph{Single-GPU Scope.} The current open-source release supports single-GPU experiments. Multi-GPU distributed training (DDP) and multi-server orchestration are planned for future releases.
+
+\paragraph{Metric Extraction.} Log parsing for metric extraction relies on regex pattern matching, which may miss custom metric formats. Structured logging formats (e.g., JSON Lines) would improve robustness.
+
+\paragraph{Exploration Strategy.} The agent's experiment planning relies on the LLM's reasoning capabilities without formal exploration strategies such as Bayesian optimization. Integrating structured search methods could improve sample efficiency for hyperparameter optimization.
+
+\paragraph{Evaluation Methodology.} Evaluating autonomous research agents remains an open challenge. Unlike software engineering agents that can be tested on fixed benchmarks~\cite{swe-agent}, research agents operate in open-ended domains where the ``correct'' next experiment is undefined. Developing standardized evaluation protocols for long-running research agents is an important direction for future work.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented Deep Researcher Agent, an autonomous framework for 24/7 deep learning experimentation. Our three key innovations --- Zero-Cost Monitoring, Two-Tier Constant-Size Memory, and Minimal-Toolset Leader-Worker Architecture --- collectively make continuous LLM-driven research economically viable at an average cost of \$0.08 per 24-hour cycle. Over 30+ days of sustained deployment across 4 concurrent research projects, the system autonomously completed 500+ experiment cycles and achieved a 52\% metric improvement over baseline in one project through 200+ fully automated experiments. We release the complete framework as open-source software at \url{https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7} to enable the broader research community to build upon this work.

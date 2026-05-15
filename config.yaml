@@ -1,0 +1,101 @@
+# Deep Researcher Agent Configuration
+# See docs/architecture.md for detailed explanations
+
+project:
+  name: "depth_estimation_unify_theory"
+  brief: "PROJECT_BRIEF.md"
+  workspace: "/home/bigboss/code"
+
+agent:
+  # Provider: "anthropic" | "openai" | "qwen" | "ali_token_plan" | "glm_token_plan"
+  #   anthropic:      Anthropic Claude (requires ANTHROPIC_API_KEY)
+  #   openai:         OpenAI Codex/GPT  (requires OPENAI_API_KEY)
+  #   qwen:           Aliyun DashScope  (requires ALI_API_KEY)
+  #   ali_token_plan: Aliyun Token Plan for code agents (requires ALI_TOKEN_PLAN_API_KEY)
+  #                   strong: qwen3.6-plus | fast: deepseek-v3.2
+  #   glm_token_plan: Zhipu GLM Coding Plan (requires GLM_CODING_PLAN_API_KEY)
+  #                   Primary: strong=glm-5.1, fast=glm-5
+  #                   Auto-failover: if primary fails, switches to ali_token_plan
+  provider: "glm_token_plan"
+
+  # Model selection:
+  #   - "auto" or "default": automatically pick strong/fast model based on task tier
+  #     (think/reflect/idea/researcher → strong model, code/writing → fast model)
+  #   - Explicit model name: use that model for ALL tasks (overrides tier logic)
+  #
+  # Per-provider models:
+  #   glm_token_plan: glm-5.1 (strong) | glm-5 (fast) | glm-5-turbo | glm-4.7 | glm-4.6 | glm-4.5
+  #   ali_token_plan: qwen3.6-plus (all tasks) | deepseek-v3.2 | glm-5 | MiniMax-M2.5
+  #   anthropic:      claude-sonnet-4-6 (fast) | claude-opus-4-6 (strongest)
+  #   openai:         codex-5.3 (fast)         | gpt-5.4 (strongest)
+  #   qwen:           qwen3.6-plus
+  model: "auto"
+
+  max_cycles: -1                  # -1 = run forever
+  max_steps_per_cycle: 3          # Max worker dispatches per cycle
+  cooldown_interval: 300          # Smart cooldown polling interval (seconds)
+  no_progress_fallback_threshold: 15  # Back off after repeated no-progress cycles on the same plan
+
+memory:
+  brief_max_chars: 3000           # Tier 1: PROJECT_BRIEF cap
+  log_max_chars: 4000             # Tier 2: MEMORY_LOG cap (increased for Dead Ends + Active Problems tables)
+  milestone_max_chars: 2000       # Key results section cap
+  max_recent_entries: 15          # Rolling decision count
+
+gpu:
+  auto_detect: true               # Auto-detect available GPUs
+  reserve_last: true              # Reserve last GPU for keep-alive
+
+monitor:
+  poll_interval: 900              # Check every 15 min during training
+  max_runtime_hours: 12           # Hard timeout: kill experiments exceeding 12 hours
+  zero_llm: true                  # No LLM calls during monitoring
+  notify_on_complete: true        # Log notification on experiment completion
+
+experiment:
+  mandatory_dry_run: true         # Always dry-run before real training
+  max_parallel: 1                 # Max concurrent experiments
+  log_tail_lines: 50              # Lines to capture from training log
+
+# Simulation Sandbox: Pre-Training Model Validation & A/B Evaluation
+# These settings control the 5-layer sandbox evaluation system.
+sandbox:
+  gpu_memory_mb: 24000            # Target GPU memory budget (MB). Auto-detect if 0.
+  default_input_shape: [1, 3, 64, 64]  # Fallback input shape when auto-detection fails
+  subprocess_timeout: 120         # Timeout (seconds) for sandbox subprocess runs
+  inference_timeout: 120          # Timeout (seconds) for inference subprocess
+  feasibility_timeout: 90         # Timeout (seconds) for feasibility check
+
+obsidian:
+  enabled: false                  # Enable progress exports
+  vault_path: ""                  # Optional: direct write into Obsidian vault
+  project_subdir: "DeepResearcher/{project_name}"
+  dashboard_note: "Dashboard.md"
+  daily_dir: "Daily"
+  auto_append_daily: true
+  local_fallback_dir: "progress_tracking"
+
+# Visual Analysis Module: Inference + Multimodal Diagnosis
+# When training is stuck (consecutive poor cycles), runs inference and sends
+# prediction images to a multimodal LLM for visual failure diagnosis.
+visual_analysis:
+  enabled: true                   # Master switch for visual analysis
+  trigger_threshold: 5            # Trigger after N consecutive poor cycles
+  mcp_timeout: 60                # MCP server timeout (seconds)
+  max_images: 6                  # Max images per analysis (token budget)
+
+# Multimodal MCP Server Configuration (@z_ai/mcp-server)
+# Vision analysis fallback chain (auto-detected at runtime):
+#   GLM key: MCP zai-mcp-server → GLM-5V-Turbo → GLM-4.6V
+#   Ali key: Qwen3.6-plus → Qwen3.5-plus (native multimodal)
+multimodal_mcp:
+  enabled: true                  # Enable MCP multimodal service
+  command: "npx"                 # MCP server launcher command
+  args: ["-y", "@z_ai/mcp-server"]  # MCP server package
+  api_key_env: "GLM_CODING_PLAN_API_KEY"  # Reuse Zhipu API key (same platform)
+  mode: "ZHIPU"                  # Provider mode (ZHIPU = Zhipu AI)
+
+# Vision MCP Server (zai-mcp-server via streamable-http)
+# Auto-detected at runtime. Only used when GLM key is available.
+# Provides specialized visual understanding tools via MCP protocol.
+# No manual configuration needed — endpoints are resolved by provider detection.

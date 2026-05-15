@@ -1,0 +1,14 @@
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{LLM-Based Coding Agents.}
+SWE-Agent~\cite{swe-agent} and OpenHands~\cite{openhands} target software engineering tasks --- bug fixing, feature implementation, and code review. These agents excel at one-shot code generation but are not designed for iterative, long-running experiment workflows. They lack GPU management, training monitoring, and result-driven iteration capabilities.
+
+\paragraph{AI Research Assistants.}
+AI Scientist~\cite{ai-scientist} generates complete research papers including experiments, but its experiment execution is limited to short-running scripts and does not support GPU training or iterative refinement based on results. Claude Scholar~\cite{claude-scholar} provides comprehensive research writing workflows with 47 skills and Zotero integration, but operates as a reactive assistant without autonomous experiment execution capabilities.
+
+\paragraph{AutoML and Hyperparameter Optimization.}
+Traditional AutoML frameworks such as Optuna~\cite{optuna} and Ray Tune~\cite{ray-tune} efficiently search hyperparameter spaces but require pre-defined search configurations and cannot modify model architectures or training pipelines. Our system operates at a higher level of abstraction, making qualitative decisions about \textit{what} to try next based on holistic result analysis, rather than optimizing within a pre-defined search space.
+
+\paragraph{Research Agent Systems.}
+MLAgentBench~\cite{mlagentbench} provides a benchmark for evaluating ML agents on Kaggle-style tasks, but evaluates single-attempt performance rather than iterative refinement over extended periods. ResearchAgent~\cite{researchagent} focuses on idea generation from scientific literature but does not execute experiments. None of these systems address the complete experiment lifecycle with cost-efficient 24/7 operation that our framework provides.

@@ -1,0 +1,139 @@
+\section{Experiments}
+\label{sec:exp}
+
+We evaluate Deep Researcher Agent through long-term deployment across multiple research projects. Due to the nature of autonomous research agents, our evaluation focuses on operational metrics and cost efficiency rather than benchmark scores on fixed tasks.
+
+\subsection{Deployment Setup}
+
+The framework was deployed across 4 concurrent deep learning research projects on 4 GPU servers equipped with NVIDIA L20X 144GB GPUs. Each project ran an independent agent instance in a persistent tmux session. The LLM backbone was Claude Sonnet~\cite{claude} with Anthropic's prompt caching enabled. Projects spanned diverse domains including generative modeling, multi-modal learning, and self-supervised representation learning.
+
+\subsection{Operational Results}
+
+Table~\ref{tab:results} summarizes the key operational metrics from our deployment.
+
+\begin{table}[t]
+\centering
+\caption{Deployment statistics across 4 concurrent research projects over 30+ days of continuous autonomous operation.}
+\label{tab:results}
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total autonomous experiment cycles & 500+ \\
+Longest continuous operation & 30+ days \\
+Concurrent projects managed & 4 \\
+GPU servers utilized & 4 \\
+Best single-project improvement & 52\% over baseline \\
+Experiments in best project & 200+ \\
+Average LLM cost per 24h cycle & \$0.08 \\
+Average experiments per day per project & 2--4 \\
+Dry-run failure rate (caught pre-training) & 18\% \\
+Post-dry-run training crash rate & $<$3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Autonomous Improvement.} In the best-performing project, the agent autonomously explored 200+ configurations over several weeks, achieving a 52\% improvement in the target metric over the initial baseline. The improvement trajectory showed diminishing returns as expected, with the majority of gains occurring in the first 50 experiments, followed by increasingly fine-grained optimization in subsequent cycles.
+
+\paragraph{Dry-Run Effectiveness.} The mandatory dry-run mechanism caught 18\% of planned experiments before they were actually launched, preventing wasted GPU hours. Common issues included tensor shape mismatches after architecture modifications, missing import statements, and configuration inconsistencies between modified code and existing configs.
+
+\paragraph{Human Intervention Frequency.} Over the 30+ day deployment, human directives were issued approximately once every 3--5 days, primarily for major direction changes (e.g., switching from one model architecture family to another). Day-to-day decisions such as hyperparameter exploration, learning rate scheduling, and regularization strategies were fully autonomous.
+
+\subsection{Cost Analysis}
+
+Table~\ref{tab:cost} presents a detailed breakdown of LLM token consumption and cost per phase.
+
+\begin{table}[t]
+\centering
+\caption{Cost comparison per 24-hour cycle (8h training, Claude Sonnet pricing). Our Zero-Cost Monitoring achieves a 10--20$\times$ cost reduction over conventional LLM polling approaches.}
+\label{tab:cost}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Phase} & \textbf{Dur.} & \textbf{Calls} & \textbf{Tokens} & \textbf{Cost} \\
+\midrule
+\multicolumn{5}{l}{\textit{Deep Researcher Agent (ours)}} \\
+\quad Think & 5--10m & 3--5 & $\sim$15K & \$0.05 \\
+\quad Execute & 10--20m & 5--10 & $\sim$25K & \$0.08 \\
+\quad Monitor & 6--8h & \textbf{0} & \textbf{0} & \textbf{\$0.00} \\
+\quad Reflect & 5--10m & 2--3 & $\sim$10K & \$0.03 \\
+\quad \textbf{Total} & \textbf{24h} & \textbf{10--18} & \textbf{$\sim$50K} & \textbf{\$0.08--0.16} \\
+\midrule
+\multicolumn{5}{l}{\textit{Conventional polling agent}} \\
+\quad Active & 30m & 15 & $\sim$50K & \$0.16 \\
+\quad Monitor (5m) & 6--8h & 96 & $\sim$192K & \$0.50 \\
+\quad Idle poll & 15h & 180 & $\sim$360K & \$0.94 \\
+\quad \textbf{Total} & \textbf{24h} & \textbf{291} & \textbf{$\sim$602K} & \textbf{\$1.60} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Our framework achieves a \textbf{10--20$\times$ cost reduction} compared to conventional polling. Over a 30-day deployment, this translates to \$2.40--4.80 versus \$48.00 for the conventional approach. Table~\ref{tab:strategies} summarizes all eight cost control strategies.
+
+\begin{table}[t]
+\centering
+\caption{Eight cost control strategies employed by our framework.}
+\label{tab:strategies}
+\begin{tabular}{clp{4.5cm}}
+\toprule
+\textbf{\#} & \textbf{Strategy} & \textbf{Mechanism} \\
+\midrule
+1 & Zero-LLM monitoring & No API calls during training \\
+2 & Constant-size memory & Fixed at $\sim$1.5K tokens \\
+3 & Within-cycle persistence & Brief sent once per cycle \\
+4 & Prompt caching & System/tool schemas cached \\
+5 & Minimal tool sets & 3--5 tools vs.\ 15+ (73\%$\downarrow$) \\
+6 & Slim prompts & Agent prompts $<$500 tokens \\
+7 & State trimming & Redundant context removed \\
+8 & Single-worker exec & No parallel LLM costs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory System Evaluation}
+
+Table~\ref{tab:memory} demonstrates that the Two-Tier Memory system reaches its steady-state size within the first week and remains constant thereafter, validating our bounded-memory design.
+
+\begin{table}[t]
+\centering
+\caption{Memory system size over time. Tier 1 (Brief) remains frozen while Tier 2 (Log) stabilizes near its 2,000-character cap through automatic compaction.}
+\label{tab:memory}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Time Point} & \textbf{Tier 1 (Brief)} & \textbf{Tier 2 (Log)} \\
+\midrule
+Day 1 (cycle 1) & 2,847 chars & 312 chars \\
+Day 7 (cycle 25) & 2,847 chars & 1,834 chars \\
+Day 14 (cycle 55) & 2,847 chars & 1,956 chars \\
+Day 30 (cycle 120) & 2,847 chars & 1,978 chars \\
+\midrule
+\textbf{Max allowed} & \textbf{3,000 chars} & \textbf{2,000 chars} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison with Existing Frameworks}
+
+\begin{table}[t]
+\centering
+\caption{Feature comparison with existing AI research frameworks. Our system is the only one providing autonomous experiment execution with 24/7 operation capability.}
+\label{tab:comparison}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Feature} & \textbf{Ours} & \textbf{CS} & \textbf{AIS} & \textbf{OH} & \textbf{SWE} \\
+\midrule
+Autonomous experiments & \checkmark & & & & \\
+Zero-cost monitoring & \checkmark & & & & \\
+GPU management & \checkmark & & & & \\
+24/7 operation & \checkmark & & & & \\
+Constant-size memory & \checkmark & & & & \\
+Paper writing & basic & \checkmark & \checkmark & & \\
+Knowledge mgmt & basic & \checkmark & & & \\
+General coding & & & & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize CS = Claude Scholar~\cite{claude-scholar}, AIS = AI Scientist~\cite{ai-scientist}, OH = OpenHands~\cite{openhands}, SWE = SWE-Agent~\cite{swe-agent}.}
+\end{table}
+
+As shown in Table~\ref{tab:comparison}, Deep Researcher Agent occupies a unique position in the landscape of AI research tools. While other frameworks excel in complementary areas --- Claude Scholar in paper writing and knowledge management, SWE-Agent and OpenHands in general software engineering --- none provide the autonomous experiment execution and zero-cost monitoring capabilities that enable 24/7 research operation.

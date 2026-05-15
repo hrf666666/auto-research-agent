@@ -1,0 +1,26 @@
+\section{Introduction}
+\label{sec:intro}
+
+The deep learning research workflow is fundamentally iterative: a researcher designs an experiment, launches GPU training (often lasting hours to days), analyzes results, adjusts hyperparameters or model architectures, and repeats. Before a single paper submission, this cycle may be repeated hundreds of times. Despite the mechanical nature of much of this loop, it remains overwhelmingly manual --- researchers must be present to check training completion, interpret results, and decide on next steps.
+
+Recent advances in LLM-based agents~\cite{openhands,swe-agent,ai-scientist} have demonstrated impressive capabilities in code generation, bug fixing, and even paper writing. However, none of these systems address the core bottleneck in deep learning research: the \textit{autonomous execution and iteration of GPU experiments}. Claude Scholar~\cite{claude-scholar} provides research writing workflows with 47 skills and Zotero integration, and AI Scientist~\cite{ai-scientist} generates complete papers, but neither can launch a training run, monitor its progress, and use the results to plan the next experiment.
+
+We introduce \textbf{Deep Researcher Agent}, a framework designed specifically for this gap. Our system operates as a continuous \textsc{Think}$\rightarrow$\textsc{Execute}$\rightarrow$\textsc{Reflect} loop (Figure~\ref{fig:architecture}), where an LLM agent autonomously:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Thinks}: Analyzes prior results, forms hypotheses, and designs experiments.
+    \item \textbf{Executes}: Implements code changes, performs mandatory dry-runs, and launches GPU training.
+    \item \textbf{Monitors}: Watches training at \textit{zero LLM cost} using only OS-level process checks.
+    \item \textbf{Reflects}: Parses training logs, evaluates metrics, and decides the next action.
+\end{enumerate}
+
+The key challenge in building such a system is \textit{cost}. A naive implementation that queries the LLM every few minutes to ``check progress'' would cost \$50+ per day. Our Zero-Cost Monitoring paradigm reduces this to \$0.08 per 24-hour cycle by eliminating all LLM calls during training. Combined with a constant-size memory system and minimal per-agent tool sets, Deep Researcher Agent makes 24/7 autonomous experimentation economically viable.
+
+Our contributions are summarized as follows:
+\begin{itemize}[nosep]
+    \item We propose a complete autonomous experiment framework with the \textsc{Think}$\rightarrow$\textsc{Execute}$\rightarrow$\textsc{Reflect} loop for deep learning research.
+    \item We introduce Zero-Cost Monitoring, a design paradigm achieving zero LLM API cost during the training phase, which typically constitutes 90\%+ of wall-clock time.
+    \item We design a Two-Tier Constant-Size Memory architecture bounded at $\sim$5K characters with automatic compaction, enabling indefinite operation without context overflow.
+    \item We propose a Minimal-Toolset Leader-Worker Architecture that reduces per-call token overhead by 73\% compared to full-toolset approaches.
+    \item We validate through extensive real-world deployment: 500+ autonomous cycles, 30+ days continuous operation, and 52\% metric improvement across 4 concurrent projects.
+\end{itemize}
