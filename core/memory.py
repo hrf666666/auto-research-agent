@@ -198,6 +198,44 @@ class MemoryManager:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_expval_cycle ON experiment_value(cycle);
+
+                CREATE TABLE IF NOT EXISTS code_review_lessons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    cycle INTEGER NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'MEDIUM',
+                    category TEXT NOT NULL DEFAULT '',
+                    pattern TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    file_pattern TEXT NOT NULL DEFAULT '',
+                    code_snippet TEXT NOT NULL DEFAULT '',
+                    fix_suggestion TEXT NOT NULL DEFAULT '',
+                    evidence TEXT NOT NULL DEFAULT '',
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    last_hit_cycle INTEGER,
+                    source TEXT NOT NULL DEFAULT 'auto'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_lesson_pattern ON code_review_lessons(pattern);
+                CREATE INDEX IF NOT EXISTS idx_lesson_severity ON code_review_lessons(severity);
+                CREATE INDEX IF NOT EXISTS idx_lesson_category ON code_review_lessons(category);
+
+                -- v15: Research Roadmap history
+                CREATE TABLE IF NOT EXISTS roadmap_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    cycle INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    module_name TEXT NOT NULL DEFAULT '',
+                    old_phase TEXT NOT NULL DEFAULT '',
+                    new_phase TEXT NOT NULL DEFAULT '',
+                    details TEXT NOT NULL DEFAULT '',
+                    global_phase TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_roadmap_cycle ON roadmap_history(cycle);
+                CREATE INDEX IF NOT EXISTS idx_roadmap_module ON roadmap_history(module_name);
+                CREATE INDEX IF NOT EXISTS idx_roadmap_event ON roadmap_history(event_type);
             """)
 
     def record_cycle_outcome(self, cycle: int, think_result: dict,
@@ -239,15 +277,15 @@ class MemoryManager:
                 verify_dict.get("passed", 0),
                 verify_dict.get("failed", 0),
                 verify_dict.get("warnings", 0),
-                "; ".join(verify_dict.get("diagnosis", []))[:1000],
+                "; ".join(str(d) for d in (verify_dict.get("diagnosis") or []))[:1000],
                 json.dumps(metrics, ensure_ascii=False),
-                reflect_result.get("milestone", "")[:500],
-                reflect_result.get("decision", "")[:500],
-                reflect_result.get("dead_end", "")[:500],
-                reflect_result.get("active_problem", "")[:500],
-                reflect_result.get("module_failure", "")[:500],
+                (reflect_result.get("milestone") or "")[:500],
+                (reflect_result.get("decision") or "")[:500],
+                (reflect_result.get("dead_end") or "")[:500],
+                (reflect_result.get("active_problem") or "")[:500],
+                (reflect_result.get("module_failure") or "")[:500],
                 duration,
-                execute_result.get("response", "")[:500],
+                (execute_result.get("response") or "")[:500],
             ))
 
     def _record_memory_entry(self, entry_type: str, content: str, cycle: int = None):
@@ -306,6 +344,53 @@ class MemoryManager:
                 ORDER BY timestamp ASC
             """).fetchall()
             return [r[0] for r in rows]
+
+    def get_dead_ends_by_category(self, category: str = None) -> list[dict]:
+        """Get dead ends grouped by failure_category (v12).
+
+        Returns structured dead end entries with their categories, enabling
+        the system to distinguish hypothesis failures from method inadequacies.
+
+        Args:
+            category: If provided, filter to this specific category.
+                One of: 'hypothesis_wrong', 'implementation_bug',
+                'insufficient_experiment', 'method_inadequacy'.
+        """
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            if category:
+                rows = conn.execute("""
+                    SELECT content, failure_category, timestamp, cycle
+                    FROM memory_entries
+                    WHERE entry_type = 'dead_end' AND failure_category = ?
+                    ORDER BY timestamp ASC
+                """, (category,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT content, failure_category, timestamp, cycle
+                    FROM memory_entries
+                    WHERE entry_type = 'dead_end'
+                    ORDER BY timestamp ASC
+                """).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_method_inadequacy_count(self) -> int:
+        """Count dead ends categorized as 'method_inadequacy' (v12).
+
+        These are dead ends where the analysis method was too narrow,
+        not the hypothesis itself being wrong. High count suggests the
+        direction should be retried with broader analysis.
+        """
+        with sqlite3.connect(str(self.db_path)) as conn:
+            try:
+                count = conn.execute("""
+                    SELECT COUNT(*) FROM memory_entries
+                    WHERE entry_type = 'dead_end' AND failure_category = 'method_inadequacy'
+                """).fetchone()[0]
+                return count
+            except Exception:
+                # Column may not exist yet (pre-v12 database)
+                return 0
 
     def get_recent_failures(self, count: int = 5) -> list[dict]:
         """Get recent experiment failures for REFLECT context."""
@@ -694,12 +779,41 @@ class MemoryManager:
 
         self._write_log(sections)
 
-    def log_dead_end(self, entry: str, cycle: int = None):
-        """Add a dead end (failed approach). Dead ends are NEVER deleted to prevent repeating mistakes."""
+    def log_dead_end(self, entry: str, cycle: int = None, failure_category: str = ""):
+        """Add a dead end (failed approach). Dead ends are NEVER deleted to prevent repeating mistakes.
+
+        Args:
+            entry: Description of the failed approach and WHY it failed.
+            cycle: Cycle number when the dead end occurred.
+            failure_category: One of 'hypothesis_wrong', 'implementation_bug',
+                'insufficient_experiment', 'method_inadequacy'. Used for
+                structured retrieval and preventing false-negative dead ends.
+        """
         sections = self._parse_log()
         timestamp = time.strftime("%m-%d %H:%M")
-        sections["dead_ends"].append(f"[{timestamp}] {entry}")
-        self._record_memory_entry("dead_end", entry, cycle)
+        # Prepend category tag for structured retrieval
+        if failure_category:
+            tagged_entry = f"[{failure_category}] [{timestamp}] {entry}"
+        else:
+            tagged_entry = f"[{timestamp}] {entry}"
+        sections["dead_ends"].append(tagged_entry)
+        # Record to SQLite with category
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("""
+                INSERT INTO memory_entries (timestamp, entry_type, content, cycle, in_llm_context)
+                VALUES (?, ?, ?, ?, 1)
+            """, (time.time(), "dead_end", tagged_entry, cycle))
+            # Also update category if column exists (v12 migration)
+            try:
+                conn.execute("""
+                    ALTER TABLE memory_entries ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''
+                """)
+            except Exception:
+                pass  # Column already exists
+            if failure_category:
+                conn.execute("""
+                    UPDATE memory_entries SET failure_category = ? WHERE content = ? AND entry_type = 'dead_end'
+                """, (failure_category, tagged_entry))
         self._write_log(sections)
 
     def log_active_problem(self, entry: str, cycle: int = None):
@@ -750,6 +864,156 @@ class MemoryManager:
             sections["decisions"] = major + routine
 
         self._write_log(sections)
+
+    # ─────────────────────────────────────────────────
+    # Code Review Lessons (Knowledge Base)
+    # ─────────────────────────────────────────────────
+
+    def record_code_review_lesson(
+        self,
+        cycle: int,
+        severity: str,
+        category: str,
+        pattern: str,
+        description: str,
+        file_pattern: str = "",
+        code_snippet: str = "",
+        fix_suggestion: str = "",
+        evidence: str = "",
+        source: str = "auto",
+    ):
+        """Record a code review lesson learned from a past mistake.
+
+        Deduplicates by pattern+category: if an identical pattern already exists,
+        increments hit_count and updates last_hit_cycle instead of inserting a row.
+        """
+        now = time.time()
+        with sqlite3.connect(str(self.db_path)) as conn:
+            existing = conn.execute(
+                "SELECT id, hit_count, severity FROM code_review_lessons WHERE pattern = ? AND category = ?",
+                (pattern, category),
+            ).fetchone()
+            if existing:
+                # Severity ordering: HIGH=2 > MEDIUM=1 > LOW=0
+                sev_rank = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
+                old_sev = existing[2]
+                new_sev = severity if sev_rank.get(severity, 1) > sev_rank.get(old_sev, 1) else old_sev
+                conn.execute(
+                    "UPDATE code_review_lessons SET hit_count = hit_count + 1, "
+                    "last_hit_cycle = ?, timestamp = ?, "
+                    "evidence = COALESCE(?, evidence), "
+                    "fix_suggestion = COALESCE(?, fix_suggestion), "
+                    "severity = ? "
+                    "WHERE id = ?",
+                    (cycle, now, evidence or None, fix_suggestion or None, new_sev, existing[0]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO code_review_lessons "
+                    "(timestamp, cycle, severity, category, pattern, description, "
+                    "file_pattern, code_snippet, fix_suggestion, evidence, hit_count, last_hit_cycle, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (now, cycle, severity, category, pattern, description,
+                     file_pattern, code_snippet, fix_suggestion, evidence, cycle, source),
+                )
+
+    def get_code_review_lessons(self, severity: str = None, category: str = None, limit: int = 30) -> list[dict]:
+        """Retrieve code review lessons, optionally filtered."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM code_review_lessons WHERE 1=1"
+            params = []
+            if severity:
+                # Severity is TEXT ("HIGH"/"MEDIUM"/"LOW") — use IN clause
+                sev_rank = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
+                min_rank = sev_rank.get(severity, 1)
+                allowed = [s for s, r in sev_rank.items() if r >= min_rank]
+                placeholders = ",".join("?" * len(allowed))
+                query += f" AND severity IN ({placeholders})"
+                params.extend(allowed)
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+            query += " ORDER BY hit_count DESC, timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def search_relevant_lessons(self, code_content: str, limit: int = 10) -> list[dict]:
+        """Find lessons relevant to the given code content.
+
+        Uses pattern matching against the code to find historically-relevant
+        mistakes. This is the key method for context injection.
+        """
+        if not code_content:
+            return []
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            # Cap at 100 most-relevant candidates to avoid loading entire table
+            rows = conn.execute(
+                "SELECT * FROM code_review_lessons ORDER BY hit_count DESC, timestamp DESC LIMIT 100"
+            ).fetchall()
+
+            scored = []
+            code_lower = code_content.lower()
+            for row in rows:
+                lesson = dict(row)
+                pattern = lesson.get("pattern", "").lower()
+                cat = lesson.get("category", "").lower()
+
+                # Require at least one keyword match for relevance
+                pattern_match = bool(pattern and pattern in code_lower)
+                cat_match = bool(cat and cat in code_lower)
+                if not pattern_match and not cat_match:
+                    continue
+
+                score = 0
+                if pattern_match:
+                    score += 10
+                if cat_match:
+                    score += 5
+                # hit_count as tiebreaker (scaled down to not dominate)
+                score += min(lesson["hit_count"], 10)
+                sev_boost = {"HIGH": 5, "MEDIUM": 2, "LOW": 0}
+                score += sev_boost.get(lesson.get("severity", "MEDIUM"), 0)
+
+                lesson["_relevance_score"] = score
+                scored.append(lesson)
+
+            scored.sort(key=lambda x: x["_relevance_score"], reverse=True)
+            return scored[:limit]
+
+    def format_lessons_for_context(self, lessons: list[dict], max_chars: int = 2000) -> str:
+        """Format lessons as a compact string for LLM context injection."""
+        if not lessons:
+            return ""
+
+        lines = ["## Code Review Lessons (PAST MISTAKES TO AVOID)", ""]
+        used = len(lines[0]) + len(lines[1])
+
+        for lesson in lessons:
+            sev = lesson.get("severity", "MEDIUM")
+            hits = lesson.get("hit_count", 1)
+            pattern = lesson.get("pattern", "?")
+            desc = lesson.get("description", "")
+            fix = lesson.get("fix_suggestion", "")
+
+            entry = f"- [{sev}] (hit {hits}x) **{pattern}**: {desc[:200]}"
+            if fix:
+                entry += f" → Fix: {fix[:150]}"
+
+            if used + len(entry) > max_chars:
+                break
+            lines.append(entry)
+            used += len(entry)
+
+        lines.append("")
+        lines.append(
+            "**IMPORTANT**: These are mistakes the agent has made before. "
+            "Check the current code for these patterns BEFORE writing any code."
+        )
+        return "\n".join(lines)
 
     def _init_log(self):
         """Create initial empty memory log."""
@@ -885,3 +1149,52 @@ class MemoryManager:
         lines.append("")
 
         return "\n".join(lines)
+
+    # ── v15: Roadmap History ──
+
+    def log_roadmap_update(self, cycle: int, event_type: str, module_name: str = "",
+                           old_phase: str = "", new_phase: str = "",
+                           details: str = "", global_phase: str = ""):
+        """Record a ROADMAP state change to the roadmap_history table.
+
+        Args:
+            cycle: Current cycle number
+            event_type: "phase_advance" | "dead_end" | "generated" | "deviation" | "alignment_reset"
+            module_name: Name of the affected module
+            old_phase: Previous phase of the module
+            new_phase: New phase of the module
+            details: Description of the change
+            global_phase: Current global research phase
+        """
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    """INSERT INTO roadmap_history
+                       (timestamp, cycle, event_type, module_name, old_phase, new_phase, details, global_phase)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (time.time(), cycle, event_type, module_name, old_phase, new_phase,
+                     details[:500], global_phase),
+                )
+        except Exception as e:
+            logger.debug(f"Failed to log roadmap update: {e}")
+
+    def get_roadmap_history(self, module_name: str = None, event_type: str = None,
+                            limit: int = 20) -> list[dict]:
+        """Query roadmap history for a module or event type."""
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                query = "SELECT * FROM roadmap_history WHERE 1=1"
+                params = []
+                if module_name:
+                    query += " AND module_name = ?"
+                    params.append(module_name)
+                if event_type:
+                    query += " AND event_type = ?"
+                    params.append(event_type)
+                query += " ORDER BY timestamp DESC LIMIT ?"
+                params.append(limit)
+                rows = conn.execute(query, params).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []

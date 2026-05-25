@@ -33,7 +33,8 @@ class ModuleSpec:
 
     def __init__(self, name: str, function: str, inputs: list[str], outputs: list[str],
                  assumptions: list[str], capacity_hint: str = "medium",
-                 dependencies: list[str] = None):
+                 dependencies: list[str] = None,
+                 verification_methods: list[str] = None):
         self.name = name
         self.function = function  # What this module does
         self.inputs = inputs       # Expected input types/shapes
@@ -41,6 +42,7 @@ class ModuleSpec:
         self.assumptions = assumptions  # Physical/mathematical assumptions
         self.capacity_hint = capacity_hint  # "light", "medium", "heavy"
         self.dependencies = dependencies or []  # Other modules this depends on
+        self.verification_methods = verification_methods or []  # v15: ≥3 methods to verify assumptions
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +53,7 @@ class ModuleSpec:
             "assumptions": self.assumptions,
             "capacity_hint": self.capacity_hint,
             "dependencies": self.dependencies,
+            "verification_methods": self.verification_methods,
         }
 
 
@@ -563,6 +566,8 @@ class IdeaPlanner:
                     assumptions=self._get_module_assumptions(mod_name, pattern),
                     capacity_hint=self._estimate_module_capacity(mod_name, brief_text),
                     dependencies=dep,
+                    verification_methods=self._suggest_verification_methods(
+                        mod_name, self._get_module_assumptions(mod_name, pattern), pattern),
                 ))
 
         # Secondary patterns add branch modules (skip fusion/decoder if already present)
@@ -587,6 +592,8 @@ class IdeaPlanner:
                     assumptions=self._get_module_assumptions(mod_name, pattern),
                     capacity_hint=self._estimate_module_capacity(mod_name, brief_text),
                     dependencies=backbone_name,  # Parallel: all branches depend on backbone
+                    verification_methods=self._suggest_verification_methods(
+                        mod_name, self._get_module_assumptions(mod_name, pattern), pattern),
                 ))
 
         # If no patterns matched, create generic decomposition
@@ -664,6 +671,53 @@ class IdeaPlanner:
         if isinstance(rules, dict):
             return [f"{k}: {v}" for k, v in rules.items()][:3]
         return []
+
+    def _suggest_verification_methods(self, mod_name: str, assumptions: list[str],
+                                       pattern: dict = None) -> list[str]:
+        """Suggest 3-6 independent verification methods for a module's assumptions (max 7).
+
+        v15: Each module must have verification methods to test assumptions
+        BEFORE implementation begins. This is the core of structured research.
+        """
+        methods = []
+        asm_text = "; ".join(assumptions[:2]) if assumptions else "core assumption"
+
+        # Method 1: Statistical / quantitative verification
+        methods.append(
+            f"Statistical analysis: test '{asm_text}' by computing "
+            f"distributions, correlations, or significance tests on dataset "
+            f"features relevant to {mod_name}"
+        )
+
+        # Method 2: Visualization / qualitative verification
+        methods.append(
+            f"Visualization: plot feature distributions, t-SNE embeddings, or "
+            f"heatmaps to visually verify whether '{asm_text}' is observable "
+            f"in the data for {mod_name}"
+        )
+
+        # Method 3: Small-scale probing
+        methods.append(
+            f"Small-scale probe: on 10-50 samples, manually inspect whether "
+            f"{mod_name}'s expected behavior ('{asm_text}') manifests — "
+            f"no model training required"
+        )
+
+        # Method 4: Cross-assumption consistency (if multiple assumptions)
+        if len(assumptions) >= 2:
+            methods.append(
+                f"Cross-assumption check: verify whether {assumptions[0][:60]} "
+                f"is consistent with {assumptions[1][:60]} in the dataset"
+            )
+
+        # Method 5: Literature cross-reference
+        if pattern and pattern.get("description"):
+            methods.append(
+                f"Literature check: find published evidence for '{asm_text}' "
+                f"in papers related to {pattern.get('description', '')[:60]}"
+            )
+
+        return methods[:7]  # Cap at 7 methods
 
     def _estimate_module_capacity(self, mod_name: str, brief_text: str) -> str:
         """Estimate whether this module should be light/medium/heavy."""

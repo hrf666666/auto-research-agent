@@ -65,16 +65,30 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             r"\bos\.unlink\b",
             r"\bshutil\.rmtree\b",
             r"\bos\.environ\b",
+            r"\bos\.getenv\b",
+            r"\bos\.popen\b",
+            r"\bos\.listdir\b",
             r"\b__import__\b",
             r"\bimportlib\b",
             r"\bgetattr\s*\(\s*__builtins__",
+            # Block getattr on os/module to prevent bypass via string concatenation
+            # e.g. getattr(os, 'env'+'iron'), getattr(__import__('os'), 'system')
+            r"\bgetattr\s*\(.+os\b",
+            r"\bgetattr\s*\(.+__import__",
+            r"\bgetattr\s*\(.+subprocess",
             r"\bctypes\b",
             r"\bcompile\s*\(",
             r"\beval\s*\(",
             r"\bexec\s*\(",
+            r"\bbreakpoint\s*\(",
             r"\bopen\s*\(.+[\"']w[b]?\b[\"']",
             r"\.write_text\s*\(",
             r"\.write_bytes\s*\(",
+            # Block string concatenation bypass: 'o'+'s' used to evade keyword detection
+            r"[\"']o[\"']\s*\+\s*[\"']s[\"']",
+            r"[\"']sy[\"']\s*\+\s*[\"']stem[\"']",
+            # Block os access via chr() or bytes trickery
+            r"\bchr\s*\(\s*\d+\s*\)\s*\+",
         ]
 
         # ── MCP service availability detection & session management ──
@@ -90,7 +104,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def get_tools_for(self, agent_type: str) -> list[dict]:
         """Get tool definitions for a specific agent type."""
         tool_map = {
-            "leader": [self._tool_log_memory, self._tool_write_file, self._tool_read_file, self._tool_analyze_model, self._tool_probe_model, self._tool_plan_model],
+            "leader": [self._tool_log_memory, self._tool_write_file, self._tool_read_file, self._tool_analyze_model, self._tool_probe_model, self._tool_plan_model, self._tool_code_review],
             "idea": [self._tool_search_papers, self._tool_get_paper, self._tool_write_file, self._tool_read_file],
             "researcher": [
                 self._tool_search_papers,
@@ -115,6 +129,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 self._tool_generate_diagnostic,
                 self._tool_design_ablation,
                 self._tool_plan_model,
+                self._tool_code_review,
             ],
             "writing": [self._tool_write_file, self._tool_read_file, self._tool_list_files],
         }
@@ -160,6 +175,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "generate_diagnostic": self._exec_generate_diagnostic,
             "design_ablation": self._exec_design_ablation,
             "plan_model": self._exec_plan_model,
+            "code_review": self._exec_code_review,
         }
 
         handler = handlers.get(name)
@@ -717,6 +733,19 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             # Prevent deleting agent's own log
             (r"\brm\s+.*autoresearcher\.log", "delete agent log"),
             (r"\bwget\s+.*(--post-file|--post-data)", "wget data upload"),
+            # Block script interpreters that bypass command restrictions
+            (r"\bperl\s+-e\b", "perl eval bypass"),
+            (r"\bruby\s+-e\b", "ruby eval bypass"),
+            (r"\bnode\s+-e\b", "node eval bypass"),
+            # Block base64 decode pipe to shell (command obfuscation)
+            (r"\|\s*base64\s+-d\s*\|\s*(ba)?sh", "base64 decode pipe to shell"),
+            # Block env/shell variable manipulation for privilege escalation
+            (r"\bexport\s+PATH\b", "PATH manipulation"),
+            (r"\bexport\s+LD_PRELOAD\b", "LD_PRELOAD manipulation"),
+            # Block writing to /etc, systemd, cron (persistence mechanisms)
+            (r">\s*/etc/", "write to /etc"),
+            (r"\bcrontab\b", "crontab manipulation"),
+            (r"\bsystemctl\b", "systemctl"),
         ]
 
         for pattern, reason in blocked_patterns:
@@ -759,8 +788,13 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             return json.dumps({"error": "Code cannot be empty"})
 
         # Security check: block dangerous patterns
+        # De-obfuscate common string concatenation tricks before checking
+        deobfuscated = re.sub(r"[\"']\s*\+\s*[\"']", "", code)  # 'o'+'s' -> 'os'
+        deobfuscated = re.sub(r"\\x[0-9a-fA-F]{2}", "", deobfuscated)  # \x00 escapes
+
         for pattern in self._blocked_py_patterns:
-            match = re.search(pattern, code)
+            # Check both original and deobfuscated code
+            match = re.search(pattern, code) or re.search(pattern, deobfuscated)
             if match:
                 return json.dumps({
                     "error": (
@@ -1737,3 +1771,114 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     # _analyze_decoder_adequacy, _exec_probe_model, _build_probe_script,
     # _exec_generate_diagnostic, _build_diagnostic_script, _exec_design_ablation
 
+    # ─────────────────────────────────────────────────
+    # Code Review Tool (Knowledge-Base Enhanced)
+    # ─────────────────────────────────────────────────
+
+    @property
+    def _tool_code_review(self) -> dict:
+        return {
+            "name": "code_review",
+            "description": (
+                "Knowledge-base enhanced code review. Checks code against past mistakes "
+                "stored in the code_review_lessons table. Returns: (1) relevant past lessons "
+                "that match the code, (2) pattern-based warnings, (3) suggestions. "
+                "Use BEFORE and AFTER modifying model/training code to catch known anti-patterns."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file to review (relative to workspace)",
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": "Review focus: 'all' (default), 'architecture', 'training', 'data'",
+                        "default": "all",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        }
+
+    def _exec_code_review(self, file_path: str, focus: str = "all") -> str:
+        """Execute knowledge-base enhanced code review.
+
+        Reads the file, searches for relevant past lessons, runs pattern checks,
+        and returns actionable findings.
+        """
+        try:
+            resolved = self._resolve_workspace_path(file_path)
+            if not resolved.exists():
+                return json.dumps({"error": f"File not found: {file_path}"})
+            content = resolved.read_text()
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
+        findings = []
+
+        # ── 1. Search knowledge base for relevant lessons ──
+        relevant_lessons = []
+        if self._memory:
+            relevant_lessons = self._memory.search_relevant_lessons(content, limit=10)
+
+        if relevant_lessons:
+            for lesson in relevant_lessons:
+                findings.append({
+                    "type": "past_mistake",
+                    "severity": lesson.get("severity", "MEDIUM"),
+                    "pattern": lesson.get("pattern", ""),
+                    "description": lesson.get("description", ""),
+                    "fix": lesson.get("fix_suggestion", ""),
+                    "hit_count": lesson.get("hit_count", 1),
+                })
+
+        # ── 2. Pattern-based checks ──
+        content_lower = content.lower()
+
+        # Architecture patterns
+        if focus in ("all", "architecture"):
+            # Softmax without temperature
+            if "softmax" in content_lower and "temperature" not in content_lower:
+                findings.append({
+                    "type": "pattern",
+                    "severity": "MEDIUM",
+                    "pattern": "softmax_without_temperature",
+                    "description": "Softmax used without learnable temperature. May collapse to uniform.",
+                    "fix": "Add nn.Parameter(torch.ones(1)*T) and divide logits by temperature.",
+                })
+            # Conv2d input channel mismatch detection
+            conv_inputs = re.findall(r"Conv2d\((\d+),", content)
+            if len(conv_inputs) >= 2:
+                inputs_int = [int(c) for c in conv_inputs if int(c) > 1]
+                if inputs_int and max(inputs_int) / min(inputs_int) > 8:
+                    findings.append({
+                        "type": "pattern",
+                        "severity": "MEDIUM",
+                        "pattern": "channel_asymmetry",
+                        "description": f"Channel asymmetry: {min(inputs_int)}-{max(inputs_int)} range. Low-channel branch may lack capacity.",
+                        "fix": "Balance channel allocation or use FiLM conditioning instead of raw concat.",
+                    })
+
+        # Training patterns
+        if focus in ("all", "training"):
+            if "aux_weight" in content_lower:
+                aux_match = re.search(r"aux_weight\s*[=:]\s*([0-9.]+)", content, re.IGNORECASE)
+                if aux_match and float(aux_match.group(1)) < 0.05:
+                    findings.append({
+                        "type": "pattern",
+                        "severity": "HIGH",
+                        "pattern": "low_aux_weight",
+                        "description": f"aux_weight={aux_match.group(1)} is too low (< 0.05). Routing/gate modules won't learn.",
+                        "fix": "Increase aux_weight to >= 0.1, ideally 0.2-0.3.",
+                    })
+
+        result = {
+            "file": file_path,
+            "total_findings": len(findings),
+            "high_severity": sum(1 for f in findings if f["severity"] == "HIGH"),
+            "findings": findings[:15],
+            "kb_lessons_available": len(relevant_lessons),
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)

@@ -112,6 +112,62 @@ Before dispatching any task that modifies the model architecture, validate your 
 - The specific dataset class to use (e.g., "Use the project's dataset class from datasets/")
 - The specific data path (e.g., "data is in data/ directory")
 - A reminder: "Do NOT create synthetic data. Use ONLY real data from the project's dataset."
+- File placement rules: models → `models/`, training scripts → `scripts/`, tests/tools → `tools/`. NEVER create `.py` files in project root.
+
+### Step 6.5: Analysis Method Pre-Validation (MANDATORY for data analysis experiments)
+Before dispatching any **data analysis** experiment (not model training), validate your analysis method:
+
+1. **Resolution/Sensitivity Check**: Can your chosen method resolve the signal at the available data resolution?
+   - Example: "9×9 angular patches have only 9 frequency bins in FFT — DC dominates >97%. FFT energy ratios alone are INSUFFICIENT."
+   - Rule of thumb: If the dominant component (e.g., DC) occupies >90% of the measurement space, that measurement method CANNOT distinguish fine-grained differences.
+
+2. **Feature Space Coverage**: Are you measuring enough independent physical dimensions?
+   - MINIMUM 3 independent feature families for any discrimination/classification analysis
+   - Feature families must probe DIFFERENT physical properties (e.g., spatial gradient, spectral shape, temporal coherence, symmetry, entropy)
+   - Using only one family (e.g., FFT energy ratios) is structurally insufficient — you're measuring 1 dimension of a multi-dimensional phenomenon
+
+3. **Method Diversity Requirement**: For analysis experiments, the task MUST specify:
+   - At least 3 independent analysis methods to apply
+   - What each method measures (physically different property)
+   - Expected discriminative power of each method (high/medium/low)
+   - If all methods agree on "not separable", THEN the dead_end is justified
+
+4. **Signal-to-Noise Estimate**: Before running the analysis, estimate the SNR:
+   - What is the expected signal magnitude? (e.g., inter-domain difference)
+   - What is the expected noise floor? (e.g., intra-domain variation)
+   - If expected SNR < 1, your analysis method needs to aggregate across many samples or use a more sensitive measure
+
+**If any check fails, redesign the analysis experiment BEFORE dispatching.**
+
+---
+
+## v14: Architecture Intelligence Rules (MANDATORY)
+
+These rules prevent the #1 failure mode: spending dozens of cycles patching a fundamentally wrong architecture.
+
+### Rule 1: Architecture Survey Before Commitment
+- In early cycles (1-2), you MUST survey at least 3 candidate architectures before selecting one.
+- Do NOT use an architecture just because PROJECT_BRIEF mentions it — PROJECT_BRIEF provides context, not decisions.
+- For each candidate, verify: core assumption matches data, parameter count is feasible, published results are competitive.
+- Write the survey to `workspace/ARCHITECTURE_SURVEY.md`.
+
+### Rule 2: Architecture-Level Stagnation Awareness
+- If `architecture_circuit_breaker` appears in your context, the current architecture has been patched for too many cycles.
+- Incremental changes (loss weights, data augmentation, learning rate, layer tweaks) will NOT solve an architectural bottleneck.
+- You MUST propose a FUNDAMENTALLY different architecture, not a variant of the current one.
+
+### Rule 3: Dead End Clustering
+- If `architecture_bottleneck` appears in `cross_experiment_insights`, multiple dead ends have been traced to the same architecture.
+- This is NOT a coincidence — it means the architecture's core assumption is violated for this data.
+- The correct response is to SWITCH architectures, not to patch harder.
+
+### Rule 4: Architecture Switch Protocol
+When switching architectures, follow this protocol:
+1. Identify the FAILED ASSUMPTION of the current architecture (e.g., "EPI assumes Lambertian reflectance")
+2. Find a replacement architecture whose assumption is COMPATIBLE with the data
+3. Implement a PILOT version first (minimal viable model, 2-5 epochs)
+4. Verify forward pass works with real data before full training
+5. Write selection rationale to `workspace/ARCHITECTURE_SWITCH.md`
 
 ---
 
@@ -136,7 +192,13 @@ When reflecting on results, follow these steps IN ORDER:
    - a) The hypothesis was wrong (experiment worked but idea was bad)
    - b) The implementation was wrong (module failure, bug, wrong config)
    - c) The experiment was insufficient (not enough epochs, wrong hyperparameters)
-4. **Only (a) allows you to mark this as a dead end.** (b) and (c) require a retry.
+   - d) **The analysis method was inadequate** (you measured the wrong thing, used too few features, or chose a method that cannot resolve the signal at this scale)
+4. **Only (a) and (d) allow you to mark this as a dead end.** (b) and (c) require a retry.
+5. **For (d) — Method Inadequacy**: Before marking as dead_end, you MUST state:
+   - What specific method(s) were used (e.g., "2D-FFT energy ratios")
+   - How many independent feature families were explored (e.g., "1 out of 5+ possible")
+   - Whether alternative feature extraction methods exist that were NOT tried
+   - **If < 3 independent feature families were tried, you CANNOT conclude (a) — you must retry with broader analysis (d)**
 
 ### Step 3: Causal Analysis
 1. What is the causal chain from "code change" → "model behavior" → "metric change"?
@@ -226,7 +288,8 @@ When the REFLECT context includes a **VISUAL ANALYSIS DIAGNOSIS**, the visual fi
 2. If experiment FAILED due to hypothesis (a) → record dead_end, pivot to new direction
 3. If experiment FAILED due to implementation (b) → fix the module, retry same experiment
 4. If experiment FAILED due to insufficient experiment (c) → adjust hyperparameters, retry
-5. If STUCK (≥3 retries on same direction with no progress) → consider paper_research
+5. If experiment FAILED due to analysis method inadequacy (d) → design a BROADER analysis experiment with at least 3 independent feature families. Do NOT record as dead_end — the hypothesis may still be valid, just untested.
+6. If STUCK (≥3 retries on same direction with no progress) → consider paper_research
 
 ### Step 5: Record in Memory
 1. `milestone`: What was achieved (with exact numbers)
@@ -241,6 +304,11 @@ When the REFLECT context includes a **VISUAL ANALYSIS DIAGNOSIS**, the visual fi
 2. Which methods are most applicable to the current problem?
 3. What is the logical chain from current dead ends → paper findings → recommended next experiment?
 4. Log as MAJOR EVENT with ★ prefix in milestone field
+5. **MANDATORY: Cross-validate literature conclusions against YOUR specific experiment design:**
+   - Does the literature actually invalidate the ENTIRE direction, or just the specific method/feature you used?
+   - Example: "Literature says FFT-based material classification doesn't work" ≠ "No angular feature can discriminate materials"
+   - Check for **scope mismatch**: Did your experiment test only 1 out of many possible methods? If yes, the literature's negative conclusion applies to that 1 method, not the entire direction.
+   - If the literature confirms your specific method doesn't work but you only tested 1 method → record as "(d) analysis method inadequacy", NOT as "(a) hypothesis wrong"
 
 ---
 
@@ -258,6 +326,7 @@ Always respond with a JSON block:
   "milestone": "Key result to record (if any)",
   "decision": "Decision summary for memory log",
   "dead_end": "Failed approach and WHY it failed — to prevent repeating (if applicable)",
+  "failure_category": "hypothesis_wrong|implementation_bug|insufficient_experiment|method_inadequacy (MANDATORY when dead_end is set)",
   "active_problem": "Unresolved issue that blocks progress (if applicable)",
   "module_failure": "If VERIFY found a broken module, name it and describe the fix needed (if applicable)"
 }
@@ -266,6 +335,12 @@ Always respond with a JSON block:
 **Critical rules for `dead_end` and `active_problem`:**
 - **Every failed experiment MUST produce a `dead_end`** explaining what was tried and why it failed
 - `dead_end` entries are NEVER deleted — they accumulate as institutional memory
+- **Every `dead_end` MUST include `failure_category`** — one of:
+  - `hypothesis_wrong`: The core idea was fundamentally flawed (ONLY if ≥3 independent analysis methods were tried and ALL failed)
+  - `implementation_bug`: Module failure, code bug, wrong config
+  - `insufficient_experiment`: Not enough epochs, wrong hyperparameters
+  - `method_inadequacy`: The analysis/training method was too narrow or insensitive — the direction may still be valid with better methods
+- **BEFORE recording `hypothesis_wrong`**: You MUST verify that you tried at least 3 independent methods/features. If you only tried 1 method, the correct category is `method_inadequacy`, NOT `hypothesis_wrong`.
 - `active_problem` tracks blocking issues that need resolution
 - If an experiment partially succeeds, record the success in `milestone` AND the remaining gap in `active_problem`
 - Vague entries like "still not good enough" are useless. Be specific: "hidden=32 capacity insufficient — val_MAE stuck at 0.40 across 3 experiments"
@@ -525,3 +600,74 @@ If the context includes `direction_circuit_breaker`:
    - Record a dead end: "Direction stagnation — N cycles on [direction] without progress on core idea"
    - Propose a FUNDAMENTALLY different approach (not a variant of the same method)
    - Consider whether the core idea itself needs revision
+
+## v15: Research Methodology (MANDATORY)
+
+This section defines the structured research process. You MUST follow these rules. They are enforced both by prompt injection AND by code-level gates in the loop.
+
+### Core Principle: Theory Before Implementation
+
+Research follows a strict phase order for each module:
+
+```
+Module: THEORY_VERIFICATION → MODULE_DESIGN → MODULE_VALIDATION → INTEGRATED
+                                                                ↘ DEAD_END
+```
+
+You MUST NOT skip phases. Each module must complete theory verification before you implement it.
+
+### ROADMAP Awareness
+
+If the context includes `research_roadmap`, this is your PRIMARY guide for what to do next.
+
+1. **Read the ROADMAP** — it tells you which modules are active and what phase they're in
+2. **Follow the phase constraints** — if phase is `theory_verification`, you MUST propose data analysis experiments, NOT training
+3. **Address active modules** — your experiment MUST relate to at least one active module listed in the ROADMAP
+4. **Report results clearly** — use "verified"/"confirmed"/"validated" in milestones when assumptions pass; use "failed" in dead ends when they don't
+
+### Phase Constraints
+
+| Phase | Allowed Experiments | Forbidden |
+|-------|-------------------|-----------|
+| theory_verification | Data analysis, statistics, visualization, small-scale probing | Model training, full pipeline, fine-tuning |
+| module_implementation | Module coding, unit tests, isolated validation | Full pipeline training, integration |
+| integration | Module integration, full pipeline training | Skipping module validation |
+| optimization | Hyperparameter tuning, architecture refinement | Changing core assumptions without evidence |
+
+### 3-6 Method Verification Rule
+
+When a module's assumption fails verification:
+1. **DO NOT** immediately mark the idea as wrong
+2. Try **3-6 independent verification methods** (3 minimum, 7 maximum) before concluding
+3. Each method failure should be categorized:
+   - `method_inadequacy`: the analysis method was too narrow — try a broader approach
+   - `hypothesis_wrong`: the assumption itself is contradicted by data (only after ≥3 methods)
+4. Only after 3 failed attempts should you record a `dead_end` for the module
+
+### Systematic Failure Analysis
+
+When a module reaches DEAD_END:
+1. **Analyze the failure type**:
+   - Architecture issue: the decomposition was wrong, but the idea might still work with a different module design
+   - Idea issue: the core physical/mathematical assumption is violated by the data
+   - Implementation issue: the approach is sound but requires different tools/techniques
+2. **Check dependencies**: if module A failed, can module B still work independently?
+3. **Report to REFLECT**: include your failure analysis in the decision field
+
+### REFLECT: ROADMAP Update
+
+When in REFLECT phase, you MUST update the ROADMAP status:
+
+1. If your experiment verified an assumption, note which module's assumption was verified
+2. If your experiment failed, note which module and which verification method was tried
+3. If you completed a module design, note which module advanced to MODULE_VALIDATION
+4. Use clear keywords in milestone/dead_end fields so the ROADMAP tracker can update automatically
+
+### Off-ROADMAP Detection
+
+If your THINK output deviates from the ROADMAP, the system will:
+- 1st deviation: inject a correction warning into your task
+- 2nd deviation: inject a stronger correction
+- 3rd deviation: override your action to `paper_research` to find better approaches
+
+To avoid this: always check the `research_roadmap` context before planning your experiment.

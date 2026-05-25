@@ -303,9 +303,11 @@ class AgentDispatcher:
         # REFLECT phase: read_file + list_files for cross-validation
         reflect_tools = None
         if task == "reflect" and self.tools:
+            # Use public get_tools_for() to avoid fragile private method references
+            researcher_tools = self.tools.get_tools_for("researcher")
             reflect_tools = [
-                self.tools._tool_read_file,
-                self.tools._tool_list_files,
+                t for t in researcher_tools
+                if t.get("name") in ("read_file", "list_files")
             ]
 
         # Leader tasks (think/reflect) always use strong model
@@ -424,8 +426,13 @@ class AgentDispatcher:
                 )
 
                 # Check if the response indicates an API error (not a tool result)
-                if text.startswith('{"error"') and '"API' in text:
-                    raise RuntimeError(f"API returned error: {text[:200]}")
+                # Use JSON parsing to avoid false positives from normal text containing {"error"
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict) and parsed.get("error") and "API" in str(parsed.get("error", "")):
+                        raise RuntimeError(f"API returned error: {text[:200]}")
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Not JSON — likely a normal text response
 
                 # Success — reset failure counter
                 self._record_provider_success(provider_key)
@@ -596,7 +603,7 @@ class AgentDispatcher:
                 return json.dumps({"error": f"API key not configured for {provider_label}"})
 
             kwargs = {
-                "timeout": 300.0,  # 5 min total (vs default 10 min)
+                "timeout": 120.0,  # 2 min total (was 5 min — causes long hangs)
                 "max_retries": 1,  # 1 retry (vs default 2)
             }
             if base_url:
@@ -660,33 +667,43 @@ class AgentDispatcher:
 
                     choice = response.choices[0]
                     if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                        # Execute tools
+                        # ── Collect ALL tool_calls into ONE assistant message ──
+                        # OpenAI protocol requires exactly one assistant message with
+                        # all tool_calls, followed by individual tool result messages.
+                        # Appending per-tool assistant messages causes consecutive
+                        # assistant messages which violates the API contract.
+                        assistant_tool_calls = []
+                        pending_results = []  # [(tool_call_id, func_name, result_content)]
+
                         for tool_call in choice.message.tool_calls:
                             func_name = tool_call.function.name
+                            assistant_tool_calls.append({
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {"name": func_name, "arguments": tool_call.function.arguments}
+                            })
+
                             # Parse tool arguments with truncation recovery
                             raw_args = tool_call.function.arguments
-                            repaired = False  # track whether args were repaired from truncation
+                            repaired = False
                             try:
                                 func_args = json.loads(raw_args)
                             except json.JSONDecodeError:
-                                # LLM output may be truncated — try to repair
                                 func_args = self._repair_json_args(raw_args)
                                 if not func_args:
-                                    # Unrecoverable — skip this tool call
                                     logger.warning(f"Skipping {func_name}: JSON args irrecoverable")
-                                    api_messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call.id,
-                                        "content": json.dumps({
+                                    pending_results.append((
+                                        tool_call.id, func_name,
+                                        json.dumps({
                                             "error": "JSON arguments were truncated and could not be recovered. "
                                                      "Please retry with shorter/simpler arguments."
                                         })
-                                    })
+                                    ))
                                     continue
                                 repaired = True
                                 logger.warning(f"Recovered truncated JSON args for {func_name}: {str(func_args)[:200]}")
 
-                            # Ensure func_args is always a dict (some APIs return list/primitive)
+                            # Ensure func_args is always a dict
                             if not isinstance(func_args, dict):
                                 logger.warning(f"Tool args for {func_name} is {type(func_args).__name__}, wrapping in dict")
                                 func_args = {"raw": func_args}
@@ -699,15 +716,14 @@ class AgentDispatcher:
                                         f"Rejecting write_file to {func_args.get('path','?')}: "
                                         f"content appears truncated (ends with: ...{content[-50:]})"
                                     )
-                                    api_messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call.id,
-                                        "content": json.dumps({
+                                    pending_results.append((
+                                        tool_call.id, func_name,
+                                        json.dumps({
                                             "error": "File content was TRUNCATED by max_tokens. "
                                                      "The file was NOT written to avoid corruption. "
                                                      "Please split into smaller chunks or write only the changed sections."
                                         })
-                                    })
+                                    ))
                                     continue
 
                             logger.info(f"Executing tool: {func_name}")
@@ -739,43 +755,61 @@ class AgentDispatcher:
                                 else:
                                     consecutive_list_files = 0
                                     tool_result = self._execute_tool_with_trace(func_name, func_args, trace)
-                                api_messages.append({
-                                    "role": "assistant",
-                                    "tool_calls": [{
-                                        "id": tool_call.id,
-                                        "type": "function",
-                                        "function": {"name": func_name, "arguments": tool_call.function.arguments}
-                                    }]
-                                })
-
-                                # ── Inject turn budget reminder ──
-                                budget_msg = (
-                                    f"\n[SYSTEM] Turn {turn+1}/{max_turns}. "
-                                    f"Remaining: {max_turns - turn - 1}."
-                                )
-                                if max_turns - turn - 1 <= int(max_turns * 0.2):
-                                    budget_msg += (
-                                        " CRITICAL: Almost out of turns. "
-                                        "You MUST finish your primary task NOW or report failure."
-                                    )
-                                elif max_turns - turn - 1 <= int(max_turns * 0.4):
-                                    budget_msg += (
-                                        " WARNING: Past 60% of budget. "
-                                        "Stop exploring and focus on the PRIMARY task."
-                                    )
-
-                                tool_content = str(tool_result)[:7900] + budget_msg
-                                api_messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": tool_content[:8000],
-                                })
+                                pending_results.append((tool_call.id, func_name, str(tool_result)))
                             else:
-                                api_messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": json.dumps({"error": f"Unknown tool: {func_name}"})
-                                })
+                                pending_results.append((
+                                    tool_call.id, func_name,
+                                    json.dumps({"error": f"Unknown tool: {func_name}"})
+                                ))
+
+                        # ── Append ONE assistant message with ALL tool_calls ──
+                        api_messages.append({
+                            "role": "assistant",
+                            "tool_calls": assistant_tool_calls,
+                        })
+
+                        # ── Append individual tool result messages ──
+                        budget_msg = (
+                            f"\n[SYSTEM] Turn {turn+1}/{max_turns}. "
+                            f"Remaining: {max_turns - turn - 1}."
+                        )
+                        if max_turns - turn - 1 <= int(max_turns * 0.2):
+                            budget_msg += (
+                                " CRITICAL: Almost out of turns. "
+                                "You MUST finish your primary task NOW or report failure."
+                            )
+                        elif max_turns - turn - 1 <= int(max_turns * 0.4):
+                            budget_msg += (
+                                " WARNING: Past 60% of budget. "
+                                "Stop exploring and focus on the PRIMARY task."
+                            )
+
+                        for tc_id, _fname, result_text in pending_results:
+                            # Smart truncation: try to keep metric-related lines
+                            if len(result_text) > 7900:
+                                lines = result_text.split('\n')
+                                metric_lines = [l for l in lines if any(
+                                    kw in l.lower() for kw in [
+                                        'mae', 'mse', 'loss', 'epoch', 'val_',
+                                        'best', 'metric', 'score', 'accuracy',
+                                        'routing_w', 'train_', 'final',
+                                    ]
+                                )]
+                                if metric_lines:
+                                    head = '\n'.join(lines[:20])
+                                    tail = '\n'.join(metric_lines[-30:])
+                                    truncated = f"{head}\n... [TRUNCATED] key metrics:\n{tail}"
+                                    tool_content = truncated[:7900]
+                                else:
+                                    tool_content = result_text[:7900]
+                            else:
+                                tool_content = result_text
+                            tool_content += budget_msg
+                            api_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": tool_content[:8000],
+                            })
                         continue
                     else:
                         # No more tool calls, return the response
@@ -917,6 +951,13 @@ class AgentDispatcher:
         for suffix in ['"}', '"}]', '"]}', '"}]}']:
             try:
                 return json.loads(raw + suffix)
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 1.5: handle single-quote JSON (LLMs sometimes use single quotes)
+        if "'" in raw and '"' not in raw:
+            try:
+                return json.loads(raw.replace("'", '"'))
             except json.JSONDecodeError:
                 pass
 
@@ -1129,6 +1170,15 @@ class AgentDispatcher:
                     diag = f.get("verify_diagnosis", "") or f.get("active_problem", "")
                     parts.append(f"- Cycle {f.get('cycle', '?')}: {diag[:150]}\n")
 
+        # ── Inject code review lessons from knowledge base ──
+        # These are past mistakes the agent has learned from.
+        code_review_lessons = context.get("code_review_lessons")
+        if code_review_lessons:
+            parts.append(f"\n{code_review_lessons}\n")
+        relevant_lessons = context.get("relevant_code_review_lessons")
+        if relevant_lessons:
+            parts.append(f"\n{relevant_lessons}\n")
+
         if context.get("experiment_result"):
             # Cap experiment result to prevent context overflow
             result_str = json.dumps(context['experiment_result'], indent=2)
@@ -1211,7 +1261,11 @@ class AgentDispatcher:
                     if depth == 0 and start is not None:
                         candidate = response[start:i + 1]
                         try:
-                            return json.loads(candidate)
+                            parsed = json.loads(candidate)
+                            # Validate it's a decision JSON with an "action" field
+                            if isinstance(parsed, dict) and "action" in parsed:
+                                return parsed
+                            # Not a decision — keep searching for the actual decision JSON
                         except json.JSONDecodeError:
                             # This brace pair wasn't valid JSON; keep searching
                             start = None

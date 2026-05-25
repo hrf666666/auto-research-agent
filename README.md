@@ -1,40 +1,288 @@
-<p align="center">
-  <img src="assets/banner.png" alt="Deep Researcher Agent" width="700"/>
-</p>
+<h1 align="center">Auto Research Agent</h1>
 
-<h1 align="center">Deep Researcher Agent</h1>
-<h3 align="center">24/7 Autonomous Deep Learning Experiment Agent</h3>
 
-<p align="center">
-  <strong>An AI agent that autonomously runs your deep learning experiments 24/7 while you sleep.</strong>
-</p>
+
 
 <p align="center">
   <a href="README.md">English</a> |
   <a href="docs/README_CN.md">中文</a> |
-
 </p>
 
-<p align="center">
-  <a href="#quickstart"><img src="https://img.shields.io/badge/-Quick_Start-blue?style=for-the-badge" alt="Quick Start"/></a>
-  <a href="docs/architecture.md"><img src="https://img.shields.io/badge/-Architecture-orange?style=for-the-badge" alt="Architecture"/></a>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"/>
-  <img src="https://img.shields.io/badge/Claude_Code-compatible-blueviolet.svg" alt="Claude Code"/>
-  <img src="https://img.shields.io/badge/Codex_CLI-compatible-green.svg" alt="Codex CLI"/>
-  <img src="https://img.shields.io/badge/license-Apache_2.0-green.svg" alt="License"/>
-  <a href="https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7/stargazers"><img src="https://img.shields.io/github/stars/Xiangyue-Zhang/auto-deep-researcher-24x7?color=yellow&logo=github&label=Stars" alt="Stars"/></a>
-</p>
-
-<p align="center">
-  <a href="https://arxiv.org/abs/2604.05854"><img src="https://img.shields.io/badge/Technical%20Report-2604.05854-b31b1b.svg" alt="Technical Report"/></a>
-</p>
+> **Attribution**: This project was originally derived from [auto-deep-researcher-24x7](https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7).
 
 ---
 
 ## Recent Updates
+
+**2026-05-25 (v15.5) — Research ROADMAP: Module-Level State Machine & Phase-Gated Research**
+
+*Prevents premature model training and enforces structured theory verification before committing GPU resources.*
+
+### Problem Solved
+Agent skipped theory verification and jumped directly to model training, wasting GPU hours on architectures whose underlying assumptions were never validated. Module verification used a hard "exactly 3 methods" requirement that was too rigid — some directions need more methods to properly disprove, while the dual deviation counter between ROADMAP and ResearchLoop could desync, causing stale state.
+
+### New Module (v15)
+- **`core/research_roadmap.py`** — Module-level state machine tracking research phases per module:
+  `theory_verification → module_design → module_validation → integrated → dead_end`
+
+### New Mechanisms (v15)
+
+| # | Mechanism | Phase | What It Does |
+|---|-----------|-------|-------------|
+| 1 | **Research ROADMAP** | THINK | Tracks per-module research phase. Each module must pass through theory_verification → module_design → module_validation before being marked integrated. |
+| 2 | **Phase-Gated Research** | THINK → EXECUTE | Code-level enforcement prevents premature model training during theory_verification phase. Only allows analysis/research tasks. |
+| 3 | **3-Strike Hard Gate** | THINK → EXECUTE | Deviation from ROADMAP phase: 1st = warning, 2nd = stronger warning, 3rd = force override to `paper_research`. Dual counter sync between `ResearchRoadmap._deviation_count` and `ResearchLoop._phase_violation_count`. |
+| 4 | **Circuit Breaker Priority** | THINK | ROADMAP overrides direction/architecture circuit breakers during theory_verification. |
+| 5 | **Flexible Method Verification** | VERIFY | 3-6 methods required per module (min 3, max 7) before dead_end marking. Not a hard 3 — supports directions needing deeper analysis. |
+| 6 | **Assumption-Embedded Methods** | THINK | `_suggest_verification_methods` embeds assumption text in every method description, adds cross-assumption consistency check when ≥2 assumptions exist. |
+
+### v15.5 Hardening (8 Code Review Fixes)
+
+| # | File | Fix |
+|---|------|-----|
+| 1 | `loop.py` + `research_roadmap.py` | `check_alignment()` no longer returns `should_force_paper_research`; loop.py solely controls 3-strike enforcement via `_phase_violation_count`. Sync-resets `roadmap._deviation_count` on hard gate trigger. |
+| 2 | `research_roadmap.py` + `loop.py` | New public properties `active_module_names` and `is_theory_verification_phase` replace private `_get_active_modules()` access. |
+| 3 | `research_roadmap.py` | `_is_training_task` rewritten with strong_indicators (e.g. "train the", "training", "epoch") and weak_indicators (e.g. "loss function", "loss curve") to avoid false positives on "information loss", "loss of detail". |
+| 4 | `research_roadmap.py` | `_is_task_related` improved with sub-token matching via `re.split(r"[_\s]+")`, dynamic threshold `max(2, len(words)//3)`, lower word length threshold (>3 instead of >4). |
+| 5 | `research_roadmap.py` | `MODULE_DESIGN` milestone handling: keywords "designed", "implemented", "coded", "built" advance to `MODULE_VALIDATION`. |
+| 6 | `idea_planner.py` | `_suggest_verification_methods` embeds assumption text in every method description, adds cross-assumption consistency check (method 4) when ≥2 assumptions exist. |
+| 7 | `research_roadmap.py` | Markdown parser regex changed from `\[\\w+\]` to `\[\\w_-+\]`, added evidence extraction from next line. |
+| 8 | `context_keys.py` | Removed orphan `roadmap_alignment_warning` ContextKey (registered but never used in context injection flow). |
+
+### Key Changes
+- `core/research_roadmap.py`: New ROADMAP module (~500 lines)
+- `core/loop.py`: `_enforce_roadmap_alignment()`, ROADMAP-aware direction circuit breaker
+- `core/idea_planner.py`: Cross-assumption consistency check in method suggestions
+- `core/context_keys.py`: Cleanup of orphan key
+- `agents/leader.md`: v15 rules for ROADMAP awareness and phase constraints
+
+### Module Size After v15.5
+
+| Module | v14 | v15.5 |
+|--------|-----|-------|
+| `core/loop.py` | ~4,150 | ~4,350 |
+| `core/research_roadmap.py` | — | ~500 |
+| `core/idea_planner.py` | 1,059 | ~1,070 |
+| `core/context_keys.py` | 194 | 193 |
+| **Total** | **~21,750** | **~22,470** |
+
+**2026-05-20 (v14) — Strategic Architecture Intelligence**
+
+*Prevents the #1 failure mode: spending dozens of cycles patching a fundamentally wrong architecture.*
+
+### Problem Solved
+In a 64-cycle run, the agent spent ALL 64 cycles patching EPINet (baseline from PROJECT_BRIEF) without ever researching alternative architectures. Only 12.5% of cycles did paper_research, and none led to architecture switching. Root causes: (1) no architecture survey before commitment — agent blindly used PROJECT_BRIEF's baseline from cycle 1; (2) dead ends were recorded individually but never clustered into "EPINet architecture is the bottleneck"; (3) direction signatures were too fine-grained — "EPINet+edge_loss" and "EPINet+angular_conv" counted as different directions; (4) paper_research reset all stagnation counters, masking persistent architectural problems.
+
+### New Mechanisms (v14)
+1. **Architecture Survey Gate** — Forces a 3+ candidate architecture survey in cycles 1-2 before committing to any baseline. Outputs `ARCHITECTURE_SURVEY.md`.
+2. **Architecture-Level Direction Signature** — Detects the underlying architecture (EPINet, U-Net, Transformer, etc.) regardless of direction keywords. Architecture stagnation accumulates across all directions on the same architecture.
+3. **Dead End Synthesis Engine** — Clusters dead ends by architecture and auto-detects when 5+ dead ends trace to the same architecture → `[ARCHITECTURE BOTTLENECK]` warning.
+4. **Architecture Switch Enforcer** — When architecture stagnation reaches threshold (5 cycles), forces `architecture_switch` action that mandates switching to a fundamentally different architecture (not a variant).
+
+### Key Changes
+- `core/loop.py`: Added `_architecture_stagnation_count`, `_extract_architecture_name()`, `_analyze_architecture_dead_ends()`, `architecture_switch` action handler, architecture survey gate injection, architecture circuit breaker.
+- `core/domain_knowledge.py`: Added `_synthesize_architecture_dead_ends()` with architecture-level dead end clustering.
+- `agents/leader.md`: Added "Architecture Intelligence Rules" section with 4 mandatory rules.
+
+### Problem Solved
+The agent repeated the same mistakes across cycles: (1) the PRE-EXECUTE Code Review's regex checks repeatedly triggered on the same false positive (matching keywords in comments/docstrings, not actual code), creating an infinite HARD GATE loop that blocked ALL training for 9+ consecutive cycles; (2) verified architectural flaws (dead ends, module failures) were recorded as text in MEMORY_LOG.md but never systematically extracted into reusable lessons; (3) API timeout of 300s caused the agent to hang for 25+ minutes on a single LLM call; (4) `reflect_result` fields containing `null` (Python `None`) crashed SQLite recording with `'NoneType' object is not subscriptable`.
+
+### Root Cause Analysis
+1. **Regex false positives**: Check 1 (`routing without aux_loss`) matched `auxiliary` in docstrings/comments, not distinguishing real code from documentation. Each cycle blocked training → code agent "fixed" → next cycle same regex triggered → dead loop.
+2. **No institutional memory**: Dead ends and module failures were logged but never extracted into structured, searchable lessons that could be injected into future THINK phases.
+3. **API timeout too long**: 300s timeout meant a single hung request could waste 5+ minutes. Combined with retries, one bad API call could stall the agent for 15+ minutes.
+4. **NoneType in SQLite**: LLM JSON responses with `null` values (e.g. `"milestone": null`) caused `dict.get("milestone", "")` to return `None` (key exists), then `None[:500]` crashed.
+
+### New Mechanisms
+
+| # | Mechanism | Phase | What It Does |
+|---|-----------|-------|-------------|
+| 1 | **Code Review Lessons Knowledge Base** | Memory | New `code_review_lessons` SQLite table with pattern-based dedup, severity ranking (HIGH > MEDIUM > LOW), hit count tracking, and keyword-based relevance search. 4 new methods in `MemoryManager`. |
+| 2 | **Post-Reflect Lesson Extraction** | REFLECT → Memory | After each REFLECT, automatically extracts lessons from: (a) VERIFY failures (per-check), (b) dead-end decisions (keyword-based pattern), (c) module failures (keyword-based pattern), (d) LLM-based semantic analysis when other methods don't find specific lessons. |
+| 3 | **THINK Phase Lesson Injection** | THINK | Loads relevant code review lessons (keyword-matched against latest model file) and injects as `relevant_code_review_lessons` context. Uses mtime-based caching to avoid re-reading unchanged model files. |
+| 4 | **HARD GATE Dead-Loop Detection** | THINK → EXECUTE (gate) | Tracks `_hard_gate_consecutive_blocks` counter. After 2 consecutive HARD blocks on the same issue, auto-downgrades to SOFT GATE (warning only, doesn't block training). Resets when code review passes cleanly. |
+| 5 | **Comment-Aware Regex Checks** | THINK → EXECUTE (gate) | New `_strip_comments_and_strings()` static method removes comments, docstrings, and string literals before regex matching. Prevents false positives from documentation keywords. |
+| 6 | **Enhanced LOW VOI Guidance** | THINK | LOW VOI experiments now strongly suggest switching to `paper_research` to find new approaches, instead of just warning. |
+| 7 | **`code_review` Tool** | EXECUTE | New tool registered for Code Agent: structural code analysis (Conv2d channel asymmetry, routing supervision, 1×1 conv router). |
+| 8 | **API Timeout Reduction** | EXECUTE | Timeout reduced from 300s to 120s to prevent long hangs on unresponsive API calls. |
+| 9 | **Two-Phase Code Review** *(v12.3)* | THINK → EXECUTE (gate) | Phase 1: Zero-LLM regex checks (routing supervision, channel asymmetry, 1×1 conv router). Phase 2: LLM semantic review using cheap fast model (only runs when Phase 1 has no HIGH issues). |
+| 10 | **Log Fallback Parser** *(v12.3)* | VERIFY | `_parse_log_text_to_json()` — when `training_log.json` doesn't exist, extracts routing weights, aux losses, and per-domain MAE from raw stdout/log text as fallback. |
+| 11 | **Dynamic Domain Discovery** *(v12.3)* | VERIFY | Per-domain baseline regression no longer uses hardcoded domain names. Parses any `DOMAIN_NAME: MAE=X.XXX` or `MAE_DOMAIN: X.XXX` pattern dynamically. |
+| 12 | **Ordered Gate Pipeline** *(v12.4)* | THINK → EXECUTE | Three gates execute in priority order: (1) PRE-VERIFY (critical preconditions), (2) CODE REVIEW (architectural defects), (3) FALSIFIABILITY (hypothesis quality, soft gate). A hard-gate firing causes subsequent gates to skip entirely, preventing gate conflicts. |
+
+### Key Design Decisions
+- **Pattern-based dedup**: Lessons use auto-generated patterns (first significant words from content) instead of fixed strings, preserving distinctiveness of different dead ends/failures.
+- **Severity ranking in Python**: SQLite `MAX()` doesn't work for TEXT severity (lexicographic order is wrong: HIGH < LOW < MEDIUM). Severity upgrade comparison done in Python with explicit rank mapping.
+- **IN clause for severity filter**: `get_code_review_lessons(severity="MEDIUM")` uses `IN ('HIGH', 'MEDIUM')` instead of integer comparison against TEXT column.
+- **Mtime caching for model file**: Only re-reads model file when mtime changes, avoiding redundant I/O every THINK cycle.
+- **Knowledge closed loop**: Failure → Extract → Store → Inject → Avoid repeat. The system learns from its own mistakes across cycles.
+
+### Bug Fixes
+- **`MAX(severity, ?)` on TEXT column** (CRITICAL): SQLite lexicographic comparison made HIGH < LOW < MEDIUM, completely inverting severity upgrade logic. Fixed with Python-side comparison.
+- **Integer vs TEXT comparison in severity filter** (CRITICAL): `severity >= 1` compared int against TEXT column. Fixed with `IN (...)` clause.
+- **`NoneType` subscriptable in SQLite recording** (HIGH): `reflect_result.get("milestone", "")` returned `None` when LLM set `milestone: null`. Fixed with `(x or "")[:500]` pattern.
+- **`search_relevant_lessons` full table scan** (MEDIUM): Added `LIMIT 100` to prevent loading entire table into Python memory.
+- **Fixed lesson patterns**: Dead-end and module-failure lessons used fixed patterns (`"dead_end_approach"`, `"module_failure"`), causing all distinct failures to merge into one lesson. Now uses content-derived keywords.
+
+### v13.1 Hardening (Code Review Fixes)
+- **`_strip_comments_and_strings` cross-line bug**: Multi-line `"""..."""` docstrings were processed line-by-line, failing to remove cross-line content. Now removes multi-line strings on full content first, then processes lines.
+- **`gate` keyword false positive**: Regex check #1 matched `gate` in any context (e.g. `torch.sigmoid` gate patterns). Changed to `gate_weight|gate_network|gating` for precision.
+- **`search_relevant_lessons` scoring**: High `hit_count` lessons with no keyword match were returned. Now requires at least one keyword match; `hit_count` used as tiebreaker (capped at 10).
+- **`record_code_review_lesson` double SQL query**: UPDATE path did separate SELECT + UPDATE. Merged into single query (SELECT includes `severity`).
+- **`_llm_extract_lesson` JSON response**: Tool-based APIs may return JSON-wrapped responses. Added JSON parse fallback before structured `|` parsing.
+- **Training script check independent of model**: `_pre_execute_code_review` returned early when model file unavailable, skipping training script checks. Now runs training script checks even without model code.
+- **Gate 2 double `if` cleanup**: `if not warnings: reset` + `if warnings: process` merged into `if/else`.
+
+### v13.2 — Multi-Tool Skill Integration + Python API
+- **Multi-tool installer**: `install.py` now supports `--claude-code`, `--codebuddy`, `--cursor`, `--all` (default). Installs skill commands to each tool's native directory.
+- **Python API** (`api.py`): New `AutoResearcher` class for programmatic access — `run_one_cycle()`, `run_n_cycles()`, `start_daemon()`, `stop_daemon()`, `get_status()`, `get_code_review_lessons()`.
+- **CLI API** (`python api.py {status|run|start|stop|lessons}`): Command-line interface for tool integration and scripting.
+- **Cursor support**: Skills install as `.mdc` rule files to `~/.cursor/rules/`.
+- **CodeBuddy support**: Skills install as `.md` commands to `~/.codebuddy/commands/`.
+
+### Context Keys Added
+- THINK: `relevant_code_review_lessons` (auto-matched from knowledge base)
+- EXECUTE: `code_review` tool for Code Agent
+- REFLECT → Memory: automatic lesson extraction pipeline
+
+### Flow Diagram
+```
+REFLECT (cycle ends)
+  → [NEW] Post-Reflect Lesson Extraction
+    → Extract from VERIFY failures (per-check)
+    → Extract from dead-end decisions (keyword pattern)
+    → Extract from module failures (keyword pattern)
+    → [NEW] LLM semantic analysis (fallback)
+
+THINK (next cycle)
+  → [NEW] Load relevant code_review_lessons (keyword-matched)
+  → [NEW] Inject as context for Leader
+  → Plan experiment
+
+PRE-EXECUTE Code Review
+  → [NEW] Strip comments/strings before regex matching
+  → [NEW] HARD GATE dead-loop detection (auto-downgrade after 2)
+```
+
+### Module Size After v13
+
+| Module | v12.1 | v12.2 | v13 | v13.2 | v14 | v15.5 |
+|--------|-------|-------|-----|-------|-----|-------|
+| `core/loop.py` | 2,992 | 3,248 | ~3,904 | 3,919 | ~4,150 | ~4,350 |
+| `core/memory.py` | 963 | 963 | ~1,130 | 1,134 | 1,134 | 1,134 |
+| `core/agents.py` | 1,357 | 1,357 | ~1,411 | 1,411 | 1,411 | 1,411 |
+| `core/tools.py` | 1,739 | 1,739 | ~1,884 | 1,884 | 1,884 | 1,884 |
+| `api.py` | — | — | — | 364 | 364 | 364 |
+| `core/domain_knowledge.py` | — | — | — | — | ~660 | ~660 |
+| `core/research_roadmap.py` | — | — | — | — | — | ~500 |
+| Other modules | — | — | unchanged | unchanged | unchanged | unchanged |
+| **Total** | **~19,071** | **~19,734** | **~20,850** | **~21,220** | **~21,750** | **~22,470** |
+
+**2026-05-18 (v12.2) — Pre-Execute Code Review + Training Architecture Verification**
+
+### Problem Solved
+Agent-generated model code (e.g. MaterialDualCueNet) contained multiple architectural flaws (routing weights never differentiating, aux loss too low, input channel information asymmetry) that were NOT detected before training. The agent wasted GPU hours and LLM tokens training architecturally flawed models, then the REFLECT phase couldn't diagnose WHY the model failed because v12's analysis reflection only covered data analysis experiments, not training experiments.
+
+### Root Cause Analysis
+The agent had two blind spots:
+1. **No code review before training**: Code agent writes model → immediately trains → VERIFY only checks if training ran, not if the architecture design is sound.
+2. **No training architecture reflection**: v12's `analysis_reflection_prompt` only triggers for analysis experiments (`experiment_launched=False`). Training experiments get no specialized reflection about routing convergence, aux loss effectiveness, or per-domain regression.
+
+### New Mechanisms
+
+| # | Mechanism | Phase | What It Does |
+|---|-----------|-------|-------------|
+| 1 | **Pre-Execute Code Review** | THINK → EXECUTE (gate) | Zero-LLM structural review of model code BEFORE training. Checks: routing without aux supervision, input channel asymmetry (>5x ratio), 1×1 conv router (no spatial context), weighted fusion without skip connection. Issues injected as mandatory-fix preamble in task. |
+| 2 | **Layer 12: Training Architecture Verification** | VERIFY | Post-training checks: (a) routing weight differentiation — all domains within 5% = FAIL, (b) aux loss convergence — flat across epochs = FAIL, (c) per-domain regression vs baseline — >20% degradation = WARN. |
+| 3 | **Training Architecture Reflection Prompt** | REFLECT | When VERIFY Layer 12 detects issues, injects specialized reflection forcing the Leader to evaluate routing convergence, aux loss effectiveness, per-domain regression, and correct failure categorization. Only triggers for training experiments (`experiment_launched=True`). |
+| 4 | **Structured Metrics Injection** | REFLECT | Parses `training_log.json` for per-domain MAE trends (epoch-by-epoch) and aux loss trends. Flags domains getting WORSE. Replaces raw-log regex parsing with structured JSON parsing. |
+
+### Key Design Decisions
+- **Pre-Execute Review is a GATE, not a BLOCK**: Issues are injected as warnings in the task preamble, not hard blocks. This prevents false positives from stopping legitimate experiments. The Code agent sees the warnings and can choose to fix or proceed.
+- **Layer 12 uses `training_log.json`**: Structured JSON parsing (not regex on raw log text) for reliable metric extraction. Falls back to regex parsing of log text when JSON unavailable.
+- **Baseline metrics from MEMORY_LOG.md**: Per-domain regression compares against the most recently recorded baseline in MEMORY_LOG.md. No extra state file needed.
+- **`_pre_execute_code_review` is zero-LLM**: All checks are regex/AST-based, no LLM calls. Adds ~50ms latency per cycle.
+
+### Context Keys Added
+- THINK → EXECUTE: code review warnings injected into task (pre-execute gate)
+- VERIFY: Layer 12 `routing_differentiation`, `aux_loss_convergence`, `domain_regression` checks
+- REFLECT: `training_architecture_reflection_prompt`, `per_domain_mae_trend`, `aux_loss_trend`
+
+### Flow Diagram
+```
+THINK (plan experiment)
+  → Pre-Verify (data, imports)
+  → [NEW] Pre-Execute Code Review (model architecture)
+    → Issues found? → Inject as warnings in task
+  → EXECUTE (Code agent writes + trains model)
+  → VERIFY (Layer 1-11 as before)
+  → [NEW] VERIFY Layer 12 (training architecture checks)
+  → [NEW] VERIFY Layer 13 (aux loss convergence)
+  → REFLECT
+    → [NEW] training_architecture_reflection_prompt (if Layer 12 issues)
+    → [NEW] per_domain_mae_trend + aux_loss_trend
+```
+
+### Module Size After v12.2
+
+| Module | v12.1 | v12.2 | v13 |
+|--------|-------|-------|-----|
+| `core/loop.py` | 2,992 | 3,248 | ~3,904 |
+| `core/verifier.py` | 2,210 | 2,537 | 2,537 |
+| Other modules | — | unchanged | see above |
+| **Total** | **~19,071** | **~19,734** | **~20,850** |
+
+**2026-05-18 (v12.1) — API Quota Exhaustion: REFLECT Degraded Fallback & Clean Shutdown**
+
+### Problem Solved
+When API quota is exhausted during the REFLECT phase, the entire cycle's results (EXECUTE + VERIFY) were lost. The agent entered a 600-second backoff loop that would never recover (retrying won't restore quota).
+
+### Changes
+- **REFLECT Degraded Fallback** (`_degraded_reflect`): When `dispatch_leader()` fails with `insufficient_quota` / `All providers failed` / `429`, a rule-based fallback generates a basic reflection from VERIFY reports, training logs, and analysis outputs. The output follows the same JSON schema as Leader REFLECT, so downstream code (`_record_cycle_outcome`, `_update_state`) works unchanged.
+- **Degraded Reflect Pending Note**: Writes `.degraded_reflect_pending` JSON file. The next cycle's THINK phase reads this and injects a `degraded_reflect_pending` context, prompting the Leader to revisit the incomplete cycle before planning new work.
+- **Clean Shutdown on Quota Error**: Outer `except` block now detects quota errors and breaks the main loop cleanly (no 600s backoff for unrecoverable errors).
+- **Context Key Added**: THINK: `degraded_reflect_pending` (injected when previous cycle had degraded REFLECT).
+
+**2026-05-18 (v12) — Exploratory Analysis Mode: Preventing False-Negative Dead Ends**
+
+### Problem Solved
+Agent concluded "angular frequency material classification is infeasible" after using only 1 method (FFT energy ratios, 5 features, Cohen's d max 0.47). But with 5 methods and 17 features, Cohen's d reached 2.06, AUC 0.969 — the direction was perfectly viable. The agent's analysis was too narrow, producing a false-negative dead end.
+
+### New Mechanisms
+
+| # | Mechanism | Phase | What It Does |
+|---|-----------|-------|-------------|
+| 1 | **Exploratory Analysis Mode** | VERIFY (Layer 11) | Scans analysis output for method families (FFT, statistical, view-consistency, spatial, frequency-decomposition). Requires ≥ 3 independent methods before concluding a direction is infeasible. |
+| 2 | **Feature Completeness Report** | VERIFY | Checks that the analysis covers ≥ 4 feature families. Generates structured JSON report with `feature_families_tested`, `methods_with_strong_signal`, `recommendation`. |
+| 3 | **Failure Category System** | REFLECT + Memory | Dead ends now carry a structured `failure_category`: `hypothesis_wrong`, `implementation_bug`, `insufficient_experiment`, or `method_inadequacy`. Stored in SQLite `failure_category` column (auto-migrated). |
+| 4 | **Method Inadequacy Re-awakening** | THINK | When dead ends exist with `failure_category='method_inadequacy'`, the Leader receives a prompt encouraging retry with broader analysis instead of abandoning the direction. |
+| 5 | **Analysis Reflection Prompt** | REFLECT | When the experiment was a data analysis (not training), injects specialized reflection prompts forcing the Leader to evaluate method coverage, feature completeness, and correct failure categorization. |
+
+### Key Design Decisions
+- **`failure_category` column**: Auto-migrated via `ALTER TABLE` in `log_dead_end()`. Pre-v12 databases continue to work (empty string default).
+- **`get_dead_ends_by_category()`**: Structured retrieval of dead ends by category, enabling the re-awakening mechanism.
+- **`get_method_inadequacy_count()`**: Quick count query for THINK phase injection.
+- **Layer 11 `_verify_analysis_coverage()`**: Pattern-based method detection in analysis output files. If only 1 method family found, generates a warning that the Leader MUST categorize as `method_inadequacy` (not `hypothesis_wrong`).
+
+### Context Keys Added
+- THINK: `method_inadequacy_retry_prompt`, `degraded_reflect_pending` (v12.1)
+- VERIFY: Layer 11 analysis coverage checks
+- REFLECT: `analysis_reflection_prompt`, `method_inadequacy_history`
+
+### Module Size After v12
+
+| Module | v11 | v12 | v12.1 | v13 |
+|--------|-----|-----|-------|-----|
+| `core/loop.py` | ~2,660 | ~2,860 | ~2,992 | ~3,904 |
+| `core/memory.py` | 852 | ~960 | ~963 | ~1,130 |
+| `core/verifier.py` | 2,102 | ~2,200 | 2,210 | 2,537 |
+| `core/tools.py` | 1,739 | 1,739 | 1,739 | 1,884 |
+| `core/model_analyzer.py` | 2,323 | 2,323 | 2,323 | 2,323 |
+| `core/simulation_sandbox.py` | ~600 | ~600 | 1,518 | 1,518 |
+| `core/constraint_engine.py` | ~580 | ~580 | 1,164 | 1,164 |
+| `core/agents.py` | — | — | 1,357 | ~1,411 |
+| Other modules | — | — | 7,317 | unchanged |
+| **Total** | **~17,204** | **~17,500** | **~19,071** | **~20,850** |
 
 **2026-05-13 (v11) — Simulation Sandbox: Pre-Training Model Validation & A/B Evaluation**
 
@@ -118,22 +366,23 @@ v10 introduces **hard verifiable constraints** — every check is machine-verifi
 
 ### Module Size After v10
 
-| Module | v8 | v9 | v10 | v11 |
-|--------|-----|-----|------|------|
-| `core/tools.py` | 1,667 | 1,740 | 1,739 | 1,739 |
-| `core/loop.py` | 2,268 | 2,355 | ~2,450 | ~2,660 |
-| `core/verifier.py` | 2,010 | 2,099 | 2,102 | 2,102 |
-| `core/model_analyzer.py` | 2,282 | 2,323 | 2,323 | 2,323 |
-| `core/memory.py` | 831 | 852 | 852 | 852 |
-| `core/visual_analyzer.py` | 853 | 853 | 848 | 848 |
-| `core/idea_planner.py` | (new) | 1,053 | 1,053 | 1,053 |
-| `core/experiment_evaluator.py` | (new) | 786 | 784 | 784 |
-| `core/constraint_engine.py` | — | — | ~580 | ~580 |
-| `core/context_keys.py` | — | — | 194 | 194 |
-| `core/simulation_sandbox.py` | — | — | — | ~600 |
-| `core/domain_knowledge.py` | 559 | 559 | 559 | 559 |
-| `core/mcp_client.py` | 724 | 724 | 724 | 724 |
-| **Total** | **~13,307** | **~15,244** | **~16,604** | **~17,204** |
+| Module | v8 | v9 | v10 | v11 | v12.1 | v12.2 | v13 |
+|--------|-----|-----|------|------|-------|-------|-----|
+| `core/tools.py` | 1,667 | 1,740 | 1,739 | 1,739 | 1,739 | 1,739 | 1,884 |
+| `core/loop.py` | 2,268 | 2,355 | ~2,450 | ~2,660 | 2,992 | 3,248 | ~3,904 |
+| `core/verifier.py` | 2,010 | 2,099 | 2,102 | 2,102 | 2,210 | 2,537 | 2,537 |
+| `core/model_analyzer.py` | 2,282 | 2,323 | 2,323 | 2,323 | 2,323 | 2,323 | 2,323 |
+| `core/memory.py` | 831 | 852 | 852 | 852 | 963 | 963 | ~1,130 |
+| `core/visual_analyzer.py` | 853 | 853 | 848 | 848 | 848 | 848 | 848 |
+| `core/idea_planner.py` | (new) | 1,053 | 1,053 | 1,053 | 1,059 | 1,059 | 1,059 |
+| `core/experiment_evaluator.py` | (new) | 786 | 784 | 784 | 800 | 800 | 800 |
+| `core/constraint_engine.py` | — | — | ~580 | ~580 | 1,164 | 1,164 | 1,164 |
+| `core/context_keys.py` | — | — | 194 | 194 | 194 | 194 | 194 |
+| `core/simulation_sandbox.py` | — | — | — | ~600 | 1,518 | 1,518 | 1,518 |
+| `core/agents.py` | — | — | — | — | 1,357 | 1,357 | ~1,411 |
+| `core/domain_knowledge.py` | 559 | 559 | 559 | 559 | 565 | 565 | 565 |
+| `core/mcp_client.py` | 724 | 724 | 724 | 724 | 724 | 724 | 724 |
+| **Total** | **~13,307** | **~15,244** | **~16,604** | **~17,204** | **~19,071** | **~19,734** | **~20,850** |
 
 **2026-05-13 (v9) — Forward Design Pipeline, Post-Experiment Evaluation & Domain-Agnostic Cleanup**
 
@@ -354,7 +603,7 @@ If you only want the shortest path to a working experiment loop, do this:
 2. Run `/auto-experiment --project /path/to/project --gpu 0`
 3. Check progress with `/experiment-status` or optional Obsidian/local text notes
 
-Prefer AI-guided setup? Open [`AI_GUIDE.md`](AI_GUIDE.md) in Claude / ChatGPT / Codex and let the assistant walk you through it.
+Prefer AI-guided setup? Open `AI_GUIDE.md` in Claude / ChatGPT / Codex and let the assistant walk you through it.
 
 ## What You Actually Need
 
@@ -686,8 +935,8 @@ export ANTHROPIC_API_KEY="sk-ant-xxxxx"
 
 ```bash
 # Clone the repo
-git clone https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7.git
-cd auto-deep-researcher-24x7
+git clone https://github.com/hrf666666/auto_research_agent.git
+cd auto_research_agent
 
 # Install Python dependencies
 pip install -r requirements.txt
@@ -964,40 +1213,6 @@ Case 3: Suspicious result
 
 Rule of thumb: let the agent handle repetition, but keep direction, interpretation, and responsibility human.
 
-### Step 7: Mobile Monitoring with [Happy Coder](https://github.com/slopus/happy) (Optional)
-
-Want to check experiments from your phone? Install [Happy Coder](https://happy.engineering/) ([iOS](https://apps.apple.com/us/app/happy-codex-claude-code-app/id6748571505) / [Android](https://play.google.com/store/apps/details?id=com.ex3ndr.happy)):
-
-```bash
-# Install CLI (one time)
-npm install -g happy-coder
-
-# Start session through Happy instead of claude
-happy
-
-# Inside the session, launch your experiment:
-/auto-experiment --project ~/my-first-experiment --gpu 0
-```
-
-Now on your phone you can:
-- Get **push notifications** when experiments finish or the agent needs input
-- **Check results** while commuting
-- **Send directives** ("try learning rate 1e-5") from anywhere
-- **Switch between phone and desktop** seamlessly
-- All communication is **end-to-end encrypted**
-
-```
-┌──────────┐     encrypted      ┌──────────┐
-│  Desktop │ ◄──────────────► │  Phone   │
-│  Claude  │     relay          │  Happy   │
-│  Code    │                    │  Coder   │
-├──────────┤                    ├──────────┤
-│ Agent    │  ← push notify ──  │ "Try     │
-│ running  │                    │  lr=1e-5"│
-│ 24/7     │  ── status ────►  │ ✓ Got it │
-└──────────┘                    └──────────┘
-```
-
 ### What a Good PROJECT_BRIEF.md Looks Like
 
 The brief is your main lever. Here are examples for different scenarios:
@@ -1124,13 +1339,27 @@ Yes. The agent works with any training framework. It just launches shell command
 
 ---
 
-## One-Click Install (Claude Code Skills)
+## One-Click Install (AI Coding Tool Skills)
 
-All features are packaged as Claude Code slash commands. **One command to install:**
+All features are packaged as slash commands for **Claude Code**, **CodeBuddy**, and **Cursor**. **One command to install:**
 
 ```bash
+# Install to all supported tools
 python install.py
+
+# Install to specific tool
+python install.py --claude-code
+python install.py --codebuddy
+python install.py --cursor
 ```
+
+### Supported Tools
+
+| Tool | Install Target | Skill Format |
+|------|---------------|--------------|
+| **Claude Code** | `~/.claude/commands/` | `.md` slash commands |
+| **CodeBuddy** | `~/.codebuddy/commands/` | `.md` slash commands |
+| **Cursor** | `~/.cursor/rules/` | `.mdc` rule files |
 
 After installation, you get **8 slash commands** in Claude Code:
 
@@ -1175,6 +1404,38 @@ python install.py
 
 ```bash
 python install.py --uninstall
+```
+
+### Python API (for tool integration)
+
+```python
+from api import AutoResearcher
+
+# Initialize for a project
+r = AutoResearcher("/path/to/project")
+
+# Run one cycle synchronously
+result = r.run_one_cycle()
+
+# Get project status
+status = r.get_status()
+
+# Start background daemon
+pid = r.start_daemon(gpu="0", max_cycles=10)
+r.stop_daemon()
+
+# Query learned code review lessons
+lessons = r.get_code_review_lessons(severity="HIGH")
+```
+
+### CLI API
+
+```bash
+python api.py status --project /path/to/project
+python api.py run --project /path/to/project --cycles 3
+python api.py start --project /path/to/project --gpu 0
+python api.py stop
+python api.py lessons --project /path/to/project --severity HIGH
 ```
 
 ---
@@ -1271,36 +1532,30 @@ mcp_services:
 
 ---
 
-## How It Compares
-
-| | Deep Researcher Agent | [Claude Scholar](https://github.com/Galaxy-Dawn/claude-scholar) | [AI Scientist](https://github.com/SakanaAI/AI-Scientist) | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | [SWE-Agent](https://github.com/princeton-nlp/SWE-agent) |
-|--|:--:|:--:|:--:|:--:|:--:|
-| **Runs experiments autonomously** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Zero-cost training monitoring** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **GPU management** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **24/7 continuous operation** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Constant-size memory** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Paper writing | Basic | ✅ | ✅ | ❌ | ❌ |
-| Knowledge management | Basic | ✅ | ❌ | ❌ | ❌ |
-| General coding | ❌ | ❌ | ❌ | ✅ | ✅ |
-
-**Deep Researcher Agent is the only framework built for _running_ deep learning research, not just writing about it.**
-
 ---
 
 ## Project Structure
 
 ```
-auto-deep-researcher-24x7/
+auto_research_agent/
 ├── core/                    # Autonomous experiment loop engine
-│   ├── loop.py              # THINK → EXECUTE → VERIFY → VISUAL → REFLECT cycle
-│   ├── memory.py            # Two-Tier constant-size memory
+│   ├── loop.py              # THINK → EXECUTE → VERIFY → VISUAL → REFLECT cycle (v15.5: ROADMAP alignment + phase-gated research)
+│   ├── memory.py            # Two-Tier constant-size memory (v12: failure_category system)
 │   ├── monitor.py           # Zero-LLM experiment monitoring
 │   ├── agents.py            # Leader-Worker agent dispatch
 │   ├── tools.py             # Minimal per-agent tool registry
-│   ├── verifier.py          # Module-level result verification (zero LLM)
-│   └── visual_analyzer.py   # Inference + multimodal visual diagnosis (NEW)
-├── skills/                  # Claude Code slash commands (python install.py)
+│   ├── verifier.py          # Module-level result verification (v13: unchanged from v12.2)
+│   ├── visual_analyzer.py   # Inference + multimodal visual diagnosis
+│   ├── simulation_sandbox.py # Pre-training model validation & A/B evaluation
+│   ├── constraint_engine.py # LLM behavior control (6 constraint mechanisms)
+│   ├── idea_planner.py      # 9-phase forward design pipeline
+│   ├── experiment_evaluator.py # Post-experiment evaluation & failure diagnosis
+│   ├── domain_knowledge.py  # Dynamic domain knowledge injection
+│   ├── context_keys.py      # Context key registry with validation
+│   ├── research_roadmap.py  # Module-level research state machine (v15)
+│   └── mcp_client.py        # MCP transport (SSE + stdio)
+├── skills/                  # Skill commands (python install.py --all)
+├── api.py                   # Python API for tool integration
 │   ├── auto-experiment/     # 24/7 autonomous experiment loop
 │   ├── experiment-status/   # Check experiment progress
 │   ├── gpu-monitor/         # GPU status & availability
@@ -1325,7 +1580,7 @@ auto-deep-researcher-24x7/
 │   └── keeper.py            # Cloud instance keep-alive
 ├── examples/                # Ready-to-run demos
 ├── docs/                    # Docs + translations (CN/JP)
-├── install.py               # Claude Code skill installer
+├── install.py               # Multi-tool skill installer (Claude Code / CodeBuddy / Cursor)
 ├── config.yaml              # Default configuration
 └── requirements.txt         # Dependencies
 ```

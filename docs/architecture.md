@@ -75,6 +75,12 @@
 │  │  │ Experiment Auditor → 4-Level Escalation  │       │     │
 │  │  │ Error-handler skill │ Code-cleanup skill │       │     │
 │  │  └──────────────────────────────────────────┘       │     │
+│  │                                                      │     │
+│  │  ┌────────── Research ROADMAP (v15) ──────────────┐  │     │
+│  │  │ Module state machine: theory_verify → design   │  │     │
+│  │  │ → validation → integrated | Phase-gated gate   │  │     │
+│  │  │ 3-Strike hard gate | Circuit breaker priority  │  │     │
+│  │  └────────────────────────────────────────────────┘  │     │
 │  └──────────────────────────────────────────────────────┘     │
 │                                                              │
 │  ┌──────────── GPU Layer ──────────────────────────────┐     │
@@ -989,3 +995,274 @@ After:
       else:
           self._quality_alert_streak = 0   # ← Reset when no degradation
 ```
+
+---
+
+## Code Review Lessons Knowledge Base (v13)
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│          Code Review Lessons Pipeline             │
+│                                                   │
+│  REFLECT phase ends                               │
+│       │                                           │
+│       ▼                                           │
+│  _post_reflect_code_review()                      │
+│       │                                           │
+│       ├── _extract_lesson_from_verify_failure()   │
+│       ├── _extract_lesson_from_dead_end()         │
+│       │       (keyword-based pattern extraction)  │
+│       ├── _extract_lesson_from_module_failure()   │
+│       │       (keyword-based pattern extraction)  │
+│       └── _llm_extract_lesson()                   │
+│               (fast model semantic analysis)      │
+│       │                                           │
+│       ▼                                           │
+│  memory.record_code_review_lesson()               │
+│       │                                           │
+│       ▼                                           │
+│  ┌──────────────────────────────┐                 │
+│  │  SQLite: code_review_lessons  │                │
+│  │  - pattern (dedup key)       │                 │
+│  │  - severity (HIGH/MEDIUM/LOW)│                 │
+│  │  - hit_count + last_hit_cycle│                 │
+│  │  - category + description    │                 │
+│  └──────────────────────────────┘                 │
+│       │                                           │
+│       ▼  (next THINK cycle)                       │
+│  memory.search_relevant_lessons()                 │
+│       │  (keyword match on model code)            │
+│       ▼                                           │
+│  context["relevant_code_review_lessons"]          │
+│       │                                           │
+│       ▼                                           │
+│  Leader THINK (avoids past mistakes)              │
+└──────────────────────────────────────────────────┘
+```
+
+### HARD GATE Dead-Loop Prevention
+
+```
+Cycle N:   code_review detects HIGH issue → HARD GATE blocks
+Cycle N+1: code agent fixes → same regex triggers (false positive) → HARD GATE blocks
+Cycle N+2: code agent fixes again → same regex → HARD GATE blocks
+                                                    │
+                          _hard_gate_consecutive_blocks > 2
+                                                    │
+                                                    ▼
+                          Auto-downgrade to SOFT GATE
+                          (warning only, training proceeds)
+```
+
+### Comment-Aware Regex
+
+`_strip_comments_and_strings()` removes:
+- Full-line comments (`# ...`)
+- Inline comments (before `#`)
+- Triple-quoted strings (`"""..."""`, `'''...'''`)
+- Single/double quoted strings
+
+All regex code review checks operate on stripped content only.
+
+### SQLite Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS code_review_lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern TEXT UNIQUE NOT NULL,     -- dedup key (content-derived keywords)
+    severity TEXT NOT NULL,           -- HIGH / MEDIUM / LOW
+    category TEXT DEFAULT 'architecture',
+    description TEXT,
+    evidence TEXT,
+    fix_suggestion TEXT,
+    hit_count INTEGER DEFAULT 1,
+    last_hit_cycle INTEGER,
+    source TEXT DEFAULT 'reflect',    -- reflect / verify / manual
+    timestamp REAL
+);
+```
+
+### Ordered Gate Pipeline (v12.4)
+
+Three gates execute in strict priority order. A hard-gate (full rewrite of `think_result`) causes subsequent gates to skip entirely:
+
+```
+┌─────────────────────────────────────────────────┐
+│              Gate Pipeline (v12.4)                │
+│                                                  │
+│  Gate 1: PRE-VERIFY                              │
+│    Critical preconditions (synthetic data,       │
+│    missing data, broken imports)                 │
+│    → HARD GATE (blocks execution)                │
+│                                                  │
+│  Gate 2: CODE REVIEW (v12.3+, enhanced v13)      │
+│    Phase 1: Zero-LLM regex checks                │
+│      - Routing without aux supervision           │
+│      - Input channel asymmetry (>10x ratio)      │
+│      - 1×1 conv router (no spatial context)      │
+│    Phase 2: LLM semantic review                  │
+│      - Uses cheap fast model                     │
+│      - Only runs when Phase 1 has no HIGH issues │
+│    → HIGH: HARD GATE (with dead-loop detection)  │
+│    → MEDIUM/LOW: SOFT GATE (injected as warning) │
+│                                                  │
+│  Gate 3: FALSIFIABILITY                          │
+│    Hypothesis quality check (soft gate)          │
+│    → Never blocks, only injects warning          │
+│                                                  │
+│  Anti-Deadloop (v13):                            │
+│    _hard_gate_consecutive_blocks > 2             │
+│    → Auto-downgrade HARD → SOFT                  │
+└─────────────────────────────────────────────────┘
+```
+
+### Log Fallback Parser (v12.3)
+
+When `training_log.json` is unavailable, `_parse_log_text_to_json()` extracts structured data from raw log text:
+
+### 33. Strategic Architecture Intelligence — v14
+
+**Prevents the #1 failure mode: spending dozens of cycles patching a fundamentally wrong architecture.**
+
+In a 64-cycle run, the agent spent ALL cycles patching EPINet without ever switching architectures. Root causes and fixes:
+
+#### Architecture Survey Gate
+Forces a 3+ candidate architecture survey in cycles 1-2 before committing to any baseline. Prevents blind use of PROJECT_BRIEF's suggested architecture.
+
+```
+THINK phase (cycle ≤ 2, no survey exists):
+  → Inject "ARCHITECTURE SURVEY GATE" context
+  → Agent MUST survey 3+ architectures
+  → Output: workspace/ARCHITECTURE_SURVEY.md
+  → Survey completion detected automatically
+```
+
+#### Architecture-Level Direction Signature
+Detects the underlying architecture (EPINet, U-Net, Transformer, etc.) regardless of direction keywords. Architecture stagnation accumulates across all directions on the same architecture.
+
+```
+_extract_architecture_name():
+  "EPINet + edge loss" → "epi"
+  "EPINet + angular conv" → "epi"  (SAME architecture!)
+  "LFNet + multi-scale" → "lfnet"  (DIFFERENT architecture → reset)
+```
+
+Architecture stagnation is NOT reset by paper_research — only by actually switching to a different architecture.
+
+#### Dead End Synthesis Engine
+Clusters dead ends by architecture and auto-detects when 5+ dead ends trace to the same architecture:
+
+```
+_build_cross_experiment_insights():
+  → _synthesize_architecture_dead_ends()
+  → Cluster dead ends by architecture pattern
+  → If 5+ dead ends for same architecture:
+    → [ARCHITECTURE BOTTLENECK] warning
+    → Lists attempted components (loss, attention, conv, etc.)
+    → Diagnosis: architecture is the bottleneck
+```
+
+#### Architecture Switch Enforcer
+When architecture stagnation reaches threshold (5 cycles), forces `architecture_switch` action:
+
+```
+_apply_no_progress_fallback():
+  if architecture_stagnation >= 5:
+    if dead_end_synthesis confirms bottleneck:
+      → action: "architecture_switch"
+      → MANDATORY: switch to fundamentally different architecture
+      → NOT allowed: improved variant of current architecture
+      → Pilot experiment first (2-5 epochs)
+```
+
+#### Known Architecture Patterns
+```python
+_ARCHITECTURE_PATTERNS = {
+    "epi": ["epi", "epinet", "epipolar", "epi_net", "epi slope", "epi branch"],
+    "unet": ["unet", "u-net", "u_net"],
+    "transformer": ["transformer", "vit", "self_attention"],
+    "cnn": ["resnet", "vgg", "mobilenet", "efficientnet"],
+    "graph": ["gnn", "graph", "gcn", "gat"],
+    "lfnet": ["lfnet", "lf_net", "lfanet"],
+    "oacc": ["oacc", "occlusion_aware"],
+    "mvsnet": ["mvsnet", "multi_view_stereo"],
+    "dpt": ["dpt", "dense_prediction_transformer"],
+}
+```
+
+Easily extensible — adding a new entry automatically enables detection for all projects.
+
+- **Routing weights**: `routing_weights: [0.xxx, 0.xxx]` patterns
+- **Aux losses**: `aux_loss=X.XXXX` patterns
+- **Per-domain MAE**: Dynamic domain discovery via `DOMAIN_NAME: MAE=X.XXX` or `MAE_DOMAIN: X.XXX` patterns (no hardcoded domain names)
+
+### 34. Research ROADMAP — Module-Level State Machine (v15)
+
+**Prevents premature model training and enforces structured theory verification before committing GPU resources.**
+
+#### Module: `core/research_roadmap.py` (~500 lines)
+
+A module-level state machine that tracks research phases per module:
+
+```
+State Machine:
+  theory_verification → module_design → module_validation → integrated
+                                                                              ↓
+                                                                          dead_end
+```
+
+**Per-Module Tracking**: Each research module (e.g., "angular_frequency_analysis", "dual_mask_modeling") has its own state in the ROADMAP. A module can only advance to the next state when milestone conditions are met.
+
+**Phase-Gated Research**: During `theory_verification` phase, the system blocks training tasks. Only analysis and research actions are allowed. This forces the agent to validate assumptions before committing GPU time.
+
+**3-Strike Hard Gate**: When the agent deviates from the ROADMAP phase:
+```
+Strike 1: Warning injected into THINK context
+Strike 2: Stronger warning + deviation logged
+Strike 3: Force override action to paper_research
+          → Sync-reset both _deviation_count and _phase_violation_count
+```
+
+**Circuit Breaker Priority**: During `theory_verification`, ROADMAP circuit breaker takes priority over direction and architecture circuit breakers. This ensures phase constraints are enforced even when other mechanisms would allow training.
+
+#### Integration Points
+
+```
+THINK phase:
+  → roadmap.check_alignment(planned_action, task_description)
+  → _enforce_roadmap_alignment() in loop.py
+  → Direction circuit breaker checks roadmap.is_theory_verification_phase
+  → roadmap.active_module_names replaces private _get_active_modules()
+
+REFLECT phase:
+  → roadmap.update_from_reflect(reflect_result)
+  → Markdown parser extracts module milestones from reflect output
+  → Milestone keywords: "designed"/"implemented"/"coded"/"built" → MODULE_DESIGN → MODULE_VALIDATION
+
+VERIFY phase:
+  → Method count enforcement: 3-6 methods (min 3, max 7) per module
+  → All methods must fail independently before dead_end marking
+```
+
+#### Key Design Decisions
+
+- **Dual counter sync**: `_deviation_count` (ROADMAP) and `_phase_violation_count` (ResearchLoop) are synchronized on every reset event. Hard gate trigger resets both to 0.
+- **Single responsibility**: `check_alignment()` returns phase information only. Loop.py controls enforcement (3-strike mechanism) independently.
+- **Sub-token matching**: `_is_task_related` uses `re.split(r"[_\s]+")` for robust matching of compound names like "freq_analyzer" against "analyze frequency spectrum".
+- **Strong/weak training indicators**: `_is_training_task` distinguishes real training ("train the model", "epoch") from research discussions ("information loss", "loss of detail").
+- **Flexible method count**: 3-6 methods with hard ceiling at 7. Supports both quick 3-method disproval and thorough 6-method analysis.
+
+#### v15.5 Hardening (8 Fixes from Code Review)
+
+| # | Fix | Impact |
+|---|-----|--------|
+| 1 | `check_alignment()` no longer returns `should_force_paper_research` | Single responsibility: loop.py controls enforcement |
+| 2 | Public properties `active_module_names`, `is_theory_verification_phase` | Clean API replacing private method access |
+| 3 | `_is_training_task` strong/weak indicators | Eliminates false positives on "loss of detail" |
+| 4 | `_is_task_related` sub-token matching + dynamic threshold | Better matching for compound method names |
+| 5 | `MODULE_DESIGN` milestone keywords | Supports natural progression through design phase |
+| 6 | Cross-assumption consistency check in method suggestions | Ensures verification methods cover inter-assumption interactions |
+| 7 | Markdown parser regex `\[\\w_-+\]` + evidence extraction | Handles hyphenated module names in reflect output |
+| 8 | Removed orphan `roadmap_alignment_warning` ContextKey | Clean context key registry |

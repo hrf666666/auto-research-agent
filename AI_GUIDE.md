@@ -6,6 +6,10 @@
 
 ---
 
+> **Attribution**: This project was originally derived from [auto-deep-researcher-24x7](https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7).
+
+---
+
 ## What Is This?
 
 Deep Researcher Agent is a framework that lets an AI agent autonomously run deep learning experiments 24/7. The agent:
@@ -30,7 +34,6 @@ User wants to...
 ├── Launch the agent → Go to [LAUNCH GUIDE]
 ├── Check status → Go to [STATUS CHECK]
 ├── Intervene/redirect → Go to [INTERVENTION]
-├── Use on phone → Go to [MOBILE SETUP]
 ├── Understand how it works → Go to [ARCHITECTURE EXPLANATION]
 └── Debug an issue → Go to [TROUBLESHOOTING]
 ```
@@ -73,8 +76,8 @@ source ~/.bashrc
 
 ```bash
 # If not already cloned:
-git clone https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7.git
-cd auto-deep-researcher-24x7
+git clone https://github.com/hrf666666/auto_research_agent.git
+cd auto_research_agent
 
 # Install dependencies
 pip install -r requirements.txt
@@ -271,29 +274,6 @@ python -m core.loop --project ~/PROJECT_NAME --directive "Try label smoothing 0.
 vim ~/PROJECT_NAME/workspace/MEMORY_LOG.md
 ```
 This is for permanent changes. The agent reads this every cycle.
-
----
-
-## MOBILE SETUP
-
-For checking experiments from phone:
-
-```bash
-# Install Happy Coder CLI
-npm install -g happy-coder
-
-# Start session through Happy
-happy
-
-# Inside: launch experiment
-/auto-experiment --project ~/PROJECT_NAME --gpu 0
-```
-
-Then install the Happy Coder app:
-- iOS: https://apps.apple.com/us/app/happy-codex-claude-code-app/id6748571505
-- Android: https://play.google.com/store/apps/details?id=com.ex3ndr.happy
-
-Scan QR code to pair. Now the user gets push notifications and can send directives from their phone.
 
 ---
 

@@ -31,6 +31,25 @@ After you finish, the **VERIFY** phase will automatically check:
 - `design_ablation`: Generate systematic ablation experiment plans (component removal, freeze, replacement)
 - `plan_model`: Generate PhD-level architecture plan from PROJECT_BRIEF (9-phase forward design)
 
+## File Placement Rules (CRITICAL)
+
+When creating files, you MUST place them in the correct directory:
+
+| File Type | Directory | Examples |
+|-----------|-----------|---------|
+| Model definitions | `models/` | `models/new_arch.py`, `models/decoder.py` |
+| Training scripts | `scripts/` | `scripts/train_model.py`, `scripts/dry_run.py` |
+| Test / debug scripts | `tools/` | `tools/test_branch.py`, `tools/debug_forward.py` |
+| Analysis scripts | `analysis/` | `analysis/validate_results.py` |
+| Paper research notes | `workspace/` | `workspace/paper_research_topic.md` |
+| Checkpoints | `checkpoints/` | `checkpoints/model_v2.pt` |
+| Log outputs | `logs/` or `outputs/` | `outputs/training_log.json` |
+
+**NEVER create `.py` files in the project root directory.** Root is only for:
+- `PROJECT_BRIEF.md`, `MEMORY_LOG.md`, `config.yaml`
+- `DATASET_MANIFEST.json`, `IMPLEMENTATION_STATUS.json`
+- `state.json`, `STRATEGY_RULES.json`, `.cycle_counter`
+
 ## Reasoning Principles (MANDATORY)
 
 ### Simplicity First
@@ -309,3 +328,49 @@ Save script to scripts/_phase1_fft_analysis.py (delete after use)"
 - Scripts should be prefixed with `_` (e.g., `_phase1_analysis.py`) and deleted after use
 - Report QUANTITATIVE results (numbers, not "looks different")
 - If the data DOESN'T support the idea, say so clearly — don't spin results
+
+## Exploratory Analysis Mode (v12 — CRITICAL for data analysis experiments)
+
+When the task is a **data analysis experiment** (not model training), the rules are DIFFERENT from training experiments:
+
+### Why different rules apply:
+Training experiments benefit from "one variable, minimum change" because you're testing a specific hypothesis.
+Data analysis experiments need the OPPOSITE: broad coverage of multiple independent methods to discover which features carry signal.
+
+### Exploratory Analysis Rules (MANDATORY for analysis experiments):
+
+1. **Multi-Method Coverage**: You MUST implement at least **3 independent analysis methods** that probe physically different properties.
+   - Example for angular patch analysis: gradient statistics, frequency-domain shape, view consistency, symmetry, entropy — NOT 5 variants of FFT.
+   - Each method should measure a DIFFERENT physical dimension.
+
+2. **Feature Family Diversity**: Never rely on a single feature family.
+   - BAD: Only FFT energy ratios (low/mid/high + centroid = 4 features, all from 1 family)
+   - GOOD: FFT shape + spatial gradients + view consistency + symmetry + entropy (= 5 families, 15+ features)
+
+3. **DC-Dominance Check**: When using frequency-domain methods, ALWAYS check what fraction of total energy is in the DC component.
+   - If DC > 90%, frequency energy ratios are nearly degenerate (they're all measuring the same thing: noise around DC)
+   - In this case, you MUST use DC-removed features or non-frequency methods as alternatives
+
+4. **Feature Completeness Report**: Your analysis output MUST include a structured report:
+   ```json
+   {
+     "feature_families_tested": ["FFT_energy", "spatial_gradient", "view_consistency", ...],
+     "features_per_family": 3,
+     "total_features": 15,
+     "best_cohens_d": 2.06,
+     "best_feature": "view_consistency.row_dir_changes",
+     "methods_with_no_signal": ["FFT_energy (DC-dominant, all d < 0.3)"],
+     "recommendation": "Feature X shows strong discrimination (d=2.06). FFT energy alone is insufficient due to DC dominance."
+   }
+   ```
+
+5. **When ALL methods show no signal**: Only then can you conclude "the direction is not feasible". If ANY method shows Cohen's d > 0.8, the direction HAS potential — just not with the methods that failed.
+
+### Contrast with Training Mode:
+| Aspect | Training Mode | Exploratory Analysis Mode |
+|--------|--------------|--------------------------|
+| Variables | 1 at a time | Multiple methods simultaneously |
+| Goal | Test specific hypothesis | Discover what works |
+| Code size | Minimum necessary | Broad coverage encouraged |
+| Success | Metric improves | ANY feature shows signal |
+| Failure | Hypothesis wrong | All methods show no signal (only after testing ≥3) |

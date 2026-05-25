@@ -1,0 +1,78 @@
+---
+description: AutoResearcher — autonomous ML experimentation agent. Use these skills when the user wants to run GPU experiments, analyze training results, review model code, or manage research projects.
+globs:
+alwaysApply: false
+---
+
+# AutoResearcher Skills
+
+When the user asks about running experiments, training models, or managing ML research, invoke the appropriate skill below.
+
+## Available Skills
+
+| Command | When to Use |
+|---------|-------------|
+| `/auto-experiment` | User wants to start autonomous 24/7 experiment loop |
+| `/code-review` | User wants architecture review before training |
+| `/code-cleanup` | User wants to clean up obsolete code |
+| `/experiment-status` | User asks about experiment progress |
+| `/gpu-monitor` | User asks about GPU status |
+| `/idea-validation` | User wants to validate a research idea |
+| `/model-architect` | User wants to design a new model architecture |
+| `/paper-research` | User wants to find relevant papers |
+| `/paper-analyze` | User wants deep analysis of a paper |
+| `/dataset-understanding` | User wants to understand dataset structure |
+| `/error-handler` | Experiment failed, user wants diagnosis |
+| `/progress-report` | User wants a progress report |
+
+## Programmatic Usage
+
+```python
+from api import AutoResearcher
+
+# Initialize for a project
+r = AutoResearcher("/path/to/project")
+
+# Run one cycle
+result = r.run_one_cycle()
+
+# Get status
+status = r.get_status()
+
+# Start background daemon
+pid = r.start_daemon(gpu="0", max_cycles=10)
+r.stop_daemon()
+
+# Query learned lessons
+lessons = r.get_code_review_lessons(severity="HIGH")
+```
+
+## CLI Usage
+
+```bash
+# Status
+python api.py status --project /path/to/project
+
+# Run 3 cycles
+python api.py run --project /path/to/project --cycles 3
+
+# Start daemon
+python api.py start --project /path/to/project --gpu 0
+
+# Stop daemon
+python api.py stop
+
+# Show learned lessons
+python api.py lessons --project /path/to/project --severity HIGH
+```
+
+## Project Requirements
+
+The project directory must contain:
+1. `PROJECT_BRIEF.md` — describes research goal, codebase, constraints
+2. `config.yaml` (optional) — agent configuration
+3. Python training scripts
+
+## Skill Files Location
+
+Skill definitions are in `skills/<name>/SKILL.md`. When invoking a skill, read the corresponding SKILL.md file and follow its instructions.

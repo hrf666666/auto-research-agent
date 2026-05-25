@@ -123,6 +123,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._no_progress_streak = 0
         self._last_no_progress_signature = ""
         self._consecutive_wait_count = 0
+        self._hard_gate_consecutive_blocks = 0  # track HARD GATE dead loops
         self._max_consecutive_waits = config.get("agent", {}).get("max_consecutive_waits", 3)
         # Repeated issue tracking for error escalation
         # Uses sliding window: issue_signature → list of recent cycle numbers
@@ -151,6 +152,16 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._direction_stagnation_count: int = 0     # Cycles without improvement in current direction
         self._direction_change_threshold: int = 3     # Force paper research after N stagnations
 
+        # ── v14: Architecture-level stagnation (independent of direction stagnation) ──
+        # Tracks whether the agent is stuck patching the SAME architecture.
+        # Unlike direction stagnation, this is NOT reset by paper_research —
+        # only reset when a genuinely different architecture is detected.
+        self._current_architecture_name: str = ""           # Detected architecture name (e.g., "epi", "unet")
+        self._architecture_stagnation_count: int = 0        # Cycles on same architecture without improvement
+        self._architecture_stagnation_threshold: int = 5    # Trigger architecture switch after N cycles
+        self._architecture_survey_done: bool = False        # Whether architecture survey has been completed
+        self._architecture_survey_path = self.workspace / "ARCHITECTURE_SURVEY.md"
+
         # ── Fix 2: Infrastructure degradation ──
         self._infra_failure_streak: int = 0  # Consecutive infrastructure failures
         self._infra_degradation_threshold: int = 3  # Skip VERIFY after N infra failures
@@ -164,6 +175,12 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── Simulation Sandbox (v11): Model evaluation engine ──
         self.sandbox = SimulationSandbox(self.project_dir, self.workspace, config=config)
+
+        # ── Research Roadmap (v15): Structured research methodology ──
+        from .research_roadmap import ResearchRoadmap
+        self.roadmap = ResearchRoadmap(self.workspace)
+        self._roadmap_initialized = False  # Set True after first generate_from_brief()
+        self._phase_violation_count = 0    # Consecutive phase violations in THINK
 
         # Graceful shutdown
         try:
@@ -213,8 +230,8 @@ class ResearchLoop(DomainKnowledgeMixin):
 
             self.cycle_count += 1
             logger.info(f"=== Cycle {self.cycle_count} ===")
-            # NOTE: _save_cycle_counter is deferred — only saved when the cycle
-            # produces meaningful work (experiment launched or paper research done).
+            # Save counter immediately at cycle start for crash recovery
+            self._save_cycle_counter()
 
             try:
                 # Keep leader context bounded to one cycle.
@@ -251,8 +268,16 @@ class ResearchLoop(DomainKnowledgeMixin):
                         logger.info("DATASET UNDERSTANDING phase — scanning data/ directory")
                         self._run_dataset_understanding()
 
+                    # ── ROADMAP INIT (v15): Generate research roadmap on first cycle ──
+                    if not self._roadmap_initialized:
+                        self._init_research_roadmap()
+
                     # THINK: Analyze and plan
                     think_result = self._think(directive)
+
+                    # ── ROADMAP ALIGNMENT CHECK (v15): Detect and correct deviations ──
+                    think_result = self._enforce_roadmap_alignment(think_result)
+
                     think_result = self._apply_no_progress_fallback(think_result, directive)
 
                 if think_result.get("action") == "wait":
@@ -330,63 +355,76 @@ class ResearchLoop(DomainKnowledgeMixin):
                                                 verify_report_dict=verify_report.to_dict() if verify_report else None)
                     self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
                     self._auto_code_cleanup(execute_result, reflect_result)
+                    # Post-reflect code review: learn from mistakes
+                    self._post_reflect_code_review(execute_result, reflect_result, verify_report)
                     # Paper research is meaningful work — persist cycle counter
                     self._save_cycle_counter()
                     continue
 
-                # PRE-VERIFY: Check critical preconditions BEFORE executing
-                # This catches problems like synthetic data, missing data, broken imports
-                # before wasting GPU hours on doomed experiments.
+                # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
+                # This is triggered when the architecture stagnation threshold is reached.
+                # The agent researches alternative architectures AND starts implementing.
+                if think_result.get("action") == "architecture_switch":
+                    self._consecutive_wait_count = 0
+                    logger.info(
+                        f"ARCHITECTURE SWITCH triggered — researching alternatives to "
+                        f"'{self._current_architecture_name}'."
+                    )
+                    self._update_state(
+                        {
+                            "cycle": self.cycle_count,
+                            "status": "architecture_switch",
+                            "updated_at": time.time(),
+                        }
+                    )
+                    # Architecture switch is dispatched as paper_research (uses researcher agent)
+                    # but with a specific architecture-switch task.
+                    execute_result = self._execute_paper_research(think_result)
+
+                    verify_report = self._verify(self.cycle_count, think_result, execute_result)
+                    execute_result["verify_report"] = verify_report.to_dict()
+
+                    reflect_result = self._reflect(execute_result, verify_report=verify_report)
+                    self._update_state(
+                        {
+                            "cycle": self.cycle_count,
+                            "updated_at": time.time(),
+                            "last_milestone": reflect_result.get("milestone", ""),
+                            "last_decision": reflect_result.get("decision", ""),
+                            "suggested_next_step": reflect_result.get("decision", "")
+                            or reflect_result.get("reason", ""),
+                        }
+                    )
+                    # Record as paper_research for outcome tracking purposes
+                    think_result_for_record = dict(think_result)
+                    think_result_for_record["action"] = "paper_research"
+                    self._record_cycle_outcome(
+                        think_result_for_record, execute_result, reflect_result,
+                        verify_report_dict=verify_report.to_dict() if verify_report else None
+                    )
+                    self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
+                    self._auto_code_cleanup(execute_result, reflect_result)
+                    self._post_reflect_code_review(execute_result, reflect_result, verify_report)
+                    self._save_cycle_counter()
+                    continue
+
+                # ── GATE PIPELINE (v12.4): ordered priority ──
+                # Gate 1 (PRE-VERIFY):  critical preconditions (synthetic data, missing data, broken imports)
+                # Gate 2 (CODE REVIEW): architectural / code defects
+                # Gate 3 (FALSIFIABILITY): hypothesis quality (soft gate, never blocks)
+                #
+                # A hard-gate (full rewrite of think_result) causes subsequent gates to
+                # skip entirely, preventing one gate from overwriting another's output.
+                _gate_blocked = False  # set to True when any hard-gate fires
+
+                # ── Gate 1: PRE-VERIFY ──
                 pre_verify_report = self._pre_verify(self.cycle_count, think_result)
-
-                # ── FALSIFIABLE HYPOTHESIS CHECK ──
-                # Force the experiment to have a falsifiable hypothesis.
-                # If the hypothesis cannot be proven wrong, the experiment is not scientific.
-                hypothesis = think_result.get("hypothesis", "")
-                success_criteria = think_result.get("success_criteria", "")
-                task_text = think_result.get("task", "")
-
-                non_falsifiable_warning = None
-                if not hypothesis or len(hypothesis.strip()) < 10:
-                    non_falsifiable_warning = (
-                        "NO HYPOTHESIS: The experiment has no stated hypothesis. "
-                        "Every experiment MUST state what it expects to learn and what would prove it wrong."
-                    )
-                elif "improve" in hypothesis.lower() and "if" not in hypothesis.lower():
-                    non_falsifiable_warning = (
-                        f"NON-FALSIFIABLE HYPOTHESIS: '{hypothesis[:100]}' is vague. "
-                        f"A hypothesis must be structured as: 'If we change X, then Y should improve "
-                        f"because Z. If Y does NOT improve (or gets worse), the hypothesis is wrong.' "
-                        f"State the SPECIFIC change, the EXPECTED effect, and the FAILURE condition."
-                    )
-                elif not success_criteria or len(success_criteria.strip()) < 10:
-                    non_falsifiable_warning = (
-                        "NO SUCCESS CRITERIA: Without concrete success criteria, you cannot "
-                        "determine whether the experiment succeeded or failed. "
-                        "Example: 'worst_domain_MAE < 0.30' (pass) vs '>= 0.30' (fail)."
-                    )
-
-                if non_falsifiable_warning:
-                    logger.warning(f"FALSIFIABILITY CHECK: {non_falsifiable_warning}")
-                    # Don't block, but inject as a strong warning into the task
-                    think_result["task"] = (
-                        f"⚠️ FALSIFIABILITY WARNING: {non_falsifiable_warning}\n\n"
-                        f"--- ORIGINAL TASK ---\n{think_result.get('task', '')}\n\n"
-                        f"--- MANDATORY ADDITION ---\n"
-                        f"Before starting: Write down your HYPOTHESIS, SUCCESS CRITERIA, and "
-                        f"FAILURE CONDITION as comments at the top of your training script.\n"
-                        f"Format: # HYPOTHESIS: If X then Y because Z\n"
-                        f"        # SUCCESS: metric < threshold\n"
-                        f"        # FAILURE: metric >= threshold (hypothesis wrong)\n"
-                    )
-
                 critical_pre_issues = pre_verify_report.critical_failures
                 if critical_pre_issues:
                     issues_text = "; ".join(c.detail for c in critical_pre_issues)
                     logger.warning(
                         f"PRE-VERIFY blocked execution: {issues_text}"
                     )
-                    # Convert pre-verify failures into a fix task instead of executing
                     think_result = {
                         "action": "experiment",
                         "agent": "code",
@@ -401,6 +439,109 @@ class ResearchLoop(DomainKnowledgeMixin):
                             "4. Do NOT launch real training until pre-verify passes\n"
                         ),
                     }
+                    _gate_blocked = True
+
+                # ── Gate 2: PRE-EXECUTE CODE REVIEW (v12.3+) ──
+                # Two-phase code review BEFORE training:
+                #   Phase 1: Zero-LLM regex checks (fast, free, catches known anti-patterns)
+                #   Phase 2: LLM semantic review (catches logic bugs, design flaws)
+                if not _gate_blocked and think_result.get("action") == "experiment":
+                    code_review_warnings = self._pre_execute_code_review(think_result)
+
+                    if not code_review_warnings:
+                        # Code review passed — reset dead-loop counter
+                        self._hard_gate_consecutive_blocks = 0
+                    else:
+                        high_issues = [w for w in code_review_warnings if w["severity"] == "HIGH"]
+
+                        if high_issues:
+                            self._hard_gate_consecutive_blocks += 1
+                            # ── Anti-deadloop: after 2 consecutive HARD blocks, downgrade to SOFT ──
+                            if self._hard_gate_consecutive_blocks > 2:
+                                logger.warning(
+                                    f"HARD GATE downgraded to SOFT after "
+                                    f"{self._hard_gate_consecutive_blocks} consecutive blocks — "
+                                    f"regex check may be a false positive"
+                                )
+                                self._hard_gate_consecutive_blocks = 0  # reset
+                                # Fall through to SOFT GATE below
+                            else:
+                                # ── HARD GATE: HIGH severity blocks execution entirely ──
+                                logger.warning(
+                                    f"PRE-EXECUTE CODE REVIEW HARD GATE: {len(high_issues)} HIGH issue(s), "
+                                    f"blocking execution (streak={self._hard_gate_consecutive_blocks})"
+                                )
+                                think_result = {
+                                    "action": "experiment",
+                                    "agent": "code",
+                                    "task": (
+                                        f"⛔ PRE-EXECUTE CODE REVIEW BLOCKED TRAINING\n\n"
+                                        f"The following CRITICAL architectural issues must be fixed "
+                                        f"BEFORE any training:\n\n"
+                                        + "\n".join(
+                                            f"- [{w['severity']}] {w['detail']}"
+                                            for w in high_issues
+                                        )
+                                        + "\n\n## Mandatory Actions:\n"
+                                        "1. Fix ALL HIGH severity issues listed above\n"
+                                        "2. Verify the model file is syntactically correct (can import)\n"
+                                        "3. Re-run will auto-check after fixes\n"
+                                        "4. Do NOT launch real training until code review passes\n"
+                                    ),
+                                }
+                                _gate_blocked = True
+                        if not _gate_blocked and code_review_warnings:
+                            # ── SOFT GATE: MEDIUM/LOW issues injected as mandatory fix ──
+                            review_prompt = (
+                                "PRE-EXECUTE CODE REVIEW (v12.3) — ISSUES DETECTED:\n\n"
+                                + "\n".join(
+                                    f"- [{w['severity']}] {w['detail']}"
+                                    for w in code_review_warnings
+                                )
+                                + "\n\nYou MUST address these issues BEFORE launching training. "
+                                + "Fix the model architecture, then re-verify. "
+                                + "Do NOT proceed with training until these are resolved.\n\n"
+                            )
+                            think_result["task"] = review_prompt + think_result.get("task", "")
+                            think_result["_soft_gate_injected"] = True  # skip falsifiability to avoid task bloat
+                            logger.warning(
+                                f"PRE-EXECUTE CODE REVIEW: {len(code_review_warnings)} issue(s) injected into task"
+                            )
+
+                # ── Gate 3: FALSIFIABLE HYPOTHESIS CHECK ──
+                # Always runs (soft gate). Skipped when a hard-gate already fired to
+                # avoid wrapping the fix-task in hypothesis boilerplate.
+                if not _gate_blocked and not think_result.get("_soft_gate_injected"):
+                    hypothesis = think_result.get("hypothesis", "")
+                    success_criteria = think_result.get("success_criteria", "")
+
+                    non_falsifiable_warning = None
+                    if not hypothesis or len(hypothesis.strip()) < 10:
+                        non_falsifiable_warning = (
+                            "NO HYPOTHESIS: The experiment has no stated hypothesis. "
+                            "Every experiment MUST state what it expects to learn and what would prove it wrong."
+                        )
+                    elif "improve" in hypothesis.lower() and "if" not in hypothesis.lower():
+                        non_falsifiable_warning = (
+                            f"NON-FALSIFIABLE HYPOTHESIS: '{hypothesis[:100]}' is vague. "
+                            f"A hypothesis must be structured as: 'If we change X, then Y should improve "
+                            f"because Z. If Y does NOT improve (or gets worse), the hypothesis is wrong.' "
+                            f"State the SPECIFIC change, the EXPECTED effect, and the FAILURE condition."
+                        )
+                    elif not success_criteria or len(success_criteria.strip()) < 10:
+                        non_falsifiable_warning = (
+                            "NO SUCCESS CRITERIA: Without concrete success criteria, you cannot "
+                            "determine whether the experiment succeeded or failed. "
+                            "Example: 'worst_domain_MAE < 0.30' (pass) vs '>= 0.30' (fail)."
+                        )
+
+                    if non_falsifiable_warning:
+                        logger.warning(f"FALSIFIABILITY CHECK: {non_falsifiable_warning}")
+                        falsify_prefix = (
+                            f"FALSIFIABILITY: {non_falsifiable_warning}\n"
+                            f"Add HYPOTHESIS/SUCCESS/FAILURE comments to training script.\n\n"
+                        )
+                        think_result["task"] = falsify_prefix + think_result.get("task", "")
 
                 # EXECUTE: Run the plan
                 self._consecutive_wait_count = 0
@@ -523,6 +664,9 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                 self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
 
+                # Post-reflect code review: learn from mistakes
+                self._post_reflect_code_review(execute_result, reflect_result, verify_report)
+
                 # Only count as meaningful cycle if experiment was launched or progress was made
                 if execute_result.get("experiment_launched") or reflect_result.get("milestone"):
                     self._save_cycle_counter()
@@ -568,16 +712,38 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
 
             except Exception as e:
+                err_msg = str(e)
                 logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
-                self.memory.log_decision(f"Cycle {self.cycle_count} error: {str(e)[:200]}")
+                self.memory.log_decision(f"Cycle {self.cycle_count} error: {err_msg[:200]}")
                 self._update_state(
                     {
                         "cycle": self.cycle_count,
                         "status": "error",
                         "updated_at": time.time(),
-                        "last_error": str(e)[:500],
+                        "last_error": err_msg[:500],
                     }
                 )
+                # v12.1: Don't backoff for quota errors — retrying won't help
+                is_quota_error = (
+                    "insufficient_quota" in err_msg
+                    or "quota" in err_msg.lower()
+                )
+                if is_quota_error:
+                    logger.warning(
+                        f"API quota exhausted — pausing for 30 min before retry. "
+                        f"Cycle state preserved for resumption."
+                    )
+                    # Save cycle state for resumption
+                    self._save_cycle_counter()
+                    # Quota recovery: wait longer (30 min) then retry instead of giving up
+                    self._update_state({
+                        "cycle": self.cycle_count,
+                        "status": "quota_recovery",
+                        "updated_at": time.time(),
+                        "last_error": err_msg[:500],
+                    })
+                    time.sleep(1800)  # 30 min cooldown for quota recovery
+                    continue  # Retry the cycle instead of breaking
                 self._cooldown_after_error()
 
         logger.info("AutoResearcher stopped.")
@@ -666,19 +832,134 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── DIRECTION CIRCUIT BREAKER ──
         # Force direction re-evaluation when stagnation is detected
+        # v15: ROADMAP has priority — if ROADMAP says we're still verifying theory,
+        # "direction change" is irrelevant; the agent should verify the current module's assumptions.
+        _roadmap_active = (
+            self._roadmap_initialized
+            and self.roadmap.is_theory_verification_phase
+        )
+
         if self._direction_stagnation_count >= self._direction_change_threshold:
-            context["direction_circuit_breaker"] = (
-                f"DIRECTION CIRCUIT BREAKER TRIGGERED: {self._direction_stagnation_count} "
-                f"cycles without progress on current direction.\n"
-                f"STOP and re-read PROJECT_BRIEF. You MUST propose a FUNDAMENTALLY different approach.\n"
-                f"Record the current direction as a dead end before proceeding."
+            if _roadmap_active:
+                # Override: don't suggest changing direction, suggest verifying current module
+                active_names = self.roadmap.active_module_names[:3]
+                mod_names = ", ".join(active_names)
+                context["direction_circuit_breaker"] = (
+                    f"ROADMAP PRIORITY OVERRIDE (v15): Direction stagnation detected, "
+                    f"but research is still in theory_verification phase.\n"
+                    f"Active modules: {mod_names}\n"
+                    f"Instead of changing direction, you MUST verify the assumptions of these modules.\n"
+                    f"Propose a DATA ANALYSIS experiment to test the core assumptions."
+                )
+            else:
+                context["direction_circuit_breaker"] = (
+                    f"DIRECTION CIRCUIT BREAKER TRIGGERED: {self._direction_stagnation_count} "
+                    f"cycles without progress on current direction.\n"
+                    f"STOP and re-read PROJECT_BRIEF. You MUST propose a FUNDAMENTALLY different approach.\n"
+                    f"Record the current direction as a dead end before proceeding."
+                )
+
+        # ── v14: ARCHITECTURE CIRCUIT BREAKER ──
+        # When the same architecture has been patched for too many cycles without
+        # improvement, force the agent to SWITCH to a completely different architecture.
+        # v15: During theory_verification, architecture switching is premature.
+        if self._architecture_stagnation_count >= self._architecture_stagnation_threshold:
+            if _roadmap_active:
+                # Suppress architecture switch during theory verification
+                logger.info(
+                    "ROADMAP priority: suppressing architecture_circuit_breaker "
+                    "during theory_verification phase"
+                )
+            else:
+                context["architecture_circuit_breaker"] = (
+                    f"ARCHITECTURE CIRCUIT BREAKER (v14): {self._architecture_stagnation_count} "
+                    f"cycles spent on architecture '{self._current_architecture_name}' without improvement.\n"
+                    f"This architecture is a DEAD END — incremental patches will NOT help.\n\n"
+                    f"MANDATORY ACTIONS:\n"
+                    f"1. Record '{self._current_architecture_name}' architecture as a dead end\n"
+                    f"2. Read ARCHITECTURE_SURVEY.md (if exists) for candidate alternatives\n"
+                    f"3. If no survey exists, do paper_research to find 3+ alternative architectures\n"
+                    f"4. Select the best alternative based on: assumption compatibility with data, "
+                    f"parameter efficiency, and implementation feasibility\n"
+                    f"5. Design a pilot experiment (2-5 epochs) to validate the new architecture\n"
+                    f"6. Do NOT propose ANY change to the current '{self._current_architecture_name}' architecture"
             )
+
+        # ── v14: ARCHITECTURE SURVEY GATE ──
+        # In early cycles (1-2), force an architecture survey before committing to any model.
+        # This prevents the agent from blindly using PROJECT_BRIEF's suggested baseline.
+        if not self._architecture_survey_done and self.cycle_count <= 2:
+            if not self._architecture_survey_path.exists():
+                context["architecture_survey_gate"] = (
+                    "ARCHITECTURE SURVEY GATE (v14): This is an early cycle and no architecture "
+                    "survey has been completed yet.\n\n"
+                    "BEFORE committing to any baseline architecture, you MUST:\n"
+                    "1. Search for at least 3 different architectures/methods for this task\n"
+                    "2. For each candidate, analyze:\n"
+                    "   - Core ASSUMPTION (e.g., Lambertian, smooth, regular grid)\n"
+                    "   - Data requirements vs. what's actually available\n"
+                    "   - Computational feasibility given available resources\n"
+                    "   - Published performance on similar tasks\n"
+                    "3. Write the survey to workspace/ARCHITECTURE_SURVEY.md\n"
+                    "4. ONLY THEN select the best architecture based on evidence\n\n"
+                    "Do NOT use any architecture just because it's mentioned in PROJECT_BRIEF.\n"
+                    "PROJECT_BRIEF provides context, NOT architectural decisions."
+                )
 
         # ── CROSS-EXPERIMENT KNOWLEDGE INTEGRATION ──
         # Connect dead ends across experiments to identify meta-patterns
         cross_exp = self._build_cross_experiment_insights()
         if cross_exp:
             context["cross_experiment_insights"] = cross_exp
+
+        # ── v12: METHOD INADEQUACY RE-AWAKENING ──
+        # If previous dead ends were categorized as 'method_inadequacy' (the analysis
+        # method was too narrow, not the hypothesis being wrong), inject a prompt
+        # encouraging the Leader to retry with broader analysis instead of abandoning.
+        try:
+            mi_count = self.memory.get_method_inadequacy_count()
+            if mi_count > 0:
+                mi_entries = self.memory.get_dead_ends_by_category("method_inadequacy")
+                mi_summaries = [e.get("content", "")[:120] for e in mi_entries[-3:]]
+                context["method_inadequacy_retry_prompt"] = (
+                    f"METHOD INADEQUACY RE-AWAKENING (v12):\n"
+                    f"You have {mi_count} dead_end(s) categorized as 'method_inadequacy'.\n"
+                    f"These are NOT hypothesis failures — the analysis method was too narrow.\n"
+                    f"Recent entries:\n"
+                    + "\n".join(f"  - {s}" for s in mi_summaries)
+                    + "\n\n"
+                    f"Consider RETRYING these directions with broader analysis:\n"
+                    f"- Use at least 3 independent feature families\n"
+                    f"- Include non-frequency methods (gradients, symmetry, entropy, view consistency)\n"
+                    f"- Check DC-dominance before relying on frequency-domain results\n"
+                    f"Only abandon a direction after ≥3 independent methods ALL show no signal."
+                )
+        except Exception as e:
+            logger.debug(f"Method inadequacy check skipped: {e}")
+
+        # ── v12.1: PENDING DEGRADED REFLECT ──
+        # If the previous cycle's REFLECT was degraded (API quota exhausted),
+        # inject a reminder so the Leader can revisit those results.
+        degraded_note_path = self.workspace / ".degraded_reflect_pending"
+        if degraded_note_path.exists():
+            try:
+                degraded_info = json.loads(degraded_note_path.read_text())
+                context["degraded_reflect_pending"] = (
+                    f"PRIOR CYCLE INCOMPLETE REFLECT (v12.1):\n"
+                    f"Cycle {degraded_info.get('cycle', '?')} REFLECT was degraded "
+                    f"(API quota exhausted). Results were preserved but NOT fully analyzed.\n"
+                    f"Metrics: {degraded_info.get('metrics_summary', 'N/A')}\n"
+                    f"VERIFY: {degraded_info.get('verify_status', 'N/A')}\n"
+                    f"{'Milestone recorded (partial).' if degraded_info.get('has_milestone') else ''}"
+                    f"{'Dead end recorded (partial).' if degraded_info.get('has_dead_end') else ''}\n"
+                    f"→ You SHOULD briefly review the last cycle's results before planning new work.\n"
+                    f"→ If the last cycle was successful, continue from there.\n"
+                    f"→ If it failed, diagnose and fix before proceeding."
+                )
+                # Consume the note after one injection
+                degraded_note_path.unlink()
+            except Exception:
+                pass
 
         # ── ARCHITECTURE PLAN INJECTION (Phase 2+) ──
         # When transitioning from analysis to model building, provide the Leader
@@ -746,6 +1027,42 @@ class ResearchLoop(DomainKnowledgeMixin):
         except Exception as e:
             logger.warning(f"Failed to inject causal history: {e}")
 
+        # ── CODE REVIEW LESSONS INJECTION ──
+        # Inject past mistakes into THINK context so the agent learns from them.
+        # This is the key mechanism that makes the knowledge base actually used.
+        try:
+            # Get all HIGH/MEDIUM lessons, format for context
+            all_lessons = self.memory.get_code_review_lessons(severity="MEDIUM", limit=20)
+            if all_lessons:
+                lesson_text = self.memory.format_lessons_for_context(all_lessons, max_chars=1500)
+                if lesson_text:
+                    context["code_review_lessons"] = lesson_text
+
+            # Also search for lessons relevant to the current project code
+            # Use cached content — only re-read when mtime changes
+            model_dir = self.project_dir / "models"
+            if model_dir.exists():
+                try:
+                    model_files = sorted(model_dir.glob("*.py"), key=lambda f: f.stat().st_mtime, reverse=True)
+                    if model_files:
+                        latest = model_files[0]
+                        mtime = latest.stat().st_mtime
+                        if (not hasattr(self, '_cached_model_mtime') or
+                                self._cached_model_mtime != mtime):
+                            self._cached_model_content = latest.read_text()
+                            self._cached_model_mtime = mtime
+                        relevant = self.memory.search_relevant_lessons(
+                            self._cached_model_content, limit=5
+                        )
+                        if relevant:
+                            context["relevant_code_review_lessons"] = (
+                                self.memory.format_lessons_for_context(relevant, max_chars=1000)
+                            )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Failed to inject code review lessons: {e}")
+
         # ── EXPERIMENT CALIBRATION ──
         # Help the agent learn from past hypothesis accuracy
         try:
@@ -788,6 +1105,15 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
         except Exception:
             pass
+
+        # ── RESEARCH ROADMAP (v15): Inject phase constraints ──
+        # This is the PRIMARY control mechanism: tells Leader what phase and module to work on.
+        try:
+            roadmap_ctx = self.roadmap.get_phase_context(self.cycle_count)
+            if roadmap_ctx:
+                context["research_roadmap"] = roadmap_ctx
+        except Exception as e:
+            logger.warning(f"ROADMAP context injection failed: {e}")
 
         # ── CONTEXT PRUNING (v10) ──
         # Limit context to most relevant keys to prevent LLM confusion
@@ -1011,13 +1337,17 @@ class ResearchLoop(DomainKnowledgeMixin):
         task = think_result.get("task", "")
         # Look for model path patterns in the task description
         patterns = [
-            r"models/[\w/]+\.py",
-            r"model.*?['\"]([\w/]+\.py)['\"]",
+            r"models/[\w/\-\.]+\.py",
+            r"(?:model_path|model_file|model)\s*[:=]\s*['\"]([\w/\-\.]+\.py)['\"]",
         ]
         for pattern in patterns:
             match = re.search(pattern, task)
             if match:
-                return match.group(0) if "/" in match.group(0) else match.group(1)
+                path = match.group(1) if match.lastindex else match.group(0)
+                # Ensure the path starts with "models/" for consistency
+                if not path.startswith("models/"):
+                    path = f"models/{path}"
+                return path
 
         # Fallback: find most recently modified model file
         models_dir = self.project_dir / "models"
@@ -1026,6 +1356,690 @@ class ResearchLoop(DomainKnowledgeMixin):
             if files:
                 return f"models/{files[0].name}"
         return ""
+
+    def _pre_execute_code_review(self, think_result: dict) -> list:
+        """v12.3: Two-phase code review BEFORE training.
+
+        Phase 1: Zero-LLM regex checks (fast, free, catches known anti-patterns)
+          - Checks both model code AND training scripts
+          - HIGH severity -> hard-block execution
+        Phase 2: LLM semantic review (catches logic bugs, design flaws)
+          - Uses cheap fast model for architecture sanity check
+          - Only runs when Phase 1 found no HIGH issues (to avoid wasted LLM tokens)
+
+        Returns a list of warnings with severity levels.
+        """
+        warnings = []
+
+        # -- Phase 1: Regex-based structural checks --
+        model_rel_path = self._extract_model_path_from_task(think_result)
+        model_content = ""
+        if model_rel_path:
+            model_path = self.project_dir / model_rel_path
+            if model_path.exists():
+                try:
+                    model_content = model_path.read_text()
+                except Exception:
+                    pass
+
+        if not model_content:
+            # Still check training script even without model code
+            train_script_content = self._find_training_script_content(think_result)
+            if train_script_content:
+                warnings.extend(self._regex_code_review_train_script(
+                    train_script_content, ""
+                ))
+            return warnings
+
+        # Regex checks on model code
+        warnings.extend(self._regex_code_review_model(model_content))
+
+        # Regex checks on training script
+        train_script_content = self._find_training_script_content(think_result)
+        if train_script_content:
+            warnings.extend(self._regex_code_review_train_script(
+                train_script_content, model_content
+            ))
+
+        # -- Phase 2: LLM semantic review --
+        # Only run if Phase 1 found no HIGH issues (otherwise already blocked)
+        has_high = any(w["severity"] == "HIGH" for w in warnings)
+        if not has_high and model_content:
+            llm_warnings = self._llm_code_review(model_content, train_script_content)
+            warnings.extend(llm_warnings)
+
+        return warnings
+
+    @staticmethod
+    def _strip_comments_and_strings(content: str) -> str:
+        """Remove comments and string literals so regex checks only match real code."""
+        # Phase 1: Remove multi-line strings first (operates on full content)
+        cleaned = re.sub(r'"""[\s\S]*?"""', '', content)
+        cleaned = re.sub(r"'''[\s\S]*?'''", '', cleaned)
+        # Phase 2: Line-by-line comment and single-line string removal
+        lines = []
+        for line in cleaned.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith('#'):
+                continue
+            # Remove inline comments (simple heuristic — doesn't handle '#' inside strings)
+            code_part = stripped.split('#')[0] if '#' in stripped else stripped
+            # Remove remaining single-line strings
+            code_part = re.sub(r'"[^"]*"', '', code_part)
+            code_part = re.sub(r"'[^']*'", '', code_part)
+            lines.append(code_part)
+        return '\n'.join(lines)
+
+    def _regex_code_review_model(self, content: str) -> list:
+        """Phase 1a: Regex-based structural checks on model code."""
+        warnings = []
+        code_only = self._strip_comments_and_strings(content)
+
+        # -- Check 1: Routing/Fusion without auxiliary supervision --
+        has_routing = bool(re.search(
+            r"routing|router|route_weight|w_epi|w_defocus|gate_weight|gate_network|gating|fusion_weight",
+            code_only, re.IGNORECASE
+        ))
+        has_aux_loss = bool(re.search(
+            r"aux_loss|aux_weight|auxiliary|routing_loss|gate_loss",
+            code_only, re.IGNORECASE
+        ))
+        if has_routing and not has_aux_loss:
+            warnings.append({
+                "severity": "HIGH",
+                "detail": (
+                    "Model has routing/fusion mechanism but no auxiliary loss for routing. "
+                    "Without explicit supervision, routing weights will not differentiate. "
+                    "Add aux_loss with domain-specific routing targets (e.g. "
+                    "Lambertian->[1,0], NL->[0,1])."
+                ),
+            })
+
+        # -- Check 2: Input channel information asymmetry --
+        conv_inputs = re.findall(r"Conv2d\((\d+),", code_only)
+        if len(conv_inputs) >= 3:
+            inputs_int = [int(c) for c in conv_inputs if int(c) > 1]
+            if inputs_int:
+                ratio = max(inputs_int) / min(inputs_int)
+                if ratio > 10:
+                    warnings.append({
+                        "severity": "MEDIUM",
+                        "detail": (
+                            f"Input channel information asymmetry detected: "
+                            f"branches range from {min(inputs_int)}ch to {max(inputs_int)}ch "
+                            f"({ratio:.0f}x ratio). The low-channel branch may not "
+                            f"have enough information to learn useful features."
+                        ),
+                    })
+
+        # -- Check 3: Router with only 1x1 conv (no spatial context) --
+        # Use per-line matching to avoid cross-block false positives.
+        # Only flag when router class/method DEFINES a 1x1 conv (not just mentions it).
+        has_router_1x1 = False
+        for line in code_only.splitlines():
+            stripped = line.strip()
+            if re.search(r"(?:router|routing|gate)", stripped, re.IGNORECASE):
+                if re.search(r"Conv2d\(\d+,\s*\d+.*?kernel_size\s*=\s*1", stripped):
+                    has_router_1x1 = True
+                    break
+        if has_router_1x1:
+            warnings.append({
+                "severity": "MEDIUM",
+                "detail": (
+                    "Router uses only 1x1 convolutions -- no spatial context. "
+                    "This produces pixel-independent routing, causing spatial "
+                    "artifacts in the output. Consider using 3x3 conv or adding "
+                    "spatial smoothing after routing weights."
+                ),
+            })
+
+        # -- Check 4: Weighted fusion without baseline comparison --
+        has_weighted_fusion = bool(re.search(
+            r"w_\w+\s*\*\s*\w+_feature|weighted.*sum|weighted.*fusion",
+            content, re.IGNORECASE,
+        ))
+        if has_weighted_fusion and has_routing:
+            has_skip = bool(re.search(
+                r"skip|residual.*baseline|identity|epi_only",
+                content, re.IGNORECASE,
+            ))
+            if not has_skip:
+                warnings.append({
+                    "severity": "LOW",
+                    "detail": (
+                        "Weighted fusion of EPI + Defocus without skip/baseline "
+                        "connection. If defocus branch produces noise, there is no "
+                        "fallback to EPI-only prediction. Consider adding a "
+                        "skip connection from EPI features to decoder."
+                    ),
+                })
+
+        # -- Check 5: Extreme channel compression in routing path --
+        channel_seq = re.findall(
+            r"(?:Conv2d|Linear)\((\d+),\s*(\d+)", content
+        )
+        for i in range(len(channel_seq) - 1):
+            out1 = int(channel_seq[i][1])
+            in2 = int(channel_seq[i + 1][0])
+            if out1 == in2 and out1 > 0:
+                reduction_ratio = int(channel_seq[i][0]) / out1
+                if reduction_ratio > 10:
+                    pos = content.find(channel_seq[i][0])
+                    surrounding = content[max(0, pos - 300): pos + 300]
+                    if re.search(r"router|routing|gate", surrounding, re.IGNORECASE):
+                        warnings.append({
+                            "severity": "MEDIUM",
+                            "detail": (
+                                f"Extreme channel compression ({int(channel_seq[i][0])}→{out1}) "
+                                f"near routing/gate module. This may lose too much information "
+                                f"for the router to make meaningful decisions. "
+                                f"Consider using a wider intermediate dimension."
+                            ),
+                        })
+
+        return warnings
+
+    def _regex_code_review_train_script(self, script_content: str, model_content: str) -> list:
+        """Phase 1b: Regex-based checks on training script."""
+        warnings = []
+
+        # -- Check T1: Routing target majority trivial --
+        all_targets = re.findall(
+            r"(?:target|label|routing_target|gate_target)\s*[=:]\s*\[([^\]]+)\]",
+            script_content, re.IGNORECASE,
+        )
+        if all_targets:
+            trivial_count = sum(1 for t in all_targets if "0.5" in t)
+            if trivial_count > len(all_targets) / 2:
+                warnings.append({
+                    "severity": "HIGH",
+                    "detail": (
+                        f"Routing target design flaw: {trivial_count}/{len(all_targets)} "
+                        f"domain routing targets are [0.5, 0.5] (trivial). "
+                        f"This means the router gets no useful gradient signal for "
+                        f"{trivial_count} domains -- it cannot learn to differentiate. "
+                        f"Use domain-specific targets like [1,0] vs [0,1]."
+                    ),
+                })
+
+        # -- Check T2: aux_weight too low relative to main loss scale --
+        aux_weight_match = re.search(
+            r"aux_weight\s*[=:]\s*([0-9.]+)", script_content, re.IGNORECASE,
+        )
+        if aux_weight_match:
+            aux_weight = float(aux_weight_match.group(1))
+            if aux_weight < 0.05:
+                warnings.append({
+                    "severity": "HIGH",
+                    "detail": (
+                        f"aux_weight={aux_weight} is very low (< 0.05). "
+                        f"When main loss >> aux loss, this means aux gradient is "
+                        f"effectively zero. The routing/attention module cannot learn. "
+                        f"Recommended: aux_weight >= 0.1, or use a separate optimizer."
+                    ),
+                })
+            elif aux_weight < 0.1:
+                if re.search(r"router|routing|gate", model_content, re.IGNORECASE):
+                    warnings.append({
+                        "severity": "MEDIUM",
+                        "detail": (
+                            f"aux_weight={aux_weight} may be too low for complex routing. "
+                            f"If aux loss doesn't decrease during training, increase to "
+                            f"0.2-0.5 or use gradient scaling."
+                        ),
+                    })
+
+        # -- Check T3: Training data leakage or no validation split --
+        if not re.search(r"val_split|val_dataset|validation|test_split", script_content, re.IGNORECASE):
+            warnings.append({
+                "severity": "MEDIUM",
+                "detail": (
+                    "Training script has no visible validation split. "
+                    "Without validation, you cannot detect overfitting. "
+                    "Add a proper train/val split."
+                ),
+            })
+
+        return warnings
+
+    def _find_training_script_content(self, think_result: dict) -> str:
+        """Find and read the training script content from task description or project."""
+        task = think_result.get("task", "")
+
+        script_patterns = [
+            r"scripts/[\w/]+\.py",
+            r"train[\w_]*\.py",
+        ]
+        for pattern in script_patterns:
+            match = re.search(pattern, task)
+            if match:
+                script_path = self.project_dir / match.group(0)
+                if script_path.exists():
+                    try:
+                        return script_path.read_text()
+                    except Exception:
+                        pass
+
+        # Fallback: find most recently modified training script
+        for search_dir in [self.project_dir / "scripts", self.project_dir]:
+            if not search_dir.exists():
+                continue
+            scripts = sorted(
+                search_dir.glob("train*.py"),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            if scripts:
+                try:
+                    return scripts[0].read_text()
+                except Exception:
+                    pass
+
+        return ""
+
+    @staticmethod
+    def _extract_key_code_segments(content: str, budget: int = 5000) -> str:
+        """Extract the most semantically important code segments within a char budget.
+
+        Priority order (highest first):
+        1. forward() method — the data flow / computation graph
+        2. __init__ of the main model class — architecture definition
+        3. Loss / criterion / routing weight computation functions
+        4. Remaining code (tail, to catch helper methods)
+
+        For each block we keep a configurable budget.  If the total is still
+        under *budget* after extracting the priority blocks, we append lines
+        from the tail of the file (where helper utilities and small modules
+        tend to live) until the budget is exhausted.
+        """
+        lines = content.splitlines()
+        total_lines = len(lines)
+
+        # Helper: extract a contiguous block identified by its start line.
+        def _block_from(start_idx: int) -> tuple[list[str], int]:
+            """Return (block_lines, end_idx) — stops at next def/class at same or lower indent."""
+            block = [lines[start_idx]]
+            base_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+            end = start_idx + 1
+            while end < total_lines:
+                line = lines[end]
+                # Blank lines and comments are always included
+                if not line.strip() or line.strip().startswith("#"):
+                    block.append(line)
+                    end += 1
+                    continue
+                cur_indent = len(line) - len(line.lstrip())
+                # A new def/class at same or lower indent ends this block
+                if cur_indent <= base_indent and re.match(r"\s*(def |class )", line):
+                    break
+                block.append(line)
+                end += 1
+            return block, end
+
+        # --- Collect priority blocks ---
+        segments: list[tuple[int, list[str]]] = []  # (priority, lines)
+
+        forward_idx = None
+        init_idx = None
+        loss_indices: list[int] = []
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if re.match(r"def forward\s*\(", stripped):
+                forward_idx = i
+            elif re.match(r"class \w+.*Model|class \w+.*Net|class \w+.*Network", stripped):
+                # Skip test/debug/utility classes that aren't the main model
+                skip_keywords = ("Test", "Debug", "Dummy", "Loader", "Helper", "Mock",
+                                 "Sampler", "Dataset", "DataLoader", "Transform")
+                class_name = stripped.split("class ")[1].split("(")[0].split(":")[0].strip()
+                if any(kw in class_name for kw in skip_keywords):
+                    continue
+                # Find __init__ inside this class
+                for j in range(i, min(i + 80, total_lines)):
+                    if re.match(r"\s+def __init__\s*\(", lines[j]):
+                        init_idx = j
+                        break
+            elif re.match(r"def .*(?:loss|criterion|compute_weight|routing_weight|gate_weight)", stripped, re.IGNORECASE):
+                loss_indices.append(i)
+
+        if forward_idx is not None:
+            blk, _ = _block_from(forward_idx)
+            segments.append((0, blk))  # highest priority
+        if init_idx is not None:
+            blk, _ = _block_from(init_idx)
+            segments.append((1, blk))
+        for li in loss_indices:
+            blk, _ = _block_from(li)
+            segments.append((2, blk))
+
+        # Sort by priority, then assemble within budget
+        segments.sort(key=lambda s: s[0])
+        result_parts: list[str] = []
+        used = 0
+        seen_line_sets: set[int] = set()
+
+        for _pri, blk in segments:
+            # Deduplicate: skip blocks we already included
+            blk_start_hash = hash(blk[0]) if blk else 0
+            if blk_start_hash in seen_line_sets:
+                continue
+            seen_line_sets.add(blk_start_hash)
+
+            block_text = "\n".join(blk)
+            if used + len(block_text) + 3 > budget:
+                # Partially include — take as many lines as fit
+                remaining = budget - used - 3
+                if remaining > 50:
+                    partial = "\n".join(blk[: remaining // max(1, len(blk[0]) + 1)])
+                    result_parts.append(partial + "\n# ... (truncated)")
+                    used += len(partial) + 20
+                break
+            result_parts.append(block_text)
+            used += len(block_text) + 1
+
+        # If still under budget, append tail lines
+        if used < budget:
+            tail_text = "\n".join(lines[-max(total_lines // 5, 20):])
+            remaining = budget - used
+            if len(tail_text) > remaining:
+                tail_text = tail_text[:remaining] + "\n# ... (tail truncated)"
+            if tail_text.strip():
+                result_parts.append("# --- Additional code (tail) ---\n" + tail_text)
+
+        assembled = "\n\n".join(result_parts)
+        # Final safety truncate
+        if len(assembled) > budget:
+            assembled = assembled[:budget] + "\n# ... (overall truncated)"
+        return assembled
+
+    def _llm_code_review(self, model_content: str, train_script_content: str) -> list:
+        """Phase 2: LLM semantic code review using fast model.
+
+        Uses smart code extraction to fit the most important code segments
+        (forward(), __init__(), loss functions) within the token budget,
+        instead of naive head-truncation that misses critical logic.
+
+        Now also injects code_review_lessons from the knowledge base so
+        the LLM checks for past mistakes.
+        """
+        warnings = []
+        try:
+            # Smart extraction: prioritize forward() > __init__() > loss fns > tail
+            model_snippet = self._extract_key_code_segments(model_content, budget=5000)
+            train_snippet = (
+                self._extract_key_code_segments(train_script_content, budget=3000)
+                if train_script_content else "(not found)"
+            )
+
+            review_prompt = (
+                "You are a deep learning architecture reviewer. Review the following model code "
+                "and training script for CRITICAL design flaws. Focus ONLY on issues that would "
+                "cause training to fail silently (model trains but key mechanisms don't work).\n\n"
+                "Common critical patterns to check:\n"
+                "1. Loss function doesn't match the model's objective (e.g., BCE for multi-class routing)\n"
+                "2. Gradient disconnection: detach() or stop_gradient in wrong place\n"
+                "3. Information bottleneck: layer dimensions too small for task\n"
+                "4. Dead modules: parameters that receive no gradient (e.g., unused forward path)\n"
+                "5. Data processing: wrong normalization, missing augmentation for specific branch\n"
+                "6. Target/label construction bugs: wrong shape, wrong values, type mismatch\n\n"
+            )
+
+            # ── Inject knowledge base lessons ──
+            # Search for lessons relevant to the current code
+            try:
+                relevant_lessons = self.memory.search_relevant_lessons(model_content, limit=5)
+                if relevant_lessons:
+                    lesson_text = self.memory.format_lessons_for_context(relevant_lessons, max_chars=800)
+                    review_prompt += (
+                        "KNOWN PAST MISTAKES (CHECK FOR THESE IN THE CODE):\n"
+                        + lesson_text + "\n\n"
+                    )
+            except Exception:
+                pass
+
+            review_prompt += (
+                "MODEL CODE:\n```python\n" + model_snippet + "\n```\n\n"
+                "TRAINING SCRIPT:\n```python\n" + train_snippet + "\n```\n\n"
+                "Respond in this EXACT format (one issue per line):\n"
+                "SEVERITY|category|description\n"
+                "Where SEVERITY is HIGH/MEDIUM/LOW, category is loss/gradient/arch/data/other.\n"
+                "If no issues found, respond with: OK|none|No critical issues detected\n"
+                "Maximum 5 issues."
+            )
+
+            # Use fast model tier for code review (cheap)
+            # IMPORTANT: task_tier must NOT be in STRONG_MODEL_TASKS to use the cheap model.
+            # "code" is in STRONG_MODEL_TASKS, so we use "review" instead.
+            response_text, _trace = self.dispatcher._call_llm(
+                system="You are a concise code reviewer. Only report REAL issues.",
+                messages=[{"role": "user", "content": review_prompt}],
+                tools=None,
+                max_turns=1,
+                task_tier="review",  # fast model (not in STRONG_MODEL_TASKS)
+            )
+
+            # Parse structured response
+            for line in response_text.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|", 2)
+                if len(parts) == 3:
+                    severity, category, detail = parts
+                    severity = severity.strip().upper()
+                    if severity not in ("HIGH", "MEDIUM", "LOW"):
+                        continue
+                    if detail.strip().lower().startswith("no "):
+                        continue
+                    warnings.append({
+                        "severity": severity,
+                        "detail": f"[LLM Review:{category.strip()}] {detail.strip()}",
+                    })
+
+        except Exception as e:
+            logger.warning(f"LLM code review skipped (non-critical): {e}")
+            # LLM review failure should NOT block execution
+
+        return warnings
+
+    def _post_reflect_code_review(self, execute_result: dict, reflect_result: dict,
+                                   verify_report=None):
+        """Post-REFLECT code review: learn from mistakes and record lessons.
+
+        This is the knowledge-extraction step that turns failures into reusable
+        knowledge base entries. It runs AFTER every REFLECT phase, extracting:
+
+        1. VERIFY failures → architectural lessons (pattern, fix, evidence)
+        2. Dead-end decisions → anti-pattern lessons
+        3. Module failures → specific bug patterns
+
+        Lessons are stored in code_review_lessons table and automatically
+        injected into future THINK and code-review phases.
+        """
+        try:
+            # ── 1. Extract lessons from VERIFY failures ──
+            if verify_report and hasattr(verify_report, 'all_failures'):
+                for check in verify_report.all_failures:
+                    if hasattr(check, 'name') and hasattr(check, 'detail'):
+                        self._extract_lesson_from_verify_failure(check)
+
+            # ── 2. Extract lessons from reflect dead-end ──
+            dead_end = reflect_result.get("dead_end", "")
+            if dead_end:
+                self._extract_lesson_from_dead_end(dead_end)
+
+            # ── 3. Extract lessons from module failure ──
+            module_failure = reflect_result.get("module_failure", "")
+            if module_failure:
+                self._extract_lesson_from_module_failure(module_failure)
+
+            # ── 4. Run LLM-based lesson extraction for experiment failures ──
+            # When experiment failed but no clear lesson was extracted above,
+            # use LLM to analyze the failure and extract a lesson.
+            if (not execute_result.get("experiment_launched") or
+                    reflect_result.get("dead_end")):
+                self._llm_extract_lesson(execute_result, reflect_result)
+
+        except Exception as e:
+            logger.warning(f"Post-reflect code review failed (non-critical): {e}")
+
+    def _extract_lesson_from_verify_failure(self, check):
+        """Convert a VERIFY check failure into a code review lesson."""
+        name = getattr(check, 'name', '')
+        detail = getattr(check, 'detail', '')
+        severity = getattr(check, 'severity', 'medium').upper()
+        category = getattr(check, 'category', 'other')
+
+        if not detail:
+            return
+
+        # Map verify category to lesson category
+        cat_map = {
+            "data": "data",
+            "model": "architecture",
+            "training": "training",
+            "output": "output",
+            "metric": "metric",
+        }
+        lesson_cat = cat_map.get(category, category)
+
+        # Extract a pattern from the check name
+        pattern = name.replace("_", " ").lower() if name else "unknown_failure"
+
+        self.memory.record_code_review_lesson(
+            cycle=self.cycle_count,
+            severity=severity if severity in ("HIGH", "MEDIUM", "LOW") else "MEDIUM",
+            category=lesson_cat,
+            pattern=pattern,
+            description=detail[:500],
+            evidence=f"VERIFY failure in cycle {self.cycle_count}: {name}",
+            source="verify",
+        )
+
+    def _extract_lesson_from_dead_end(self, dead_end: str):
+        """Extract a lesson from a dead-end decision."""
+        if not dead_end or len(dead_end) < 20:
+            return
+
+        # Use first significant words as pattern to avoid merging all dead ends
+        words = re.findall(r'[a-zA-Z_]{4,}', dead_end[:100])
+        pattern = "_".join(words[:4]).lower() if words else "dead_end_approach"
+
+        self.memory.record_code_review_lesson(
+            cycle=self.cycle_count,
+            severity="MEDIUM",
+            category="strategy",
+            pattern=pattern,
+            description=dead_end[:500],
+            evidence=f"Dead end in cycle {self.cycle_count}",
+            source="reflect",
+        )
+
+    def _extract_lesson_from_module_failure(self, module_failure: str):
+        """Extract a lesson from a module failure."""
+        if not module_failure or len(module_failure) < 10:
+            return
+
+        # Try to categorize the module failure
+        mf_lower = module_failure.lower()
+        category = "other"
+        if any(kw in mf_lower for kw in ["import", "module not found", "attribute"]):
+            category = "import"
+        elif any(kw in mf_lower for kw in ["shape", "dimension", "size mismatch", "channel"]):
+            category = "architecture"
+        elif any(kw in mf_lower for kw in ["nan", "inf", "overflow", "underflow"]):
+            category = "numerical"
+        elif any(kw in mf_lower for kw in ["gradient", "backward", "loss"]):
+            category = "gradient"
+        elif any(kw in mf_lower for kw in ["data", "dataset", "loader", "dataloader"]):
+            category = "data"
+
+        # Use first significant words as pattern to preserve distinctiveness
+        words = re.findall(r'[a-zA-Z_]{3,}', module_failure[:100])
+        pattern = "_".join(words[:4]).lower() if words else f"{category}_failure"
+
+        self.memory.record_code_review_lesson(
+            cycle=self.cycle_count,
+            severity="HIGH",
+            category=category,
+            pattern=pattern,
+            description=module_failure[:500],
+            evidence=f"Module failure in cycle {self.cycle_count}",
+            source="verify",
+        )
+
+    def _llm_extract_lesson(self, execute_result: dict, reflect_result: dict):
+        """Use LLM to analyze a failed experiment and extract a reusable lesson.
+
+        Only runs when other extraction methods didn't find specific lessons.
+        Uses the fast model to keep costs low.
+        """
+        response = reflect_result.get("response", "")
+        dead_end = reflect_result.get("dead_end", "")
+        if not response and not dead_end:
+            return
+
+        # Don't extract lessons every cycle — only on failures
+        if not dead_end and execute_result.get("experiment_launched"):
+            return
+
+        combined_text = f"Dead end: {dead_end}\nReflect: {response[:500]}"
+        if len(combined_text) < 50:
+            return
+
+        try:
+            lesson_prompt = (
+                "Analyze this failed experiment and extract ONE reusable code review lesson.\n"
+                "Focus on the ROOT CAUSE — what code pattern caused the failure?\n\n"
+                f"FAILURE CONTEXT:\n{combined_text[:1000]}\n\n"
+                "Respond in this EXACT format:\n"
+                "PATTERN|CATEGORY|SEVERITY|DESCRIPTION|FIX_SUGGESTION\n\n"
+                "Where:\n"
+                "- PATTERN: a short code pattern to watch for (e.g., 'softmax_without_temperature')\n"
+                "- CATEGORY: architecture|gradient|data|training|numerical|strategy\n"
+                "- SEVERITY: HIGH|MEDIUM|LOW\n"
+                "- DESCRIPTION: what went wrong and why (1-2 sentences)\n"
+                "- FIX_SUGGESTION: how to prevent this (1 sentence)\n\n"
+                "If no clear lesson can be extracted, respond with: SKIP|none|LOW|No lesson|N/A"
+            )
+
+            response_text, _trace = self.dispatcher._call_llm(
+                system="You extract concise code review lessons from failed experiments.",
+                messages=[{"role": "user", "content": lesson_prompt}],
+                tools=None,
+                max_turns=1,
+                task_tier="review",
+            )
+
+            # Handle possible JSON-wrapped response from tool-based APIs
+            try:
+                parsed = json.loads(response_text)
+                if isinstance(parsed, dict) and "content" in parsed:
+                    response_text = parsed["content"]
+                elif isinstance(parsed, list) and parsed:
+                    response_text = parsed[0].get("content", response_text)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # Parse the structured response
+            line = response_text.strip().split("\n")[0].strip()
+            parts = line.split("|", 4)
+            if len(parts) == 5:
+                pattern, category, severity, description, fix = parts
+                if pattern.strip().upper() == "SKIP":
+                    return
+                self.memory.record_code_review_lesson(
+                    cycle=self.cycle_count,
+                    severity=severity.strip().upper(),
+                    category=category.strip(),
+                    pattern=pattern.strip(),
+                    description=description.strip()[:500],
+                    fix_suggestion=fix.strip()[:300],
+                    source="llm_reflect",
+                )
+
+        except Exception as e:
+            logger.debug(f"LLM lesson extraction skipped: {e}")
 
     def _reflect(self, execute_result: dict, verify_report=None, visual_analysis_result=None) -> dict:
         """REFLECT phase: evaluate results and update memory.
@@ -1409,6 +2423,104 @@ class ResearchLoop(DomainKnowledgeMixin):
         if impl_prompt:
             context["implementation_progress"] = impl_prompt
 
+        # ── v12: ANALYSIS EXPERIMENT REFLECTION ──
+        # When the experiment was a data analysis (no training), inject specialized
+        # reflection prompts that force the Leader to evaluate method coverage.
+        is_analysis = (
+            not execute_result.get("experiment_launched", False)
+            and not execute_result.get("is_paper_research", False)
+            and execute_result.get("response", "")  # has output
+        )
+        if is_analysis:
+            # Count feature families from output (heuristic: check for known patterns)
+            response_text = execute_result.get("response", "") or ""
+            analysis_output = str(execute_result.get("output", "")) or response_text
+
+            # Inject analysis-specific reflection prompt
+            context["analysis_reflection_prompt"] = (
+                "ANALYSIS EXPERIMENT REFLECTION (v12):\n"
+                "This was a DATA ANALYSIS experiment, not model training. You MUST evaluate:\n\n"
+                "1. METHOD COVERAGE: How many INDEPENDENT analysis methods were used?\n"
+                "   - 1 method → INSUFFICIENT (cannot conclude direction is infeasible)\n"
+                "   - 2 methods → WEAK (need at least 1 more)\n"
+                "   - 3+ methods → ADEQUATE (can draw conclusions)\n\n"
+                "2. FEATURE DIVERSITY: Are the features measuring DIFFERENT physical properties?\n"
+                "   - Example: FFT energy ratios at 3 frequency bands = 1 family, not 3\n"
+                "   - Example: FFT shape + spatial gradient + view consistency = 3 families\n\n"
+                "3. DC-DOMINANCE: If using frequency-domain methods, what fraction of energy is DC?\n"
+                "   - DC > 90% → frequency energy ratios are degenerate (useless for discrimination)\n"
+                "   - In this case, you MUST try non-frequency methods before concluding\n\n"
+                "4. CORRECT FAILURE CATEGORY:\n"
+                "   - If < 3 independent methods tried and all show no signal → method_inadequacy\n"
+                "   - If ≥ 3 independent methods tried and ALL show no signal → hypothesis_wrong\n"
+                "   - If ANY method shows Cohen's d > 0.8 → direction HAS potential\n\n"
+                "5. CRITICAL: Do NOT extrapolate 'method X doesn't work' to 'the entire direction doesn't work'.\n"
+                "   Example: 'FFT energy ratios cannot discriminate materials' ≠ 'no angular feature can discriminate materials'"
+            )
+
+            # Check for method-inadequacy dead ends in recent history
+            method_inadequacy_count = self.memory.get_method_inadequacy_count()
+            if method_inadequacy_count > 0:
+                context["method_inadequacy_history"] = (
+                    f"WARNING: {method_inadequacy_count} previous dead_end(s) were categorized as "
+                    f"'method_inadequacy'. This means the ANALYSIS METHOD was too narrow, "
+                    f"not the hypothesis being wrong. Consider retrying with broader analysis "
+                    f"before abandoning this direction."
+                )
+
+        # ── v12.2: TRAINING EXPERIMENT ARCHITECTURE REFLECTION ──
+        # When the experiment was a training run (not analysis), inject
+        # specialized reflection prompts for architecture-level issues.
+        is_training = (
+            execute_result.get("experiment_launched", False)
+            and not execute_result.get("is_paper_research", False)
+        )
+        if is_training:
+            # Check for routing-related VERIFY issues from Layer 12
+            verify_report_dict = verify_report.to_dict() if verify_report else {}
+            routing_issues = [
+                c for c in verify_report_dict.get("checks", [])
+                if c.get("name") in ("routing_differentiation", "aux_loss_convergence",
+                                     "domain_regression")
+                and c.get("status") in ("fail", "warn")
+            ]
+
+            if routing_issues:
+                context["training_architecture_reflection_prompt"] = (
+                    "TRAINING ARCHITECTURE REFLECTION (v12.2):\n"
+                    "VERIFY detected architectural convergence issues. You MUST evaluate:\n\n"
+                    "1. ROUTING/FUSION CONVERGENCE:\n"
+                    "   - Did routing weights differentiate across domains?\n"
+                    "   - If all domains have ~50/50 weights, the router is NOT learning.\n"
+                    "   - Possible causes: aux_weight too low, routing target [0.5,0.5]\n"
+                    "     for majority class, router input lacks discriminative info.\n\n"
+                    "2. AUX LOSS CONVERGENCE:\n"
+                    "   - Is aux_loss actually decreasing across epochs?\n"
+                    "   - If aux_loss is flat, the auxiliary module receives no useful gradient.\n"
+                    "   - Consider: higher aux_weight, separate optimizer for router,\n"
+                    "     or pre-training the router with material classification GT.\n\n"
+                    "3. PER-DOMAIN REGRESSION:\n"
+                    "   - Did ANY domain get WORSE compared to the baseline?\n"
+                    "   - A domain regressing >20% means the new mechanism is HARMFUL for it.\n"
+                    "   - The new component may need a domain-specific on/off switch.\n\n"
+                    "4. CORRECT FAILURE CATEGORY:\n"
+                    "   - If routing weights did not differentiate → implementation_bug\n"
+                    "     (the architecture cannot learn what it's supposed to)\n"
+                    "   - If overall MAE improved but specific domains regressed →\n"
+                    "     method_inadequacy (the approach helps some domains but hurts others)\n"
+                    "   - Do NOT classify as hypothesis_wrong unless ≥3 independent\n"
+                    "     architecture variants all fail the same way.\n\n"
+                    f"VERIFY issues:\n"
+                    + "\n".join(
+                        f"  - [{c.get('severity','?')}] {c.get('detail', '')[:200]}"
+                        for c in routing_issues[:5]
+                    )
+                )
+                logger.info(
+                    f"Injecting training architecture reflection: "
+                    f"{len(routing_issues)} VERIFY issues"
+                )
+
         # ── v10: STRATEGY CONSTRAINT ENGINE — generate rules from history ──
         try:
             self.strategy_engine.generate_rules_from_history(self.memory)
@@ -1418,10 +2530,33 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── v10: CONTEXT PRUNING ──
         context = self.context_pruner.prune(context, "reflect")
 
-        result = self.dispatcher.dispatch_leader(
-            task="reflect",
-            context=context,
-        )
+        # ── v12.1: REFLECT with quota-exhaustion fallback ──
+        # If the LLM call fails (e.g. insufficient_quota, all providers down),
+        # use a rule-based degraded reflect instead of losing the entire cycle's
+        # EXECUTE + VERIFY results.
+        try:
+            result = self.dispatcher.dispatch_leader(
+                task="reflect",
+                context=context,
+            )
+        except (RuntimeError, Exception) as reflect_err:
+            err_msg = str(reflect_err)
+            is_quota_error = (
+                "insufficient_quota" in err_msg
+                or "All providers failed" in err_msg
+                or "429" in err_msg
+                or "quota" in err_msg.lower()
+            )
+            if is_quota_error:
+                logger.warning(
+                    f"REFLECT LLM call failed (quota/API error): {err_msg[:200]}. "
+                    f"Using degraded rule-based reflect to preserve cycle results."
+                )
+                result = self._degraded_reflect(
+                    execute_result, verify_report, context
+                )
+            else:
+                raise
 
         # Update memory based on reflection
         if result.get("milestone"):
@@ -1429,7 +2564,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         if result.get("decision"):
             self.memory.log_decision(result["decision"])
         if result.get("dead_end"):
-            self.memory.log_dead_end(result["dead_end"])
+            failure_cat = result.get("failure_category", "")
+            self.memory.log_dead_end(result["dead_end"], failure_category=failure_cat)
         if result.get("active_problem"):
             self.memory.log_active_problem(result["active_problem"])
 
@@ -1447,6 +2583,192 @@ class ResearchLoop(DomainKnowledgeMixin):
             pass
 
         return result
+
+    def _degraded_reflect(
+        self, execute_result: dict, verify_report, context: dict
+    ) -> dict:
+        """Rule-based fallback when REFLECT's LLM call fails (e.g. quota exhausted).
+
+        Instead of losing the entire cycle's EXECUTE + VERIFY results, this method
+        generates a basic reflection from available structured data:
+        - VERIFY report (module-level pass/fail)
+        - Experiment results (metrics, training logs)
+        - Memory log (dead ends, active problems)
+
+        The output follows the same JSON schema as Leader REFLECT so downstream
+        code (_record_cycle_outcome, _update_state) works unchanged.
+        """
+        import json as _json
+
+        # ── 1. Extract key facts from available data ──
+        experiment_launched = execute_result.get("experiment_launched", False)
+        is_paper_research = execute_result.get("is_paper_research", False)
+        response_text = execute_result.get("response", "") or ""
+        output_text = str(execute_result.get("output", "")) or response_text
+
+        # VERIFY status
+        verify_pass = 0
+        verify_fail = 0
+        verify_warnings = []
+        if verify_report:
+            verify_pass = verify_report.pass_count if hasattr(verify_report, 'pass_count') else 0
+            verify_fail = verify_report.fail_count if hasattr(verify_report, 'fail_count') else 0
+            if hasattr(verify_report, 'all_failures'):
+                verify_warnings = [
+                    f"[{c.category}] {c.name}: {c.detail}" for c in verify_report.all_failures
+                ]
+
+        # ── 2. Extract metrics from training logs ──
+        metrics_summary = ""
+        training_logs = execute_result.get("training_log", "") or ""
+        if not training_logs:
+            training_logs = self._load_state().get("last_training_logs", "")
+
+        # Try to find best val_MAE
+        best_mae = None
+        mae_matches = re.findall(r"(?:val_MAE|Best val_MAE)[:\s=]+([\d.]+)", training_logs)
+        if mae_matches:
+            best_mae = min(float(m) for m in mae_matches)
+
+        # Try to find per-domain MAE
+        domain_maes = {}
+        for domain in ["Lambertian", "Non-Lambertian", "Urban", "Mixed", "light_field_4d", "Overall"]:
+            patterns = [
+                rf"{domain}[^)]*?MAE[=:]\s*([\d.]+)",
+                rf"MAE_{domain}[=:]\s*([\d.]+)",
+            ]
+            for pat in patterns:
+                m = re.search(pat, training_logs)
+                if m:
+                    domain_maes[domain] = float(m.group(1))
+                    break
+
+        if best_mae is not None:
+            metrics_summary = f"Best val_MAE={best_mae:.4f}"
+        if domain_maes:
+            metrics_summary += " | " + " ".join(
+                f"{k}={v:.4f}" for k, v in domain_maes.items()
+            )
+
+        # ── 3. Extract accuracy from analysis results ──
+        analysis_info = ""
+        acc_match = re.search(r"(?:accuracy|Accuracy)[\s:=]+([\d.]+)%?", output_text)
+        auc_match = re.search(r"(?:AUC|auc)[\s:=]+([\d.]+)", output_text)
+        if acc_match:
+            analysis_info += f" Accuracy={acc_match.group(1)}%"
+        if auc_match:
+            analysis_info += f" AUC={auc_match.group(1)}"
+
+        # ── 4. Build decision ──
+        if verify_fail > 0:
+            verify_status = f"VERIFY: {verify_pass} passed, {verify_fail} FAILED"
+        else:
+            verify_status = f"VERIFY: all {verify_pass} checks passed"
+
+        if experiment_launched:
+            if best_mae is not None:
+                decision = (
+                    f"[DEGRADED REFLECT — API quota exhausted] "
+                    f"Cycle {self.cycle_count}: Experiment completed. {metrics_summary}. "
+                    f"{verify_status}. "
+                    f"LLM REFLECT unavailable — results preserved for next cycle."
+                )
+            else:
+                decision = (
+                    f"[DEGRADED REFLECT — API quota exhausted] "
+                    f"Cycle {self.cycle_count}: Experiment launched but metrics extraction failed. "
+                    f"{verify_status}. "
+                    f"LLM REFLECT unavailable — review results manually."
+                )
+        elif is_paper_research:
+            decision = (
+                f"[DEGRADED REFLECT — API quota exhausted] "
+                f"Cycle {self.cycle_count}: Paper research completed. "
+                f"LLM REFLECT unavailable — findings preserved."
+            )
+        elif output_text:
+            # Analysis experiment
+            decision = (
+                f"[DEGRADED REFLECT — API quota exhausted] "
+                f"Cycle {self.cycle_count}: Data analysis completed.{analysis_info} "
+                f"{verify_status}. "
+                f"LLM REFLECT unavailable — results preserved for next cycle."
+            )
+        else:
+            decision = (
+                f"[DEGRADED REFLECT — API quota exhausted] "
+                f"Cycle {self.cycle_count}: No experiment output available. "
+                f"{verify_status}."
+            )
+
+        # ── 5. Detect success/failure heuristically ──
+        milestone = ""
+        dead_end = ""
+        failure_category = ""
+        active_problem = ""
+
+        if experiment_launched and best_mae is not None:
+            # Heuristic: check if MAE improved vs. known baselines
+            # We don't have the exact target, so just report the result
+            milestone = (
+                f"[Degraded] Cycle {self.cycle_count} experiment: {metrics_summary}. "
+                f"Full analysis deferred (API quota)."
+            )
+        elif not experiment_launched and output_text:
+            # Analysis experiment — check if results suggest hypothesis confirmed
+            if any(kw in output_text.lower() for kw in ["hypothesis confirmed", "recommendation: hypothesis confirmed", "feasible"]):
+                milestone = (
+                    f"[Degraded] Cycle {self.cycle_count} analysis: hypothesis appears confirmed. "
+                    f"{analysis_info}. Full analysis deferred."
+                )
+            elif any(kw in output_text.lower() for kw in ["not supported", "failed", "infeasible"]):
+                # Check if this might be method_inadequacy
+                if verify_warnings:
+                    dead_end = (
+                        f"[Degraded] Cycle {self.cycle_count} analysis: negative result. "
+                        f"Could not verify method coverage (LLM unavailable). "
+                        f"Categorize as method_inadequacy pending full REFLECT."
+                    )
+                    failure_category = "method_inadequacy"
+                else:
+                    dead_end = (
+                        f"[Degraded] Cycle {self.cycle_count} analysis: negative result. "
+                        f"Full analysis deferred."
+                    )
+
+        if verify_fail > 0:
+            active_problem = (
+                f"[Degraded REFLECT Cycle {self.cycle_count}] "
+                f"VERIFY found {verify_fail} failure(s): {'; '.join(verify_warnings[:3])}. "
+                f"LLM REFLECT was unavailable — investigate in next cycle."
+            )
+
+        # ── 6. Write a directive hint for next cycle ──
+        # If we degraded, tell the next cycle to re-reflect on this one
+        degraded_note_path = self.workspace / ".degraded_reflect_pending"
+        try:
+            degraded_note_path.write_text(_json.dumps({
+                "cycle": self.cycle_count,
+                "reason": "api_quota_exhausted",
+                "metrics_summary": metrics_summary,
+                "verify_status": verify_status,
+                "has_milestone": bool(milestone),
+                "has_dead_end": bool(dead_end),
+            }))
+        except Exception:
+            pass
+
+        # ── 7. Return in Leader REFLECT format ──
+        return {
+            "decision": decision,
+            "milestone": milestone,
+            "dead_end": dead_end,
+            "failure_category": failure_category,
+            "active_problem": active_problem,
+            "reason": "LLM REFLECT unavailable (API quota exhausted)",
+            "task": "",
+            "_degraded": True,
+        }
 
     def _refresh_obsidian(self, reflect_result: dict, directive: Optional[str]):
         if not self.obsidian.is_enabled():
@@ -1499,6 +2821,193 @@ class ResearchLoop(DomainKnowledgeMixin):
             sig = task_text[:100]
         return hashlib.md5(sig.encode()).hexdigest()[:12]
 
+    # ── Known architecture names for architecture-level detection (v14) ──
+    _ARCHITECTURE_PATTERNS = {
+        "epi": ["epi", "epinet", "epipolar", "epi_net", "epi slope", "epi branch"],
+        "unet": ["unet", "u-net", "u_net", "unet_decoder", "unet_encoder"],
+        "transformer": ["transformer", "vit", "attention_is_all", "self_attention"],
+        "cnn": ["resnet", "vgg", "mobilenet", "efficientnet", "densenet", "inception"],
+        "graph": ["gnn", "graph", "gcn", "gat", "message_passing"],
+        "lfnet": ["lfnet", "lf_net", "lfanet", "lf_network"],
+        "oacc": ["oacc", "occlusion_aware", "occlusion-aware"],
+        "mvsnet": ["mvsnet", "mvs_net", "multi_view_stereo"],
+        "dpt": ["dpt", "dense_prediction_transformer"],
+        "adaspike": ["adaspike", "spike", "spiking"],
+    }
+
+    def _extract_architecture_name(self, task_text: str) -> str:
+        """Extract the underlying architecture name from a task description (v14).
+
+        This operates at a coarser granularity than _extract_direction_signature.
+        'EPINet + edge loss' and 'EPINet + angular conv' are different directions
+        but the SAME architecture (epi). This detects the architecture-level pattern.
+
+        Returns:
+            Architecture key (e.g., "epi", "unet") or "" if no known architecture found.
+        """
+        normalized = task_text.lower().replace("-", " ").replace("_", " ")
+        for arch_key, patterns in self._ARCHITECTURE_PATTERNS.items():
+            for pat in patterns:
+                if pat in normalized:
+                    return arch_key
+        return ""
+
+    def _analyze_architecture_dead_ends(self) -> dict:
+        """Analyze dead ends to detect architecture-level bottlenecks (v14).
+
+        Groups dead ends by architecture and checks if a single architecture
+        has accumulated enough dead ends to indicate a fundamental problem.
+
+        Returns:
+            dict with keys:
+            - bottleneck: bool — whether an architecture bottleneck is detected
+            - architecture: str — the bottleneck architecture name (if any)
+            - dead_end_count: int — number of dead ends for this architecture
+            - evidence: list[str] — summary of dead end evidence
+        """
+        result = {"bottleneck": False, "architecture": "", "dead_end_count": 0, "evidence": []}
+        try:
+            all_dead_ends = self.memory.get_dead_ends_full()
+            if len(all_dead_ends) < 5:
+                return result
+
+            # Group dead ends by architecture
+            arch_dead_ends: dict[str, list[str]] = {}
+            for de_text in all_dead_ends:
+                de_lower = de_text.lower()
+                for arch_key, patterns in self._ARCHITECTURE_PATTERNS.items():
+                    for pat in patterns:
+                        if pat in de_lower:
+                            arch_dead_ends.setdefault(arch_key, []).append(de_text)
+                            break
+                    else:
+                        continue
+                    break
+
+            # Check if any architecture has ≥ 5 dead ends
+            for arch_key, des in arch_dead_ends.items():
+                if len(des) >= 5:
+                    result["bottleneck"] = True
+                    result["architecture"] = arch_key
+                    result["dead_end_count"] = len(des)
+                    result["evidence"] = [d[:120] for d in des[-5:]]
+                    break
+        except Exception as e:
+            logger.debug(f"Architecture dead end analysis failed: {e}")
+        return result
+
+    # ── v15: Research Roadmap Integration ──
+
+    def _init_research_roadmap(self):
+        """Initialize the research roadmap from PROJECT_BRIEF on first cycle.
+
+        Called once; subsequent cycles read the persisted file.
+        """
+        try:
+            # Try loading existing ROADMAP first
+            if self.roadmap.load():
+                logger.info(f"ROADMAP loaded from file: {len(self.roadmap.modules)} modules")
+                self._roadmap_initialized = True
+                return
+
+            # Generate from PROJECT_BRIEF + architecture plan
+            brief_path = self.workspace / "PROJECT_BRIEF.md"
+            if not brief_path.exists():
+                # Try project root
+                brief_path = self.project_dir / "PROJECT_BRIEF.md"
+
+            arch_plan = getattr(self, '_last_architecture_plan', None)
+            result = self.roadmap.generate_from_brief(brief_path, arch_plan=arch_plan)
+
+            if result.get("status") == "ok":
+                self._roadmap_initialized = True
+                self.memory.log_decision(
+                    f"[ROADMAP v15] Research roadmap generated: "
+                    f"{len(self.roadmap.modules)} modules, "
+                    f"phase={self.roadmap.global_phase.value}"
+                )
+                logger.info(
+                    f"ROADMAP initialized: {result.get('global_phase')}, "
+                    f"{len(result.get('modules', []))} modules"
+                )
+            else:
+                logger.warning(f"ROADMAP generation failed: {result.get('message', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"ROADMAP init failed: {e}")
+
+    def _enforce_roadmap_alignment(self, think_result: dict) -> dict:
+        """Check THINK output against ROADMAP and correct deviations.
+
+        This is the HARD GATE: code-level enforcement, not just prompt injection.
+        Strategy:
+          - 1st deviation: inject correction warning into result
+          - 2nd deviation: inject stronger warning
+          - 3rd deviation: override to forced paper_research or data analysis
+        """
+        try:
+            alignment = self.roadmap.check_alignment(think_result)
+
+            if alignment["aligned"]:
+                self._phase_violation_count = 0
+                return think_result
+
+            # Misaligned — log and correct
+            deviation_type = alignment["deviation_type"]
+            current_modules = alignment.get("current_modules", [])
+            self._phase_violation_count += 1
+            violation_num = self._phase_violation_count
+
+            logger.warning(
+                f"ROADMAP DEVIATION (#{violation_num}): "
+                f"type={deviation_type}, modules={current_modules}, "
+                f"task={think_result.get('task', '')[:100]}"
+            )
+
+            self.memory.log_decision(
+                f"[ROADMAP v15] Deviation #{violation_num}: "
+                f"{deviation_type}. "
+                f"Active modules: {', '.join(current_modules[:3])}"
+            )
+
+            # Hard gate: 3rd consecutive deviation → force paper_research
+            if self._phase_violation_count >= 3:
+                logger.warning("ROADMAP: Forcing paper_research after 3 consecutive deviations")
+                self._phase_violation_count = 0  # Reset after enforcement
+                self.roadmap._deviation_count = 0  # Sync reset with roadmap counter
+                return {
+                    "action": "paper_research",
+                    "agent": "paper_researcher",
+                    "task": (
+                        "ROADMAP DEVIATION DETECTED — 3 consecutive experiments deviated from the plan.\n\n"
+                        "You MUST research methods to verify the following modules:\n"
+                        + "\n".join(f"  - {m}" for m in current_modules)
+                        + "\n\nFind published methods or techniques to validate the theoretical "
+                        "assumptions underlying each module BEFORE implementing them."
+                    ),
+                    "reason": (
+                        f"Forced paper_research: {violation_num} consecutive "
+                        f"deviations from ROADMAP. Agent keeps proposing {deviation_type} "
+                        f"instead of addressing active modules."
+                    ),
+                }
+
+            # 1st-2nd deviation: inject correction into result
+            correction = alignment.get("correction_prompt", "")
+            if correction:
+                original_task = think_result.get("task", "")
+                think_result["_roadmap_alignment_warning"] = correction
+                # Append correction to task so Leader sees it
+                think_result["task"] = (
+                    f"{original_task}\n\n"
+                    f"---\n{correction}\n---"
+                )
+
+            return think_result
+
+        except Exception as e:
+            logger.warning(f"ROADMAP alignment check failed: {e}")
+            return think_result  # Fail open — don't block on errors
+
     def _apply_no_progress_fallback(self, think_result: dict, directive: Optional[str]) -> dict:
         """Back off if the same experiment plan keeps repeating without progress.
 
@@ -1507,12 +3016,77 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         Fix 1: Also force paper research when output quality degrades repeatedly.
         Fix 3: Force paper research when direction stagnation is detected.
+        v14: Force architecture_switch when architecture stagnation is detected.
         """
         if directive or self.no_progress_fallback_threshold <= 0:
             return think_result
 
         if think_result.get("action") != "experiment":
             return think_result
+
+        # v14: Architecture switch fallback (highest priority)
+        # When the same architecture has been patched for too many cycles, force a switch.
+        if self._architecture_stagnation_count >= self._architecture_stagnation_threshold:
+            # Check if dead end synthesis also flags this architecture
+            bottleneck_detected = False
+            try:
+                dead_end_analysis = self._analyze_architecture_dead_ends()
+                if dead_end_analysis.get("bottleneck"):
+                    bottleneck_detected = True
+            except Exception:
+                pass
+
+            arch_name = self._current_architecture_name or "current"
+            reason = (
+                f"ARCHITECTURE SWITCH (v14): '{arch_name}' architecture has been used for "
+                f"{self._architecture_stagnation_count} cycles without improvement."
+            )
+            if bottleneck_detected:
+                reason += f" Dead end synthesis confirms '{arch_name}' is a bottleneck."
+
+            logger.warning(reason)
+            self.memory.log_decision(reason)
+
+            # Build architecture switch task
+            survey_path = self._architecture_survey_path
+            survey_note = ""
+            if survey_path.exists():
+                survey_note = (
+                    f"Read {survey_path.name} for pre-analyzed candidate architectures.\n"
+                )
+            else:
+                survey_note = (
+                    "No ARCHITECTURE_SURVEY.md exists. You MUST:\n"
+                    "1. First do paper research to find 3+ alternative architectures\n"
+                    "2. Write the survey to workspace/ARCHITECTURE_SURVEY.md\n"
+                )
+
+            return {
+                "action": "architecture_switch",
+                "reason": reason,
+                "decision": reason,
+                "agent": "researcher",
+                "task": (
+                    f"ARCHITECTURE SWITCH — the '{arch_name}' architecture is a DEAD END.\n\n"
+                    f"You have spent {self._architecture_stagnation_count} cycles patching '{arch_name}' "
+                    f"without any metric improvement. This is NOT a tuning problem — "
+                    f"the architecture itself is unsuitable.\n\n"
+                    f"{survey_note}"
+                    f"MANDATORY STEPS:\n"
+                    f"1. Identify 3+ ALTERNATIVE architectures (NOT variants of '{arch_name}')\n"
+                    f"2. For each alternative, verify:\n"
+                    f"   - Core assumption matches the data characteristics\n"
+                    f"   - Feasible to implement with available resources\n"
+                    f"   - Published results suggest it can outperform '{arch_name}'\n"
+                    f"3. Select the BEST alternative with justification\n"
+                    f"4. Implement a PILOT version (minimal viable model, 2-5 epoch test)\n"
+                    f"5. Verify the forward pass works with real data before training\n"
+                    f"6. Write the selection rationale to workspace/ARCHITECTURE_SWITCH.md\n\n"
+                    f"Do NOT propose ANY modification to '{arch_name}'. "
+                    f"Do NOT suggest 'improved {arch_name}' or '{arch_name} v2'. "
+                    f"You MUST switch to a fundamentally different architecture."
+                ),
+            }
 
         # Fix 1: Quality degradation fallback
         if self._quality_alert_streak >= 2:
@@ -1608,6 +3182,16 @@ class ResearchLoop(DomainKnowledgeMixin):
         except Exception as e:
             logger.warning(f"Failed to record cycle outcome to SQLite: {e}")
 
+        # ── ROADMAP UPDATE (v15): Feed cycle outcome back to roadmap ──
+        try:
+            self.roadmap.update_from_cycle_outcome(
+                think_result=think_result,
+                reflect_result=reflect_result,
+                cycle=self.cycle_count,
+            )
+        except Exception as e:
+            logger.debug(f"ROADMAP update from cycle outcome skipped: {e}")
+
         if think_result.get("action") == "paper_research":
             # Paper research is always considered progress — it generates new knowledge
             self._no_progress_streak = 0
@@ -1615,6 +3199,9 @@ class ResearchLoop(DomainKnowledgeMixin):
             self._metric_no_progress_streak = 0
             self._direction_stagnation_count = 0  # Reset direction stagnation
             self._infra_failure_streak = 0
+            # v14: Do NOT reset _architecture_stagnation_count — paper research alone
+            # does not change the underlying architecture being used.
+            # Only a real architecture switch (detected in _extract_architecture_name) resets it.
             return
 
         if think_result.get("action") != "experiment":
@@ -1756,6 +3343,50 @@ class ResearchLoop(DomainKnowledgeMixin):
             # Reset to allow new direction after paper research
             self._direction_stagnation_count = 0
             self._current_direction_signature = ""
+
+        # ── v14: Architecture-level stagnation tracking ──
+        # Track at the ARCHITECTURE level (coarser than direction level).
+        # "EPINet + edge loss" and "EPINet + angular conv" are different directions
+        # but the SAME architecture. Architecture stagnation is NOT reset by
+        # paper_research — only by actually switching to a different architecture.
+        arch_name = self._extract_architecture_name(task_text)
+        if arch_name:
+            if arch_name != self._current_architecture_name:
+                # Switched to a different architecture — reset
+                old_arch = self._current_architecture_name or "(none)"
+                self._current_architecture_name = arch_name
+                self._architecture_stagnation_count = 0
+                logger.info(
+                    f"ARCHITECTURE SWITCH: '{old_arch}' → '{arch_name}'. "
+                    f"Architecture stagnation reset."
+                )
+                self.memory.log_decision(
+                    f"[ARCH] Architecture switched from '{old_arch}' to '{arch_name}' at cycle {self.cycle_count}."
+                )
+            else:
+                # Same architecture — check if metrics improved
+                if current_metric is not None and current_metric < self._best_metric_ever:
+                    self._architecture_stagnation_count = 0  # Real improvement
+                else:
+                    self._architecture_stagnation_count += 1
+                    if self._architecture_stagnation_count % 3 == 0:
+                        logger.warning(
+                            f"ARCHITECTURE STAGNATION: '{arch_name}' has shown no improvement "
+                            f"for {self._architecture_stagnation_count} cycles."
+                        )
+                        self.memory.log_decision(
+                            f"[ARCH] '{arch_name}' stagnant for {self._architecture_stagnation_count} cycles."
+                        )
+        elif self._current_architecture_name and think_result.get("action") == "experiment":
+            # Task doesn't explicitly mention architecture but is an experiment —
+            # check if the task implicitly targets the current architecture
+            # (e.g., "modify the model" without naming it)
+            self._architecture_stagnation_count += 1
+
+        # Check architecture survey completion
+        if not self._architecture_survey_done and self._architecture_survey_path.exists():
+            self._architecture_survey_done = True
+            logger.info("ARCHITECTURE SURVEY completed — survey file detected.")
 
         # ── Metric tracking (existing logic) ──
         if current_metric is not None:
@@ -2450,12 +4081,13 @@ class ResearchLoop(DomainKnowledgeMixin):
                 f"expected_improvement={expected_improvement:.4f}. "
                 f"This experiment is unlikely to produce useful information."
             )
-            # Inject warning but don't block
+            # Inject warning and strongly suggest paper_research instead
             think_result["task"] = (
                 f"⚠️ LOW VALUE EXPERIMENT (VOI={voi:.4f}, success probability={prior:.0%})\n"
                 f"This experiment has low estimated value based on past calibration. "
-                f"Consider whether a DIFFERENT hypothesis would be more informative.\n"
-                f"If proceeding, consider running a pilot experiment (2-3 epochs) first "
+                f"STRONGLY consider switching to paper_research to find a NEW approach, or "
+                f"choose a hypothesis you have NOT tried before.\n"
+                f"If you must proceed with this experiment, run a pilot (2-3 epochs) first "
                 f"to quickly validate the hypothesis.\n\n"
                 f"--- ORIGINAL TASK ---\n{think_result.get('task', '')}"
             )
@@ -2619,6 +4251,74 @@ class ResearchLoop(DomainKnowledgeMixin):
                 )
 
         context["training_curve_analysis"] = curve_summary
+
+        # ── v12.2: Per-domain MAE trend + Aux loss analysis ──
+        # Parse training_log.json for structured per-domain metrics
+        self._inject_structured_metrics(context, execute_result)
+
+    def _inject_structured_metrics(self, context: dict, execute_result: dict):
+        """v12.2: Parse training_log.json for per-domain MAE trends and aux loss."""
+        # Find training_log.json
+        log_json = None
+        for pattern in ["outputs/*/training_log.json", "outputs/training_log.json"]:
+            candidates = list(self.project_dir.glob(pattern))
+            if candidates:
+                latest = max(candidates, key=lambda p: p.stat().st_mtime)
+                try:
+                    log_json = json.loads(latest.read_text())
+                    break
+                except Exception:
+                    continue
+
+        if not log_json:
+            return
+
+        epochs = log_json.get("epochs", [])
+        if len(epochs) < 2:
+            return
+
+        # ── Per-domain MAE trend ──
+        domain_trends = {}
+        for ep in epochs:
+            for key, val in ep.items():
+                if key.startswith("MAE_") and not key.endswith("_count") and isinstance(val, (int, float)):
+                    domain = key.replace("MAE_", "")
+                    domain_trends.setdefault(domain, []).append(float(val))
+
+        if domain_trends:
+            trend_lines = ["PER-DOMAIN MAE TREND:"]
+            for domain, values in sorted(domain_trends.items()):
+                if len(values) >= 2:
+                    direction = "↓" if values[-1] < values[0] else "↑"
+                    change = values[-1] - values[0]
+                    trend_lines.append(
+                        f"  {domain}: {' → '.join(f'{v:.4f}' for v in values)} "
+                        f"({direction} {abs(change):.4f})"
+                    )
+                    # Flag domains that are getting worse
+                    if change > 0.05:
+                        trend_lines.append(
+                            f"    ⚠️ {domain} is GETTING WORSE (+{change:.4f})"
+                        )
+            context["per_domain_mae_trend"] = "\n".join(trend_lines)
+
+        # ── Aux loss trend ──
+        aux_values = []
+        for ep in epochs:
+            for key in ["train_aux_loss", "aux_loss"]:
+                if key in ep and isinstance(ep[key], (int, float)):
+                    aux_values.append(float(ep[key]))
+                    break
+
+        if len(aux_values) >= 2:
+            aux_change = abs(aux_values[-1] - aux_values[0]) / max(abs(aux_values[0]), _EPS)
+            aux_line = (
+                f"AUX LOSS TREND: {' → '.join(f'{v:.6f}' for v in aux_values)} "
+                f"(change: {aux_change:.2%})"
+            )
+            if aux_change < 0.01:
+                aux_line += " ⚠️ FLAT — auxiliary module NOT learning"
+            context["aux_loss_trend"] = aux_line
 
 
 def main():

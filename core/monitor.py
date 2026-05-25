@@ -169,6 +169,7 @@ class ExperimentMonitor:
             if exp["status"] == "running" and not self._is_process_alive(pid):
                 exp["status"] = "completed"
                 return True
+        self._cleanup_stale_experiments()
         return False
 
     def has_active_experiments(self) -> bool:
@@ -185,6 +186,22 @@ class ExperimentMonitor:
             return True
         except OSError:
             return False
+
+    def _cleanup_stale_experiments(self):
+        """Remove completed/failed experiments older than 24h to prevent memory leak.
+
+        Called automatically from has_completed_experiments().
+        """
+        now = time.time()
+        stale_pids = [
+            pid for pid, exp in self._active_experiments.items()
+            if exp.get("status") in ("completed", "failed")
+            and now - exp.get("start_time", 0) > 86400  # 24 hours
+        ]
+        for pid in stale_pids:
+            del self._active_experiments[pid]
+        if stale_pids:
+            logger.debug(f"Cleaned up {len(stale_pids)} stale experiment(s) from tracker")
 
     def _kill_process(self, pid: int) -> bool:
         """Force-kill a process and its entire process group.

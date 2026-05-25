@@ -1,32 +1,20 @@
-<p align="center">
-  <img src="../assets/banner.png" alt="Deep Researcher Agent" width="700"/>
-</p>
-
-<h1 align="center">Deep Researcher Agent</h1>
+<h1 align="center">Auto Research Agent</h1>
 <h3 align="center">24/7 全自主深度学习实验 Agent</h3>
 
-<p align="center">
-  <strong>一个能 24/7 自主运行深度学习实验的 AI Agent 框架。<br/>你睡觉，它炼丹。</strong>
-</p>
+
 
 <p align="center">
   <a href="../README.md">English</a> |
   <a href="README_CN.md">中文</a> |
-
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"/>
-  <img src="https://img.shields.io/badge/Claude_Code-兼容-blueviolet.svg" alt="Claude Code"/>
-  <img src="https://img.shields.io/badge/Codex_CLI-兼容-green.svg" alt="Codex CLI"/>
-  <img src="https://img.shields.io/badge/license-Apache_2.0-green.svg" alt="License"/>
-</p>
+> **来源声明**：本项目最初来源于 [auto-deep-researcher-24x7](https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7)。
 
 ---
 
 > **第一次来？别慌。** 你不用读完整个README，只需要做一件事：
 >
-> 1. 打开 [`AI_GUIDE.md`](../AI_GUIDE.md)，丢给 **Claude / ChatGPT / Codex**
+> 1. 打开 `AI_GUIDE.md`，丢给 **Claude / ChatGPT / Codex**
 > 2. AI 会一步步带你装好、配好、跑起第一个实验
 > 3. 就这样。不焦虑，我们慢慢来。
 >
@@ -52,7 +40,7 @@ Agent 很乐意替你把实验跑完，但请把 *idea*、*结果的解读* 和 
 >
 > **Science should stay pure.** The agent can run the experiments — but the ideas, the interpretation, and the responsibility belong to the human. We genuinely hope every user will keep a **human in the loop for thinking**, and make their own real contribution in their own research direction.
 >
-> **科学は純粋であるべきです。** Agent は実験を走らせることができますが、アイデア・解釈・責任は、どうか人間の手に残してください。
+
 
 我们相信每一个愿意拿起这个工具的人，都会认真对待这件事——也正是因为相信你们当中的大多数本来就是这样的人，我们才愿意把它开源出来。谢谢你成为其中之一。💛
 
@@ -90,6 +78,255 @@ Agent 很乐意替你把实验跑完，但请把 *idea*、*结果的解读* 和 
 ---
 
 ## 最近更新
+
+**2026-05-25 (v15.5) — Research ROADMAP：模块级状态机与阶段门控研究**
+
+*防止过早训练模型，强制在提交 GPU 资源前进行结构化理论验证。*
+
+### 解决的核心问题
+Agent 跳过理论验证直接进行模型训练，在架构假设从未被验证的情况下浪费 GPU 时间。模块验证使用硬性"恰好 3 种方法"的要求过于僵化——某些方向需要更多方法才能正确证伪，而 ROADMAP 与 ResearchLoop 之间的双偏差计数器可能不同步，导致状态过期。
+
+### 新模块 (v15)
+- **`core/research_roadmap.py`** — 模块级状态机，追踪每个模块的研究阶段：
+  `theory_verification → module_design → module_validation → integrated → dead_end`
+
+### 新增机制 (v15)
+
+| # | 机制 | 阶段 | 功能 |
+|---|------|------|------|
+| 1 | **Research ROADMAP** | THINK | 追踪每个模块的研究阶段。每个模块必须经过 theory_verification → module_design → module_validation 才能标记为 integrated。 |
+| 2 | **阶段门控研究** | THINK → EXECUTE | 代码级强制：theory_verification 阶段禁止模型训练，仅允许分析/研究任务。 |
+| 3 | **三击硬门控** | THINK → EXECUTE | 偏离 ROADMAP 阶段：第 1 次 = 警告，第 2 次 = 强警告，第 3 次 = 强制切换到 `paper_research`。`ResearchRoadmap._deviation_count` 和 `ResearchLoop._phase_violation_count` 双计数器同步。 |
+| 4 | **断路器优先级** | THINK | theory_verification 期间 ROADMAP 覆盖方向/架构断路器。 |
+| 5 | **灵活方法验证** | VERIFY | 每个模块要求 3-6 种方法（最少 3，最多 7）才能标记 dead_end。不是硬性 3 种——支持需要更深入分析的方向。 |
+| 6 | **假设嵌入方法** | THINK | `_suggest_verification_methods` 在每个方法描述中嵌入假设文本，当存在 ≥2 个假设时添加跨假设一致性检查。 |
+
+### v15.5 加固修复（8 项 Code Review 修复）
+
+| # | 文件 | 修复内容 |
+|---|------|----------|
+| 1 | `loop.py` + `research_roadmap.py` | `check_alignment()` 不再返回 `should_force_paper_research`；loop.py 通过 `_phase_violation_count` 独立控制三击强制机制。硬门控触发时同步重置 `roadmap._deviation_count`。 |
+| 2 | `research_roadmap.py` + `loop.py` | 新增公开属性 `active_module_names` 和 `is_theory_verification_phase`，替代私有 `_get_active_modules()` 访问。 |
+| 3 | `research_roadmap.py` | `_is_training_task` 重写：使用强指示器（如"train the"、"training"、"epoch"）和弱指示器（如"loss function"、"loss curve"），避免"information loss"、"loss of detail"等误报。 |
+| 4 | `research_roadmap.py` | `_is_task_related` 改进：通过 `re.split(r"[_\s]+")` 子词元匹配，动态阈值 `max(2, len(words)//3)`，降低词长度阈值（>3 替代 >4）。 |
+| 5 | `research_roadmap.py` | `MODULE_DESIGN` 里程碑处理：关键词"designed"、"implemented"、"coded"、"built"推进到 `MODULE_VALIDATION`。 |
+| 6 | `idea_planner.py` | `_suggest_verification_methods` 在每个方法描述中嵌入假设文本，当 ≥2 个假设时添加跨假设一致性检查（方法 4）。 |
+| 7 | `research_roadmap.py` | Markdown 解析器正则从 `\[\\w+\]` 改为 `\[\\w_-+\]`，添加下一行证据提取。 |
+| 8 | `context_keys.py` | 移除孤立的 `roadmap_alignment_warning` ContextKey（已注册但从未在上下文注入流程中使用）。 |
+
+### 关键改动
+- `core/research_roadmap.py`：新 ROADMAP 模块（~500 行）
+- `core/loop.py`：`_enforce_roadmap_alignment()`，ROADMAP 感知的方向断路器
+- `core/idea_planner.py`：方法建议中的跨假设一致性检查
+- `core/context_keys.py`：清理孤立键
+- `agents/leader.md`：v15 规则（ROADMAP 感知和阶段约束）
+
+### 模块大小
+
+| 模块 | v14 | v15.5 |
+|------|-----|-------|
+| `core/loop.py` | ~4,150 | ~4,350 |
+| `core/research_roadmap.py` | — | ~500 |
+| `core/idea_planner.py` | 1,059 | ~1,070 |
+| `core/context_keys.py` | 194 | 193 |
+| **总计** | **~21,750** | **~22,470** |
+
+---
+
+**2026-05-20 (v14) — 战略架构智能**
+
+*解决 #1 失败模式：在错误的架构上浪费数十个 cycle 修修补补。*
+
+### 解决的核心问题
+在一次 64 cycle 的运行中，Agent 花费所有 64 个 cycle 修补 EPINet（PROJECT_BRIEF 中的 baseline），从未调研替代架构。仅 12.5% 的 cycle 做了 paper_research，且没有一个导致架构切换。根因：(1) 无架构调研 — Agent 从第 1 个 cycle 就盲目使用 PROJECT_BRIEF 推荐的 baseline；(2) Dead End 只记录为个体条目，从未聚类为"EPINet 架构本身就是瓶颈"；(3) 方向签名过于细粒度 — "EPINet+edge_loss"和"EPINet+angular_conv"被识别为不同方向；(4) paper_research 重置所有停滞计数器，掩盖了持续的架构问题。
+
+### 新增机制 (v14)
+1. **架构调研门控** — 在 cycle 1-2 强制调研 3+ 候选架构后才允许选择 baseline。输出 `ARCHITECTURE_SURVEY.md`。
+2. **架构级方向签名** — 检测底层架构（EPINet、U-Net、Transformer 等），而非仅检测方向关键词。架构停滞在同一架构的所有方向间累积。
+3. **Dead End 聚合引擎** — 按架构聚类 dead end，当 5+ dead end 追溯到同一架构时自动生成 `[ARCHITECTURE BOTTLENECK]` 警告。
+4. **架构切换执行器** — 当架构停滞达到阈值（5 cycles），强制 `architecture_switch` 动作，要求切换到完全不同的架构。
+
+### 关键改动
+- `core/loop.py`：新增 `_architecture_stagnation_count`、`_extract_architecture_name()`、`_analyze_architecture_dead_ends()`、`architecture_switch` 动作处理、架构调研门控注入、架构断路器。
+- `core/domain_knowledge.py`：新增 `_synthesize_architecture_dead_ends()` 架构级 dead end 聚类分析。
+- `agents/leader.md`：新增"架构智能规则"章节，4 条强制规则。
+
+### 模块大小
+
+| 模块 | v13.2 | v14 |
+|------|-------|-----|
+| `core/loop.py` | 3,919 | ~4,150 |
+| `core/domain_knowledge.py` | — | ~660 |
+| **总计** | **~21,220** | **~21,750** |
+
+---
+
+**2026-05-19 (v13.2) — Code Review 知识库 + 多工具集成**
+
+*包含 v12.3–v13.1 变更 + v13.2（多工具安装器、Python API、Cursor/CodeBuddy 支持）。*
+
+### 解决的核心问题
+Agent 在多个 cycle 中重复犯相同的错误：(1) PRE-EXECUTE Code Review 的正则检查反复匹配注释/文档字符串中的关键词，造成无限 HARD GATE 死循环，连续阻止训练 9+ 个 cycle；(2) 已验证的架构缺陷（死胡同、模块失败）仅记录为文本，未系统提取为可复用的教训；(3) API 超时 300 秒导致单次调用挂起 25+ 分钟；(4) `reflect_result` 中的 `null` 值导致 SQLite 记录崩溃。
+
+### 新增机制
+
+| # | 机制 | 阶段 | 功能 |
+|---|------|------|------|
+| 1 | **Code Review Lessons 知识库** | Memory | 新增 `code_review_lessons` SQLite 表，支持模式去重、严重度排名、命中计数跟踪、关键词相关性搜索 |
+| 2 | **Post-Reflect 教训提取** | REFLECT → Memory | 自动从 VERIFY 失败、死胡同、模块失败、LLM 语义分析中提取教训 |
+| 3 | **THINK 阶段教训注入** | THINK | 自动加载与当前模型代码相关的教训，注入 Leader 上下文 |
+| 4 | **HARD GATE 死循环检测** | Gate | 连续 2 次 HARD 阻止后自动降级为 SOFT GATE |
+| 5 | **注释感知正则检查** | Gate | 新增 `_strip_comments_and_strings()` 方法，正则检查仅匹配真实代码 |
+| 6 | **增强 LOW VOI 引导** | THINK | 强烈建议切换到 `paper_research` 寻找新方向 |
+| 7 | **`code_review` 工具** | EXECUTE | Code Agent 新增结构化代码分析工具 |
+| 8 | **API 超时优化** | EXECUTE | 超时从 300 秒降至 120 秒 |
+| 9 | **两阶段代码审查** *(v12.3)* | Gate | Phase 1: 零 LLM 正则检查；Phase 2: LLM 语义审查（仅在 Phase 1 无 HIGH 问题时运行） |
+| 10 | **日志回退解析器** *(v12.3)* | VERIFY | `training_log.json` 不存在时，从原始日志文本提取 routing weights、aux loss、per-domain MAE |
+| 11 | **动态域名发现** *(v12.3)* | VERIFY | 不再硬编码域名，动态解析任何 `DOMAIN: MAE=X.XXX` 模式 |
+| 12 | **有序 Gate Pipeline** *(v12.4)* | THINK→EXECUTE | 三个 Gate 按优先级顺序执行：PRE-VERIFY → CODE REVIEW → FALSIFIABILITY。Hard-gate 触发后跳过后续 Gate |
+
+### Bug 修复
+- **`MAX(severity, ?)` 对 TEXT 列无效** (严重): SQLite 字典序使 HIGH < LOW < MEDIUM，严重度升级逻辑完全反了。改为 Python 侧比较。
+- **整数与 TEXT 比较** (严重): severity 过滤用整数比较 TEXT 列。改为 `IN (...)` 子句。
+- **`NoneType` 下标错误** (HIGH): LLM 返回 `null` 值导致 SQLite 崩溃。改为 `(x or "")[:500]` 模式。
+- **全表加载性能问题** (MEDIUM): `search_relevant_lessons` 添加 `LIMIT 100`。
+- **固定 pattern 合并** (LOW): 死胡同和模块失败改为内容关键词提取 pattern。
+
+### v13.1 加固修复
+- **跨行字符串处理 bug**: `_strip_comments_and_strings` 逐行处理无法移除跨行 `"""..."""`。改为先在全内容上移除多行字符串，再逐行处理。
+- **`gate` 关键词误报**: 正则 Check 1 匹配所有 `gate`（如 `torch.sigmoid`）。改为 `gate_weight|gate_network|gating`。
+- **搜索评分优化**: 高 `hit_count` 的无关 lesson 不再返回。要求至少一个关键词匹配。
+- **SQL 查询合并**: `record_code_review_lesson` 的 UPDATE 路径从两次查询合并为一次。
+- **LLM JSON 响应处理**: `_llm_extract_lesson` 添加 JSON 解析回退。
+- **训练脚本独立检查**: 模型文件不可用时仍执行训练脚本检查。
+- **Gate 2 代码清理**: 双重 `if` 改为 `if/else`。
+
+### v13.2 — 多工具 Skill 集成 + Python API
+- **多工具安装器**: `install.py` 支持 `--claude-code`、`--codebuddy`、`--cursor`、`--all`，一键安装 skill 到各工具原生目录。
+- **Python API** (`api.py`): `AutoResearcher` 类提供 `run_one_cycle()`、`start_daemon()`、`get_status()`、`get_code_review_lessons()` 等编程接口。
+- **CLI API**: `python api.py {status|run|start|stop|lessons}` 命令行接口。
+- **Cursor 支持**: Skill 安装为 `.mdc` 规则文件到 `~/.cursor/rules/`。
+- **CodeBuddy 支持**: Skill 安装为 `.md` 命令到 `~/.codebuddy/commands/`。
+
+### 知识闭环
+
+```
+失败 → 提取教训 → 存储到 SQLite → 关键词匹配注入 THINK → 避免重复犯错
+```
+
+### 模块大小
+
+| 模块 | v12.2 | v13 | v13.2 | v14 | v15.5 |
+|------|-------|-----|-------|-----|-------|
+| `core/loop.py` | 3,248 | ~3,904 | 3,919 | ~4,150 | ~4,350 |
+| `core/memory.py` | 963 | ~1,130 | 1,134 | 1,134 | 1,134 |
+| `core/agents.py` | 1,357 | ~1,411 | 1,411 | 1,411 | 1,411 |
+| `core/tools.py` | 1,739 | ~1,884 | 1,884 | 1,884 | 1,884 |
+| `core/domain_knowledge.py` | — | — | — | ~660 | ~660 |
+| `core/research_roadmap.py` | — | — | — | — | ~500 |
+| **Total** | **~19,734** | **~20,850** | **~21,220** | **~21,750** | **~22,470** |
+
+**2026-05-18 (v12.2) — Pre-Execute 代码审查 + 训练架构验证**
+
+### 解决的核心问题
+Agent 生成的模型代码（如 MaterialDualCueNet）包含多个架构缺陷（routing weights 永远不分化、aux loss 太低、输入通道信息不对称），但训练前没有被检测到。Agent 在架构有缺陷的模型上浪费了 GPU 时间和 LLM token，而 REFLECT 阶段无法诊断模型为什么失败——因为 v12 的分析反思只覆盖数据分析实验，不覆盖训练实验。
+
+### 根因分析
+Agent 存在两个盲区：
+1. **训练前无代码审查**：Code agent 写完模型 → 立即训练 → VERIFY 只检查训练是否执行了，不检查架构设计是否合理。
+2. **无训练架构反思**：v12 的 `analysis_reflection_prompt` 只在分析实验（`experiment_launched=False`）时触发。训练实验没有专门的反思机制来评估 routing 收敛、aux loss 有效性或 per-domain 回退。
+
+### 新增机制
+
+| # | 机制 | 触发阶段 | 功能 |
+|---|------|---------|------|
+| 1 | **Pre-Execute 代码审查** | THINK → EXECUTE（门控） | 训练前对模型代码做零 LLM 结构审查。检查：routing 无辅助监督、输入通道不对称（>5x 比率）、1×1 conv router（无空间上下文）、加权融合无 skip 连接。问题以强制修复前缀注入任务描述。 |
+| 2 | **Layer 12: 训练架构验证** | VERIFY | 训练后检查：(a) routing weights 分化度——所有 domain 差异 <5% = FAIL，(b) aux loss 收敛——跨 epoch 不变 = FAIL，(c) per-domain 回退——比基线退化 >20% = WARN。 |
+| 3 | **训练架构反思提示** | REFLECT | 当 VERIFY Layer 12 检测到问题时，注入专门的反思提示，强制 Leader 评估 routing 收敛、aux loss 有效性、per-domain 回退，并正确分类失败。仅在训练实验（`experiment_launched=True`）时触发。 |
+| 4 | **结构化指标注入** | REFLECT | 解析 `training_log.json` 的 per-domain MAE 趋势（逐 epoch）和 aux loss 趋势。标记正在变差的 domain。用结构化 JSON 解析替代原始日志正则解析。 |
+
+### 关键设计决策
+- **Pre-Execute 审查是门控，不是阻塞**：问题作为警告注入任务前缀，不是硬阻塞。避免误报阻止合法实验。Code agent 看到警告后可选择修复或继续。
+- **Layer 12 使用 `training_log.json`**：结构化 JSON 解析（不是原始日志文本的正则）确保可靠提取指标。JSON 不可用时回退到正则解析。
+- **基线指标来自 MEMORY_LOG.md**：Per-domain 回退与 MEMORY_LOG.md 中最近记录的基线比较，无需额外状态文件。
+- **`_pre_execute_code_review` 零 LLM 调用**：所有检查基于 regex/AST，无 LLM 调用。每 cycle 增加约 50ms 延迟。
+
+### 新增上下文键
+- THINK → EXECUTE: code review 警告注入 task（pre-execute 门控）
+- VERIFY: Layer 12 `routing_differentiation`、`aux_loss_convergence`、`domain_regression` 检查
+- REFLECT: `training_architecture_reflection_prompt`、`per_domain_mae_trend`、`aux_loss_trend`
+
+### 流程图
+```
+THINK (规划实验)
+  → Pre-Verify (数据、导入)
+  → [新增] Pre-Execute 代码审查 (模型架构)
+    → 发现问题? → 作为警告注入任务
+  → EXECUTE (Code agent 写代码 + 训练模型)
+  → VERIFY (Layer 1-11 不变)
+  → [新增] VERIFY Layer 12 (训练架构检查)
+  → [新增] VERIFY Layer 13 (aux loss 收敛)
+  → REFLECT
+    → [新增] training_architecture_reflection_prompt (当 Layer 12 有问题时)
+    → [新增] per_domain_mae_trend + aux_loss_trend
+```
+
+### 模块大小
+
+| 模块 | v12.1 | v12.2 |
+|------|-------|-------|
+| `core/loop.py` | 2,992 | 3,248 |
+| `core/verifier.py` | 2,210 | 2,537 |
+| **总计** | **~19,071** | **~19,734** |
+
+**2026-05-18 (v12.1) — API 配额耗尽时 REFLECT 降级回退与干净停止**
+
+### 解决的核心问题
+API 配额耗尽时 REFLECT 阶段失败，导致整个 cycle 的 EXECUTE + VERIFY 成果丢失。Agent 进入 600 秒退避循环，且重试也无法恢复配额。
+
+### 改动
+- **REFLECT 降级回退**（`_degraded_reflect`）：当 `dispatch_leader()` 因 `insufficient_quota` / `All providers failed` / `429` 失败时，基于规则的降级 REFLECT 从 VERIFY 报告、训练日志和分析输出中生成基本反思结果。输出格式与 Leader REFLECT 的 JSON schema 完全兼容，下游代码（`_record_cycle_outcome`、`_update_state`）无需修改。
+- **降级反思待处理标记**：写入 `.degraded_reflect_pending` JSON 文件。下一 cycle 的 THINK 阶段读取该文件并注入 `degraded_reflect_pending` 上下文，提示 Leader 在规划新工作前先回顾未完成的 cycle。
+- **配额错误时干净停止**：外层 `except` 块现在能检测配额错误并直接退出主循环（不再对不可恢复的错误执行 600s 退避）。
+- **新增上下文键**：THINK: `degraded_reflect_pending`（上一个 cycle 存在降级 REFLECT 时注入）。
+
+**2026-05-18 (v12) — 探索性分析模式：防止假阴性死胡同**
+
+### 解决的核心问题
+Agent 仅用 1 种方法（FFT 能量比，5 个特征，Cohen's d 最高 0.47）就断定"角度频率材料分类不可行"。但用 5 种方法 17 个特征重新分析后，Cohen's d 达到 2.06，AUC 0.969——方向完全可行。Agent 的分析过于狭窄，产生了假阴性死胡同。
+
+### 新增机制
+
+| # | 机制 | 触发阶段 | 功能 |
+|---|------|---------|------|
+| 1 | **探索性分析模式** | VERIFY (Layer 11) | 扫描分析输出中的方法族（FFT、统计、视角一致性、空间、频率分解）。在断定方向不可行前要求至少 3 种独立方法。 |
+| 2 | **特征完整性报告** | VERIFY | 检查分析是否覆盖至少 4 个特征族。生成结构化 JSON 报告，包含 `feature_families_tested`、`methods_with_strong_signal`、`recommendation`。 |
+| 3 | **失败分类系统** | REFLECT + Memory | 死胡同现在携带结构化的 `failure_category`：`hypothesis_wrong`、`implementation_bug`、`insufficient_experiment` 或 `method_inadequacy`。存储在 SQLite `failure_category` 列（自动迁移）。 |
+| 4 | **方法不足再唤醒** | THINK | 当存在 `failure_category='method_inadequacy'` 的死胡同时，Leader 收到提示，鼓励用更广泛的分析重试而非放弃方向。 |
+| 5 | **分析实验反思提示** | REFLECT | 当实验为数据分析（非训练）时，注入专门的反思提示，强制 Leader 评估方法覆盖度、特征完整性，并正确分类失败。 |
+
+### 关键设计决策
+- **`failure_category` 列**：通过 `log_dead_end()` 中的 `ALTER TABLE` 自动迁移。v12 之前的数据库继续正常工作（空字符串默认值）。
+- **`get_dead_ends_by_category()`**：按类别结构化检索死胡同，支持再唤醒机制。
+- **`get_method_inadequacy_count()`**：THINK 阶段注入的快速计数查询。
+- **Layer 11 `_verify_analysis_coverage()`**：基于模式的分析输出方法检测。如果只找到 1 个方法族，生成警告要求 Leader 必须分类为 `method_inadequacy`（而非 `hypothesis_wrong`）。
+
+### 新增上下文键
+- THINK: `method_inadequacy_retry_prompt`、`degraded_reflect_pending`（v12.1）
+- VERIFY: Layer 11 分析覆盖度检查
+- REFLECT: `analysis_reflection_prompt`、`method_inadequacy_history`
+
+### 模块大小
+
+| 模块 | v11 | v12 | v12.1 |
+|------|-----|-----|-------|
+| `core/loop.py` | ~2,660 | ~2,860 | 2,992 |
+| `core/memory.py` | 852 | ~960 | 963 |
+| `core/verifier.py` | 2,102 | ~2,200 | 2,210 |
+| `core/simulation_sandbox.py` | ~600 | ~600 | 1,518 |
+| `core/constraint_engine.py` | ~580 | ~580 | 1,164 |
+| `core/agents.py` | — | — | 1,357 |
+| **总计** | **~17,204** | **~17,500** | **~19,071** |
 
 **2026-05-14 (v11.1) — 三轮 Code Review 全面修复 + 硬编码参数提取**
 
@@ -506,7 +743,7 @@ v10引入**可验证的硬约束**——每个检查都是机器可验证的，�
 
 > **完全不会？** 跟着下面每一步走，10分钟从零到跑起来。
 >
-> **想让AI带你装？** 把 [`AI_GUIDE.md`](../AI_GUIDE.md) 丢给 Claude / ChatGPT / Codex，AI会交互式地一步步教你。
+> **想让AI带你装？** 把 `AI_GUIDE.md` 丢给 Claude / ChatGPT / Codex，AI会交互式地一步步教你。
 
 ### 第 0 步：检查环境
 
@@ -536,8 +773,8 @@ export ANTHROPIC_API_KEY="sk-ant-xxxxx"
 
 ```bash
 # 克隆仓库
-git clone https://github.com/Xiangyue-Zhang/auto-deep-researcher-24x7.git
-cd auto-deep-researcher-24x7
+git clone https://github.com/hrf666666/auto_research_agent.git
+cd auto_research_agent
 
 # 安装依赖
 pip install -r requirements.txt
@@ -776,26 +1013,6 @@ python -m core.loop --project ~/my-first-experiment \
 vim ~/my-first-experiment/workspace/MEMORY_LOG.md
 ```
 
-### 第 7 步：手机上看（可选）
-
-装 [Happy Coder](https://happy.engineering/) ([iOS](https://apps.apple.com/us/app/happy-codex-claude-code-app/id6748571505) / [Android](https://play.google.com/store/apps/details?id=com.ex3ndr.happy))，在手机上监控 Agent：
-
-```bash
-# 装 CLI（一次性）
-npm install -g happy-coder
-
-# 用 happy 代替 claude 启动会话
-happy
-# 在会话里启动实验：
-/auto-experiment --project ~/my-first-experiment --gpu 0
-```
-
-手机上你可以：
-- **推送通知**：实验跑完或需要你决策时立刻通知
-- **查看结果**：地铁上看最新指标
-- **下指令**：告诉 Agent 换方向
-- **无缝切换**：手机 ↔ 电脑一键切
-
 ### PROJECT_BRIEF.md 示例
 
 Brief 是你最主要的控制方式。不同场景的写法：
@@ -975,21 +1192,6 @@ python install.py --uninstall
 ```
 
 ---
-
-## 与其他工具对比
-
-| | Deep Researcher Agent | [Claude Scholar](https://github.com/Galaxy-Dawn/claude-scholar) | [AI Scientist](https://github.com/SakanaAI/AI-Scientist) | [OpenHands](https://github.com/All-Hands-AI/OpenHands) | [SWE-Agent](https://github.com/princeton-nlp/SWE-agent) |
-|--|:--:|:--:|:--:|:--:|:--:|
-| **自主运行实验** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **零成本训练监控** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **GPU 管理** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **24/7 持续运行** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **恒定大小记忆** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| 论文写作 | 基础 | ✅ | ✅ | ❌ | ❌ |
-| 知识管理 | 基础 | ✅ | ❌ | ❌ | ❌ |
-| 通用编程 | ❌ | ❌ | ❌ | ✅ | ✅ |
-
-**唯一一个为"跑"深度学习实验而设计的框架，不是为"写"。**
 
 ---
 

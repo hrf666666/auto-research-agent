@@ -443,6 +443,16 @@ class ExperimentVerifier:
         # This prevents "self-evaluation" where the model's own metrics are unreliable.
         self._verify_independent_probe(think_result, execute_result, report)
 
+        # ── Layer 11 (v12): Analysis Experiment Coverage Verification ──
+        # For data analysis experiments (no training), check that the analysis
+        # used multiple independent methods, not just one narrow approach.
+        self._verify_analysis_coverage(think_result, execute_result, report)
+
+        # ── Layer 12 (v12.2): Training Architecture Review ──
+        # For training experiments, check routing/fusion convergence,
+        # aux loss convergence, and per-domain regression.
+        self._verify_training_architecture(think_result, execute_result, report)
+
         # ── Synthesize diagnosis ──
         self._synthesize_diagnosis(report)
 
@@ -2106,3 +2116,564 @@ class ExperimentVerifier:
                     break
 
         return result
+
+    # ─────────────────────────────────────────────────
+    # Layer 11 (v12): Analysis Experiment Coverage Verification
+    # ─────────────────────────────────────────────────
+
+    def _verify_analysis_coverage(
+        self, think_result: dict, execute_result: dict, report: VerifyReport
+    ):
+        """Verify data analysis experiments used sufficient method coverage.
+
+        Checks that analysis experiments (no training) explored multiple
+        independent feature families, not just one narrow approach.
+        This prevents false-negative conclusions like "FFT energy ratios
+        can't discriminate materials" from being generalized to "no angular
+        feature can discriminate materials".
+        """
+        # Only check analysis experiments (no training launched)
+        if execute_result.get("experiment_launched"):
+            return
+        if execute_result.get("is_paper_research"):
+            return
+
+        # Look for analysis output in the response or output files
+        response = execute_result.get("response", "") or ""
+        output_str = str(execute_result.get("output", "")) or ""
+        combined = (response + " " + output_str).lower()
+
+        # Heuristic: detect if this was a discrimination/classification analysis
+        is_discrimination_analysis = any(
+            kw in combined
+            for kw in ["separability", "cohens_d", "cohen's d", "discriminat",
+                        "classification", "distinguishable", "feasib", "roc_auc",
+                        "bhattacharyya", "frequency_band"]
+        )
+        if not is_discrimination_analysis:
+            return
+
+        # Count independent analysis methods used
+        method_indicators = {
+            "fft_energy": ["fft", "frequency_band", "spectral_centroid", "energy_ratio"],
+            "gradient": ["gradient", "angular_gradient", "spatial_deriv", "du,", "dv,"],
+            "view_consistency": ["view_consistency", "direction_change", "sign_change",
+                                 "angular_coherence", "cross_direction"],
+            "symmetry": ["symmetry", "center_sym", "peak_dist"],
+            "entropy": ["entropy", "spectral_entropy", "information"],
+            "curvature": ["curvature", "second_order", "epi_curvature"],
+            "variance_profile": ["variance_profile", "angular_var"],
+        }
+
+        methods_found = []
+        for method_name, keywords in method_indicators.items():
+            if any(kw in combined for kw in keywords):
+                methods_found.append(method_name)
+
+        n_methods = len(methods_found)
+
+        if n_methods == 0:
+            # Couldn't detect methods (might be in files we can't read)
+            return
+
+        if n_methods == 1:
+            report.checks.append(VerifyCheck(
+                name="analysis_method_coverage",
+                category="integrity",
+                status="warn",
+                detail=(
+                    f"Analysis experiment used only 1 method family: {methods_found[0]}. "
+                    f"This is INSUFFICIENT to conclude a direction is infeasible. "
+                    f"The Leader MUST categorize this as 'method_inadequacy' if marking as dead_end, "
+                    f"NOT 'hypothesis_wrong'. At least 3 independent method families are required "
+                    f"before concluding a hypothesis is wrong."
+                ),
+                evidence=f"Detected methods: {methods_found}. Required: ≥3 independent families.",
+                severity="high",
+            ))
+        elif n_methods == 2:
+            report.checks.append(VerifyCheck(
+                name="analysis_method_coverage",
+                category="integrity",
+                status="warn",
+                detail=(
+                    f"Analysis experiment used 2 method families: {methods_found}. "
+                    f"This is WEAK coverage. Consider adding at least 1 more independent method "
+                    f"before drawing strong conclusions."
+                ),
+                evidence=f"Detected methods: {methods_found}. Recommended: ≥3 independent families.",
+                severity="medium",
+            ))
+        else:
+            report.checks.append(VerifyCheck(
+                name="analysis_method_coverage",
+                category="integrity",
+                status="pass",
+                detail=f"Analysis experiment used {n_methods} independent method families: {methods_found}.",
+                evidence=f"Methods: {methods_found}",
+                severity="low",
+            ))
+
+    # ─────────────────────────────────────────────────
+    # Layer 12 (v12.2): Training Architecture Review
+    # ─────────────────────────────────────────────────
+
+    def _verify_training_architecture(
+        self, think_result: dict, execute_result: dict, report: VerifyReport
+    ):
+        """Verify training experiments for architectural convergence issues.
+
+        Checks that the Code agent's model actually learned what it was
+        supposed to — routing weights differentiated, aux losses converged,
+        no per-domain regression vs baseline.
+
+        This catches the pattern where a sophisticated-looking architecture
+        (dual-branch, attention, routing) trains successfully but the key
+        mechanism (routing, attention) never actually learns to differentiate.
+        """
+        # Only check training experiments
+        if not execute_result.get("experiment_launched"):
+            return
+        action = think_result.get("action", "")
+        if action != "experiment":
+            return
+
+        # ── 12a: Routing Weight Differentiation ──
+        self._check_routing_differentiation(execute_result, report)
+
+        # ── 12b: Aux Loss Convergence ──
+        self._check_aux_loss_convergence(execute_result, report)
+
+        # ── 12c: Per-Domain Regression Detection ──
+        self._check_domain_regression(execute_result, report)
+
+    def _check_routing_differentiation(
+        self, execute_result: dict, report: VerifyReport
+    ):
+        """Check if routing/fusion weights differentiated across domains.
+
+        Parses training_log.json for routing_w_epi_* / routing_w_defocus_*
+        entries. If all domains have nearly identical weights (within 5%),
+        the routing mechanism has not learned.
+        """
+        log_json = self._load_training_log_json(execute_result)
+        if not log_json:
+            # Fallback: parse from state.last_training_logs text
+            self._check_routing_from_log_text(execute_result, report)
+            return
+
+        epochs = log_json.get("epochs", [])
+        if len(epochs) < 2:
+            return
+
+        # Collect final epoch routing weights per domain.
+        # Domain-specific weight = w_epi - w_defocus (epistemic minus shared defocus baseline).
+        # Using raw w_epi alone is misleading since it includes the shared defocus component
+        # and cannot distinguish true domain specialization from a shared baseline increase.
+        final_epoch = epochs[-1]
+        routing_by_domain = {}
+        for key, val in final_epoch.items():
+            if key.startswith("routing_w_epi_") and not key.endswith("_count"):
+                domain = key.replace("routing_w_epi_", "")
+                # Look up matching defocus weight for the same domain
+                defocus_val = final_epoch.get(f"routing_w_defocus_{domain}", 0.0)
+                routing_by_domain[domain] = val - defocus_val
+
+        if len(routing_by_domain) < 2:
+            return
+
+        # Check differentiation: all domains within 5% of each other?
+        weights = list(routing_by_domain.values())
+        # Handle potential negative values (w_defocus > w_epi for some domains)
+        # Use absolute values for range check: if all weights are near zero
+        # (regardless of sign), the router isn't differentiating.
+        abs_weights = [abs(w) for w in weights]
+        w_range = max(abs_weights) - min(abs_weights)
+        # Also check if all weights are effectively zero (absolute sum too small)
+        total_abs = sum(abs_weights)
+
+        if w_range < 0.05 or total_abs < 0.02:
+            report.checks.append(VerifyCheck(
+                name="routing_differentiation",
+                category="integrity",
+                status="fail",
+                detail=(
+                    f"Routing weights NOT differentiated across domains. "
+                    f"All domains have nearly identical weights: "
+                    f"{', '.join(f'{d}={w:.4f}' for d, w in routing_by_domain.items())}. "
+                    f"Range={w_range:.4f} (< 0.05 threshold). "
+                    f"The routing/fusion mechanism is NOT learning to specialize. "
+                    f"Possible causes: (1) aux_weight too low, (2) routing target "
+                    f"[0.5,0.5] for majority class suppresses learning, "
+                    f"(3) router input lacks information."
+                ),
+                evidence=f"Routing weights: {routing_by_domain}, range={w_range:.4f}",
+                severity="high",
+                module_path="routing",
+            ))
+        elif w_range < 0.15:
+            report.checks.append(VerifyCheck(
+                name="routing_differentiation",
+                category="integrity",
+                status="warn",
+                detail=(
+                    f"Routing weights weakly differentiated (range={w_range:.4f}). "
+                    f"Weights: {', '.join(f'{d}={w:.4f}' for d, w in routing_by_domain.items())}. "
+                    f"Differentiation may improve with more epochs or higher aux_weight."
+                ),
+                evidence=f"Routing weights: {routing_by_domain}, range={w_range:.4f}",
+                severity="medium",
+                module_path="routing",
+            ))
+
+    def _check_routing_from_log_text(
+        self, execute_result: dict, report: VerifyReport
+    ):
+        """Fallback: parse routing weights from raw log text."""
+        log_text = ""
+        log_file = execute_result.get("log_file", "")
+        if log_file:
+            log_path = self.project_dir / log_file
+            if log_path.exists():
+                try:
+                    log_text = log_path.read_text(errors="ignore")
+                except Exception:
+                    return
+
+        # Also check state.last_training_logs
+        if not log_text:
+            log_text = execute_result.get("training_logs", "")
+
+        if not log_text:
+            return
+
+        # Parse "Domain: w_epi=X.XXXX, w_defocus=X.XXXX" patterns
+        routing_pattern = re.findall(
+            r"(\w+):\s*w_epi=(\d+\.\d+),\s*w_defocus=(\d+\.\d+)",
+            log_text,
+        )
+        if not routing_pattern:
+            return
+
+        # Use the LAST occurrence (final epoch).
+        # Domain-specific weight = w_epi - w_defocus (epistemic minus defocus component).
+        # Using only w_epi would be misleading since it includes the shared defocus baseline.
+        routing_by_domain = {}
+        for domain, w_epi, w_def in routing_pattern:
+            routing_by_domain[domain] = float(w_epi) - float(w_def)
+
+        if len(routing_by_domain) < 2:
+            return
+
+        weights = list(routing_by_domain.values())
+        w_range = max(weights) - min(weights)
+
+        if w_range < 0.05:
+            report.checks.append(VerifyCheck(
+                name="routing_differentiation",
+                category="integrity",
+                status="fail",
+                detail=(
+                    f"Routing weights NOT differentiated (log text). "
+                    f"All domains: "
+                    f"{', '.join(f'{d}={w:.4f}' for d, w in routing_by_domain.items())}. "
+                    f"Range={w_range:.4f}. Routing mechanism not learning."
+                ),
+                severity="high",
+                module_path="routing",
+            ))
+
+    def _check_aux_loss_convergence(
+        self, execute_result: dict, report: VerifyReport
+    ):
+        """Check if auxiliary loss is converging (actually learning).
+
+        If aux_loss barely changes across epochs, the auxiliary module
+        (router, attention head, etc.) is not receiving useful gradient signal.
+        """
+        log_json = self._load_training_log_json(execute_result)
+        if not log_json:
+            return
+
+        epochs = log_json.get("epochs", [])
+        if len(epochs) < 2:
+            return
+
+        # Look for train_aux_loss or similar fields
+        aux_losses = []
+        for ep in epochs:
+            for key in ["train_aux_loss", "aux_loss"]:
+                if key in ep:
+                    val = ep[key]
+                    if isinstance(val, (int, float)):
+                        aux_losses.append(float(val))
+                        break
+
+        if len(aux_losses) < 2:
+            return
+
+        # Check change rate
+        initial = aux_losses[0]
+        final = aux_losses[-1]
+        if initial == 0:
+            return
+        change_pct = abs(final - initial) / abs(initial)
+
+        if change_pct < 0.01:
+            report.checks.append(VerifyCheck(
+                name="aux_loss_convergence",
+                category="integrity",
+                status="fail",
+                detail=(
+                    f"Auxiliary loss NOT converging across {len(aux_losses)} epochs. "
+                    f"Initial={initial:.6f}, Final={final:.6f}, change={change_pct:.2%}. "
+                    f"The auxiliary module (routing/attention) is NOT learning. "
+                    f"Possible causes: (1) aux_weight too low (gradient signal drowned by main loss), "
+                    f"(2) aux target is trivially satisfied (e.g. [0.5,0.5] for majority class), "
+                    f"(3) module input lacks information to differentiate."
+                ),
+                evidence=f"Aux loss: {aux_losses}",
+                severity="high",
+                module_path="auxiliary_loss",
+            ))
+        elif change_pct < 0.05:
+            report.checks.append(VerifyCheck(
+                name="aux_loss_convergence",
+                category="integrity",
+                status="warn",
+                detail=(
+                    f"Auxiliary loss barely changing: {change_pct:.2%} over "
+                    f"{len(aux_losses)} epochs. Auxiliary module may need more "
+                    f"training signal (higher aux_weight or better targets)."
+                ),
+                evidence=f"Aux loss: {aux_losses}",
+                severity="medium",
+                module_path="auxiliary_loss",
+            ))
+
+    def _check_domain_regression(
+        self, execute_result: dict, report: VerifyReport
+    ):
+        """Check if any domain regressed significantly from baseline.
+
+        Compares per-domain MAE in the training log against known baseline
+        metrics stored in the project. If any domain degraded >20%, flags it.
+        """
+        log_json = self._load_training_log_json(execute_result)
+        if not log_json:
+            return
+
+        epochs = log_json.get("epochs", [])
+        if not epochs:
+            return
+
+        # Load baseline metrics from memory or known location
+        baseline = self._load_baseline_metrics()
+        if not baseline:
+            return
+
+        final_epoch = epochs[-1]
+        regressions = []
+        for key, val in final_epoch.items():
+            if not key.startswith("MAE_") or key.endswith("_count"):
+                continue
+            domain = key.replace("MAE_", "")
+            if domain in baseline:
+                base_val = baseline[domain]
+                if isinstance(val, (int, float)) and isinstance(base_val, (int, float)):
+                    degradation = (val - base_val) / base_val
+                    if degradation > 0.20:
+                        regressions.append(
+                            f"{domain}: {val:.4f} vs baseline {base_val:.4f} "
+                            f"(+{degradation:.0%})"
+                        )
+
+        if regressions:
+            report.checks.append(VerifyCheck(
+                name="domain_regression",
+                category="integrity",
+                status="warn",
+                detail=(
+                    f"Per-domain MAE REGRESSED vs baseline:\n"
+                    + "\n".join(f"  - {r}" for r in regressions)
+                    + "\n\nThe new model makes some domains WORSE. "
+                    + "REFLECT must investigate WHY before iterating."
+                ),
+                severity="high",
+                module_path="domain_metrics",
+            ))
+
+    def _load_training_log_json(self, execute_result: dict) -> dict:
+        """Load structured training_log.json from the project outputs.
+
+        v12.3: Also tries parsing from raw log text as fallback when
+        training_log.json doesn't exist or has unexpected format.
+        """
+        # Try known output locations
+        for pattern in ["outputs/*/training_log.json", "outputs/training_log.json"]:
+            candidates = list(self.project_dir.glob(pattern))
+            if candidates:
+                # Use the most recently modified
+                latest = max(candidates, key=lambda p: p.stat().st_mtime)
+                try:
+                    data = json.loads(latest.read_text())
+                    if data and isinstance(data, dict):
+                        return data
+                except Exception:
+                    continue
+
+        # Fallback: parse from raw log text in execute_result
+        return self._parse_log_text_to_json(execute_result)
+
+    def _parse_log_text_to_json(self, execute_result: dict) -> dict:
+        """v12.3: Fallback parser — converts raw log text into training_log.json format.
+
+        Extracts routing weights, aux losses, and per-domain MAE from stdout/log text
+        when structured JSON is not available.
+        """
+        log_text = ""
+        log_file = execute_result.get("log_file", "")
+        if log_file:
+            log_path = self.project_dir / log_file
+            if log_path.exists():
+                try:
+                    log_text = log_path.read_text(errors="ignore")
+                except Exception:
+                    pass
+
+        if not log_text:
+            log_text = execute_result.get("training_logs", "")
+        if not log_text:
+            log_text = execute_result.get("log_tail", "")
+
+        if not log_text or len(log_text) < 50:
+            return {}
+
+        result = {"epochs": []}
+
+        # Parse per-domain MAE: "MAE_Lambertian: 0.387" or "Lambertian MAE=0.387"
+        # Group by epoch markers: "Epoch 1", "Epoch 2", etc.
+        epoch_blocks = re.split(r"(?:Epoch\s+\d+|epoch\s*\d+)", log_text)
+        for block in epoch_blocks[1:]:  # Skip text before first epoch marker
+            epoch_data = {}
+
+            # Domain MAE patterns
+            for m in re.finditer(
+                r"MAE[_\s]+(\w+)[\s:=]+(\d+\.\d+)", block, re.IGNORECASE
+            ):
+                domain = m.group(1).strip("_")
+                epoch_data[f"MAE_{domain}"] = float(m.group(2))
+
+            # Aux loss patterns
+            for m in re.finditer(
+                r"(?:train_)?aux_loss[\s:=]+(\d+\.\d+)", block, re.IGNORECASE
+            ):
+                epoch_data["train_aux_loss"] = float(m.group(1))
+
+            # Routing weight patterns
+            for m in re.finditer(
+                r"routing_w_epi_(\w+)[\s:=]+(\d+\.\d+)", block, re.IGNORECASE
+            ):
+                domain = m.group(1)
+                epoch_data[f"routing_w_epi_{domain}"] = float(m.group(2))
+            for m in re.finditer(
+                r"routing_w_defocus_(\w+)[\s:=]+(\d+\.\d+)", block, re.IGNORECASE
+            ):
+                domain = m.group(1)
+                epoch_data[f"routing_w_defocus_{domain}"] = float(m.group(2))
+
+            if epoch_data:
+                result["epochs"].append(epoch_data)
+
+        # If no epoch markers found, try parsing all metrics from entire text
+        if not result["epochs"] and log_text:
+            epoch_data = {}
+            # Take the LAST occurrence of each metric (final epoch)
+            for m in re.finditer(
+                r"MAE[_\s]+(\w+)[\s:=]+(\d+\.\d+)", log_text, re.IGNORECASE
+            ):
+                domain = m.group(1).strip("_")
+                epoch_data[f"MAE_{domain}"] = float(m.group(2))
+            for m in re.finditer(
+                r"(?:train_)?aux_loss[\s:=]+(\d+\.\d+)", log_text, re.IGNORECASE
+            ):
+                epoch_data["train_aux_loss"] = float(m.group(1))
+            for m in re.finditer(
+                r"routing_w_epi_(\w+)[\s:=]+(\d+\.\d+)", log_text, re.IGNORECASE
+            ):
+                domain = m.group(1)
+                epoch_data[f"routing_w_epi_{domain}"] = float(m.group(2))
+            if epoch_data:
+                result["epochs"].append(epoch_data)
+
+        return result if result["epochs"] else {}
+
+    def _load_baseline_metrics(self) -> dict:
+        """Load baseline per-domain metrics from MEMORY_LOG or known files.
+
+        v12.3: Dynamic domain discovery — no longer hardcoded domain names.
+        Parses any 'DOMAIN_NAME: MAE=X.XXX' or 'MAE_DOMAIN: X.XXX' pattern.
+        """
+        # Check MEMORY_LOG.md for baseline entries
+        memory_path = self.project_dir / "MEMORY_LOG.md"
+        if not memory_path.exists():
+            workspace_memory = self.workspace / "MEMORY_LOG.md"
+            if workspace_memory.exists():
+                memory_path = workspace_memory
+
+        if not memory_path.exists():
+            return {}
+
+        try:
+            text = memory_path.read_text(errors="ignore")
+        except Exception:
+            return {}
+
+        baseline = {}
+
+        # Common English words that are NOT domain names
+        _STOPWORDS = frozenset({
+            "the", "and", "for", "mae", "loss", "baseline", "best",
+            "overall", "average", "mean", "total", "metric", "this",
+            "with", "from", "that", "which", "epoch", "train", "val",
+            "test", "model", "data", "result", "output", "score",
+        })
+
+        def _normalize_domain(name: str) -> str:
+            """Normalize domain name: strip, title-case, collapse whitespace."""
+            name = name.strip("_ \"'|")
+            name = re.sub(r"\s+", "_", name)  # spaces → underscores
+            # Title-case normalization: "lambertian" → "Lambertian"
+            if name and not name[0].isupper():
+                name = name[0].upper() + name[1:]
+            return name
+
+        # Pattern 1: "DOMAIN: MAE=X.XXX" or "DOMAIN: 0.387" (highest confidence)
+        for match in re.finditer(
+            r"(\w[\w\s-]*?)[:\s]+MAE[:\s]*(\d+\.\d+)",
+            text,
+        ):
+            domain = _normalize_domain(match.group(1))
+            if len(domain) > 2 and domain.lower() not in _STOPWORDS:
+                baseline[domain] = float(match.group(2))
+
+        # Pattern 2: "MAE_DOMAIN: X.XXX" (from training_log.json format)
+        for match in re.finditer(
+            r"MAE[_\s]+(\w+)[\s:=]+(\d+\.\d+)",
+            text,
+        ):
+            domain = _normalize_domain(match.group(1))
+            baseline[domain] = float(match.group(2))
+
+        # Pattern 3: "Domain (DOMAIN): 0.387" or "| DOMAIN | 0.387 |"
+        # Only match within table-like or parenthetical contexts to reduce false positives.
+        for match in re.finditer(
+            r"(?:Domain\s*\(|\|\s*)(\w[\w\s]*?)(?:\)|\s*\|)[:\s]*(\d+\.\d{2,4})",
+            text,
+        ):
+            domain = _normalize_domain(match.group(1))
+            val = float(match.group(2))
+            if 0 < val < 10 and len(domain) > 2 and domain.lower() not in _STOPWORDS:
+                baseline.setdefault(domain, val)
+
+        return baseline

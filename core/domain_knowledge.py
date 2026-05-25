@@ -562,4 +562,89 @@ class DomainKnowledgeMixin:
                     f"EXHAUSTED METHODS: {', '.join(dead_end_methods)} have been tried and failed."
                 )
 
+        # ── v14: Architecture-level dead end synthesis ──
+        self._synthesize_architecture_dead_ends(insights)
+
         return insights if insights["meta_patterns"] or insights["stuck_domains"] else {}
+
+    # ── v14: Architecture-level dead end synthesis ──
+    # Known architecture patterns for clustering dead ends.
+    _ARCH_PATTERNS = {
+        "epi": ["epi", "epinet", "epipolar", "epi slope", "epi branch"],
+        "unet": ["unet", "u-net", "u_net"],
+        "transformer": ["transformer", "vit", "self_attention"],
+        "cnn": ["resnet", "vgg", "mobilenet", "efficientnet"],
+        "graph": ["gnn", "graph", "gcn", "gat"],
+        "lfnet": ["lfnet", "lf_net"],
+        "oacc": ["oacc", "occlusion_aware"],
+        "mvsnet": ["mvsnet", "multi_view_stereo"],
+    }
+
+    def _synthesize_architecture_dead_ends(self, insights: dict) -> None:
+        """Cluster dead ends by architecture and detect architecture bottlenecks (v14).
+
+        When 5+ dead ends cluster around the same architecture, this indicates
+        the architecture itself is the bottleneck, not individual approaches.
+        Injects a strong meta-pattern into insights.
+        """
+        try:
+            all_dead_ends = self.memory.get_dead_ends_full()
+            if len(all_dead_ends) < 5:
+                return
+
+            # Cluster dead ends by architecture
+            arch_clusters: dict[str, list[str]] = {}
+            unclustered = []
+            for de_text in all_dead_ends:
+                de_lower = de_text.lower()
+                matched = False
+                for arch_key, patterns in self._ARCH_PATTERNS.items():
+                    for pat in patterns:
+                        if pat in de_lower:
+                            arch_clusters.setdefault(arch_key, []).append(de_text)
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if not matched:
+                    unclustered.append(de_text)
+
+            # Detect architecture bottlenecks (5+ dead ends for same architecture)
+            for arch_key, des in arch_clusters.items():
+                if len(des) >= 5:
+                    # Further analyze: what components were attempted?
+                    component_keywords = {
+                        "loss": 0, "attention": 0, "conv": 0, "stream": 0,
+                        "branch": 0, "augment": 0, "pretrain": 0, "norm": 0,
+                        "head": 0, "feature": 0, "fusion": 0, "skip": 0,
+                    }
+                    for de in des:
+                        de_lower = de.lower()
+                        for kw in component_keywords:
+                            if kw in de_lower:
+                                component_keywords[kw] += 1
+
+                    # Find the most-patched components
+                    attempted_components = [
+                        f"{kw} ({count} attempts)"
+                        for kw, count in sorted(component_keywords.items(), key=lambda x: -x[1])
+                        if count > 0
+                    ][:5]
+
+                    insights["meta_patterns"].append(
+                        f"ARCHITECTURE BOTTLENECK DETECTED (v14): "
+                        f"'{arch_key}' architecture has {len(des)} dead ends across "
+                        f"{len(all_dead_ends)} total dead ends ({len(des)*100//len(all_dead_ends)}% of all failures). "
+                        f"Components attempted: {', '.join(attempted_components)}. "
+                        f"DIAGNOSIS: The architecture itself is the bottleneck — "
+                        f"no amount of component-level patching will fix this. "
+                        f"A fundamentally different architecture is required."
+                    )
+                    insights["architecture_bottleneck"] = {
+                        "architecture": arch_key,
+                        "dead_end_count": len(des),
+                        "total_dead_ends": len(all_dead_ends),
+                        "attempted_components": attempted_components,
+                    }
+        except Exception as e:
+            logger.debug(f"Architecture dead end synthesis failed: {e}")

@@ -87,6 +87,10 @@ THINK_KEYS = [
     # Simulation sandbox (v11)
     ContextKey("sandbox_design_guidance", "think",
                "Sandbox scaling guidance from previous cycle's model evaluation"),
+
+    # Research roadmap (v15)
+    ContextKey("research_roadmap", "think",
+               "ResearchRoadmap: module decomposition, phase constraints, active module requirements"),
 ]
 
 # ── REFLECT phase context keys ──
