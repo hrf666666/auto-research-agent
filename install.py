@@ -19,6 +19,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 REPO_DIR = Path(__file__).parent.resolve()
@@ -100,7 +101,7 @@ def _install_target(target_key: str):
     print(f"  [{t['label']}] {count} skills → {t['skill_dir']}")
 
 
-def install(targets: list[str] | None = None):
+def install(targets: Optional[list[str]] = None):
     """Install skills to specified targets (or all)."""
     print()
     print("  AutoResearcher — Skill Installer")
@@ -142,7 +143,7 @@ def install(targets: list[str] | None = None):
     print()
 
 
-def uninstall(targets: list[str] | None = None):
+def uninstall(targets: Optional[list[str]] = None):
     """Remove installed skills."""
     if not targets:
         targets = list(TARGETS.keys())

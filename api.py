@@ -62,6 +62,7 @@ class AutoResearcher:
         self.config_path = config_path
         self.workspace = Path(workspace).resolve() if workspace else self.project_dir
         self._daemon_process: Optional[subprocess.Popen] = None
+        self._daemon_log = None
 
         if not (self.project_dir / "PROJECT_BRIEF.md").exists():
             raise FileNotFoundError(
@@ -120,7 +121,7 @@ class AutoResearcher:
             PID of the daemon process.
         """
         if self._daemon_process and self._daemon_process.poll() is None:
-            raise RuntimeError("Daemon already running (PID {self._daemon_process.pid})")
+            raise RuntimeError(f"Daemon already running (PID {self._daemon_process.pid})")
 
         cmd = [sys.executable, "-m", "core.loop", "--project", str(self.project_dir)]
         if gpu:
@@ -131,13 +132,13 @@ class AutoResearcher:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(_REPO_DIR)
 
-        log_file = open(self.project_dir / "autoresearcher.log", "a")
+        self._daemon_log = open(self.project_dir / "autoresearcher.log", "a")
         self._daemon_process = subprocess.Popen(
             cmd,
             cwd=str(_REPO_DIR),
             env=env,
-            stdout=log_file,
-            stderr=log_file,
+            stdout=self._daemon_log,
+            stderr=self._daemon_log,
         )
 
         logger.info(f"Daemon started: PID {self._daemon_process.pid}")
@@ -152,6 +153,8 @@ class AutoResearcher:
             except subprocess.TimeoutExpired:
                 self._daemon_process.kill()
             logger.info("Daemon stopped")
+        if self._daemon_log and not self._daemon_log.closed:
+            self._daemon_log.close()
 
     def is_daemon_running(self) -> bool:
         """Check if daemon is running."""

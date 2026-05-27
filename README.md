@@ -14,6 +14,45 @@
 
 ## Recent Updates
 
+**2026-05-27 (v16.1) — Runtime-Grounded Gate Overhaul & Dead Module Cleanup**
+
+*Fixes the core problem: Phase Gate v1 never triggered (0/11 cycles), FORBIDDEN rules never activated (0/11 cycles), and PRE-EXECUTE "3-consecutive downgrade" leaked 4 training runs past the gate.*
+
+### Problem Solved
+v16 added Phase Gate, FORBIDDEN hard gate, and scope prefix injection — but none worked in production:
+1. **Phase Gate v1 matched task text** (LLM generates abstract descriptions like "frequency analysis" that don't contain blocked_pattern keywords like `train`, `epoch`, `Conv`) → **0 triggers in 11 cycles**
+2. **FORBIDDEN rules didn't exist** — `STRATEGY_RULES.json` was never created, auto-generated rules never have FORBIDDEN priority, and `generate_rules_from_history()` overwrote human rules → **0 triggers in 11 cycles**
+3. **PRE-EXECUTE 3-consecutive downgrade** — after 3 HARD blocks, gate auto-downgraded to SOFT regardless of phase status → **4 training runs leaked through**
+4. **Metrics pipeline incomplete** — `monitor._extract_metrics()` only extracted epoch/loss, no accuracy/AUC → Phase Status never auto-updated → Phase 1 stuck at PARTIAL forever
+5. **4 dead modules** consumed ~793 lines but scored ≤3/10 effectiveness in runtime analysis
+6. **Context overload** — 20+ keys diluted critical constraints, scope prefix injection ignored by LLM
+
+### v16.1 Changes (6 fixes)
+
+| # | Fix | Files | What Changed |
+|---|-----|-------|-------------|
+| 1 | **Phase Gate v2** | `loop.py` | `_check_phase_blocked()` rewritten: scans **actual code files** (model file + training script) instead of matching task text. Uses `_extract_model_path_from_task()` + `_find_training_script_content()` to get real code, then `re.search()` against blocked_patterns. |
+| 2 | **FORBIDDEN rules** | `constraint_engine.py`, `STRATEGY_RULES.json` | Created human-authored FORBIDDEN rules (no training before Phase 1 validated, no skip-validation, no architecture switch). Fixed `generate_rules_from_history()` to preserve `source=human` rules instead of overwriting. |
+| 3 | **Metrics pipeline** | `monitor.py` | Extended `_extract_metrics()` with AUC, FGD, FID, val_MAE patterns + generic key=value fallback. Enables Phase Status auto-update from experiment results. |
+| 4 | **Phase-aware downgrade** | `loop.py` | PRE-EXECUTE CODE REVIEW: 3-consecutive downgrade now checks Phase Status — if phase is NOT VALIDATED, no downgrade (cap streak at 2). Only downgrades when phase is VALIDATED. |
+| 5 | **Dead module removal** | `loop.py`, `constraint_engine.py` | Removed PlannerChecker (2/10), QuickBenchmark (1/10), AdaptiveThresholds (3/10), ImplementationTracker (2/10). Replaced with hardcoded thresholds. ~793 lines deleted. |
+| 6 | **Context engineering** | `loop.py`, `constraint_engine.py`, `PERSISTENT_CONSTRAINTS.md` | Removed scope_prefix injection (ineffective), sandbox_design_guidance (context bloat). Added `PERSISTENT_CONSTRAINTS.md` loading in `_think()`. ContextPruner MAX_KEYS 20→14. Updated TIER lists. |
+
+### New Files
+- `<project>/workspace/STRATEGY_RULES.json` — 3 human FORBIDDEN rules (Phase 1 no-training, no-skip-validation, no-architecture-switch)
+- `<project>/PERSISTENT_CONSTRAINTS.md` — Project-level hard constraints injected every THINK cycle
+
+### Module Size After v16.1
+
+| Module | v15.5 | v16.1 |
+|--------|-------|-------|
+| `core/loop.py` | ~4,350 | ~4,802 |
+| `core/constraint_engine.py` | 1,164 | 422 |
+| `core/monitor.py` | ~300 | 323 |
+| **Change** | | **constraint_engine -742 lines (-64%)** |
+
+---
+
 **2026-05-25 (v15.5) — Research ROADMAP: Module-Level State Machine & Phase-Gated Research**
 
 *Prevents premature model training and enforces structured theory verification before committing GPU resources.*
@@ -326,35 +365,31 @@ LLMs as agent brains have three critical weaknesses that no amount of prompt eng
 v10 introduces **hard verifiable constraints** — every check is machine-verifiable, not relying on LLM self-reporting.
 
 ### New Module
-- **`core/constraint_engine.py`** (~580 lines): 6 constraint mechanisms:
+- **`core/constraint_engine.py`** (~580 lines → 422 lines in v16.1): Originally 6 constraint mechanisms, now 2 after v16.1 dead module removal:
 
 | # | Mechanism | Phase | LLM Problem Addressed |
 |---|-----------|-------|-----------------------|
-| 1 | **PlannerChecker** | REFLECT | Code Agent freelancing — implements different architecture than planned |
-| 2 | **StrategyConstraintEngine** | THINK | Repeating failed approaches, ignoring historical lessons |
-| 3 | **QuickBenchmark** | REFLECT | Metric fabrication — reported metrics don't match actual computation |
-| 4 | **AdaptiveThresholds** | THINK | Fixed thresholds causing false diagnoses on different metric scales |
-| 5 | **ImplementationTracker** | THINK+REFLECT | "Pretending to be done" — skipping planned modules silently |
-| 6 | **ContextPruner** | THINK+REFLECT | Information overload causing LLM confusion (30+ keys → top 20) |
+| 1 | **StrategyConstraintEngine** | THINK | Repeating failed approaches, ignoring historical lessons |
+| 2 | **ContextPruner** | THINK+REFLECT | Information overload causing LLM confusion (14-key limit in v16.1) |
+
+**Removed in v16.1** (dead modules, scored ≤3/10 in runtime analysis):
+| # | Mechanism | Reason for Removal |
+|---|-----------|-------------------|
+| ~~PlannerChecker~~ | AST compliance check never useful — PlannerChecker only produced warnings (score 2/10) |
+| ~~QuickBenchmark~~ | Conditions too strict, never triggered (score 1/10) |
+| ~~AdaptiveThresholds~~ | Insufficient data for calibration, always fell back to defaults (score 3/10) |
+| ~~ImplementationTracker~~ | Overlapped with research_roadmap functionality (score 2/10) |
 
 ### How It Works
 
-**PlannerChecker**: Scans `models/*.py` AST to find all `nn.Module` subclasses and `self.xxx = SomeModule()` assignments. Fuzzy-matches against planned module names. Detects stub patterns: `pass` bodies, `NotImplementedError`, hardcoded return values, `forward()` shorter than 5 lines. Generates `PlanComplianceReport` with compliance score (0-1) and fabrication risk rating.
+**StrategyConstraintEngine**: Reads SQLite history (hypothesis calibration, dead ends, Pareto frontier) and generates executable constraint rules. Example: "edge loss failed 5 times → FORBIDDEN", "hypothesis accuracy < 30% → must cite evidence before proposing experiments". Rules persist in `STRATEGY_RULES.json`. Violations are checked after THINK dispatch and injected back into memory. v16.1: Fixed `generate_rules_from_history()` to preserve human-authored rules (`source=human`).
 
-**StrategyConstraintEngine**: Reads SQLite history (hypothesis calibration, dead ends, Pareto frontier) and generates executable constraint rules. Example: "edge loss failed 5 times → FORBIDDEN", "hypothesis accuracy < 30% → must cite evidence before proposing experiments". Rules persist in `STRATEGY_RULES.json`. Violations are checked after THINK dispatch and injected back into memory.
+**ContextPruner**: 4-tier priority system (always > situational > conditional > rare). Trims context dict to **14 keys max** (reduced from 20 in v16.1) before dispatching to LLM. Ensures critical constraints (`persistent_constraints` added in v16.1) aren't drowned out by low-priority information.
 
-**QuickBenchmark**: Loads model checkpoint, runs forward pass on random input (dynamic shape inference from state_dict). Compares output statistics against reported metrics. Flags discrepancy > 20% as anomaly. Runs as subprocess with 120s timeout, never blocks the main loop.
-
-**AdaptiveThresholds**: Reads `best_metric`/`worst_metric` from SQLite, auto-calibrates all diagnostic thresholds relative to actual metric range (e.g., `domain_gap_critical = range * 0.8`). Falls back to sensible defaults when no history exists.
-
-**ImplementationTracker**: Persistent JSON tracking of planned module status across cycles (`pending → implemented → verified`). Updated by PlannerChecker compliance reports. Injects "STILL PENDING: [ModuleB, ModuleC]" prompt to force Leader to complete before adding new features.
-
-**ContextPruner**: 4-tier priority system (always > situational > conditional > rare). Trims context dict to 20 keys max before dispatching to LLM. Ensures critical constraints aren't drowned out by low-priority information.
-
-### Context Key Registry Update
-- THINK keys: 19 → 21 (added `adaptive_thresholds`, `implementation_progress`)
-- REFLECT keys: 24 → 27 (added `plan_compliance_warning`, `quick_benchmark_warning`, `implementation_progress`)
-- Total: 48 registered context keys with validation
+### Context Key Registry Update (v16.1)
+- THINK keys: 21 → 18 (removed `adaptive_thresholds`, `implementation_progress`, `sandbox_design_guidance`; added `persistent_constraints`)
+- REFLECT keys: 27 → 24 (removed `plan_compliance_warning`, `quick_benchmark_warning`, `implementation_progress`)
+- Total: ~42 registered context keys with validation
 
 ### Bug Fixes (v9→v10)
 - **`memory.py` dead code bug (CRITICAL)**: `__init__` initialization code (`mkdir`, `_init_log()`, `_init_db()`) was unreachable after `return []` in `_infer_domain_keys()` — persistent memory system silently failed
@@ -1539,7 +1574,7 @@ mcp_services:
 ```
 auto_research_agent/
 ├── core/                    # Autonomous experiment loop engine
-│   ├── loop.py              # THINK → EXECUTE → VERIFY → VISUAL → REFLECT cycle (v15.5: ROADMAP alignment + phase-gated research)
+│   ├── loop.py              # THINK → EXECUTE → VERIFY → VISUAL → REFLECT cycle (v16.1: Phase Gate v2 code-scan + phase-aware downgrade)
 │   ├── memory.py            # Two-Tier constant-size memory (v12: failure_category system)
 │   ├── monitor.py           # Zero-LLM experiment monitoring
 │   ├── agents.py            # Leader-Worker agent dispatch
@@ -1547,7 +1582,7 @@ auto_research_agent/
 │   ├── verifier.py          # Module-level result verification (v13: unchanged from v12.2)
 │   ├── visual_analyzer.py   # Inference + multimodal visual diagnosis
 │   ├── simulation_sandbox.py # Pre-training model validation & A/B evaluation
-│   ├── constraint_engine.py # LLM behavior control (6 constraint mechanisms)
+│   ├── constraint_engine.py # LLM behavior control (v16.1: StrategyEngine + ContextPruner, 4 dead modules removed)
 │   ├── idea_planner.py      # 9-phase forward design pipeline
 │   ├── experiment_evaluator.py # Post-experiment evaluation & failure diagnosis
 │   ├── domain_knowledge.py  # Dynamic domain knowledge injection

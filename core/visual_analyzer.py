@@ -129,7 +129,7 @@ class VisualAnalyzer:
             "ali_token_plan": {
                 "env_key": "ALI_TOKEN_PLAN_API_KEY",
                 "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-                "models": ["qwen3.6-plus"],  # qwen3.5-plus not on token plan
+                "models": ["qwen3.6-plus", "qwen3.6-flash"],  # Vision-capable models
                 "mcp_enabled": False,
                 "label": "Ali (Token Plan)",
             },

@@ -1,6 +1,6 @@
 # LLM Providers (install at least one)
 anthropic>=0.40.0    # For Claude Sonnet 4.6 / Opus 4.6
-openai>=1.30.0       # For Codex 5.3 / GPT 5.4
+openai>=1.30.0       # For Codex 5.3 / GPT 5.4 / GLM5.1 /Qwen3.6plus
 
 # Core
 pyyaml>=6.0

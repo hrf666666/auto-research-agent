@@ -825,7 +825,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
 
         try:
             result = subprocess.run(
-                ["python", "-c", wrapped],
+                [sys.executable, "-c", wrapped],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1041,7 +1041,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "query": query,
         })
 
-    def _search_papers_semantic_scholar(self, query: str, limit: int, year: str = None) -> str | None:
+    def _search_papers_semantic_scholar(self, query: str, limit: int, year: str = None) -> Optional[str]:
         """Search Semantic Scholar Graph API. Returns raw JSON or None."""
         import urllib.request
         import urllib.parse
@@ -1066,7 +1066,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             logger.warning(f"search_papers: Semantic Scholar failed: {e}")
             return None
 
-    def _search_papers_duckduckgo(self, query: str, limit: int, year: str = None) -> str | None:
+    def _search_papers_duckduckgo(self, query: str, limit: int, year: str = None) -> Optional[str]:
         """Fallback: search papers via DuckDuckGo HTML parsing. Returns raw JSON or None."""
         try:
             from urllib.parse import quote
@@ -1249,7 +1249,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "paperId": paper_id,
         }
 
-    def _get_paper_arxiv_direct(self, arxiv_url: str, paper_id: str) -> str | None:
+    def _get_paper_arxiv_direct(self, arxiv_url: str, paper_id: str) -> Optional[str]:
         """Direct urllib fetch of arXiv page as fallback. Returns parsed JSON or None."""
         try:
             import urllib.request
@@ -1335,7 +1335,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "query": query,
         })
 
-    def _web_search_duckduckgo(self, query: str, max_results: int) -> str | None:
+    def _web_search_duckduckgo(self, query: str, max_results: int) -> Optional[str]:
         """DuckDuckGo HTML search. Returns JSON string or None."""
         try:
             from urllib.parse import quote

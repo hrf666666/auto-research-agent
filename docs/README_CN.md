@@ -79,6 +79,45 @@ Agent 很乐意替你把实验跑完，但请把 *idea*、*结果的解读* 和 
 
 ## 最近更新
 
+**2026-05-27 (v16.1) — 运行时驱动的门控机制重构与死模块清理**
+
+*修复核心问题：Phase Gate v1 从未触发（0/11 cycles），FORBIDDEN 规则从未激活（0/11 cycles），PRE-EXECUTE "连续3次降级"导致4次训练泄露。*
+
+### 解决的核心问题
+v16 添加了 Phase Gate、FORBIDDEN 硬门控和 scope prefix 注入——但全部在生产中失效：
+1. **Phase Gate v1 匹配任务文本**（LLM 生成抽象描述如"频域分析"，不含 blocked_pattern 关键词 `train`、`epoch`、`Conv`）→ **11 个 cycle 中 0 次触发**
+2. **FORBIDDEN 规则不存在** — `STRATEGY_RULES.json` 从未创建，自动生成规则不会有 FORBIDDEN 优先级，`generate_rules_from_history()` 覆盖人工规则 → **0 次触发**
+3. **PRE-EXECUTE 连续3次降级** — 3 次 HARD 拦截后自动降级为 SOFT，不管 Phase 状态 → **4 次训练泄露**
+4. **指标管道不完整** — `monitor._extract_metrics()` 只提取 epoch/loss，没有 accuracy/AUC → Phase 状态永远无法自动更新
+5. **4 个死模块** 占用约 793 行，但运行时分析评分 ≤3/10
+6. **上下文过载** — 20+ 个 key 稀释关键约束，scope prefix 注入被 LLM 无视
+
+### v16.1 修复（6 项）
+
+| # | 修复 | 文件 | 改动内容 |
+|---|-----|------|----------|
+| 1 | **Phase Gate v2** | `loop.py` | `_check_phase_blocked()` 重写：扫描**实际代码文件**（模型文件 + 训练脚本）而非匹配任务文本。使用 `_extract_model_path_from_task()` + `_find_training_script_content()` 获取真实代码，`re.search()` 匹配 blocked_patterns。 |
+| 2 | **FORBIDDEN 规则** | `constraint_engine.py`、`STRATEGY_RULES.json` | 创建人工 FORBIDDEN 规则（Phase 1 未验证禁止训练、禁止跳过验证、禁止架构切换）。修复 `generate_rules_from_history()` 保留 `source=human` 规则而非覆盖。 |
+| 3 | **指标管道** | `monitor.py` | 扩展 `_extract_metrics()` 支持 AUC、FGD、FID、val_MAE 模式 + 通用 key=value 回退。使 Phase 状态可从实验结果自动更新。 |
+| 4 | **阶段感知降级** | `loop.py` | PRE-EXECUTE CODE REVIEW：连续3次降级现在检查 Phase 状态——Phase 未 VALIDATED 则不降级（上限锁定为 2）。仅在 Phase 已 VALIDATED 时才降级。 |
+| 5 | **死模块移除** | `loop.py`、`constraint_engine.py` | 移除 PlannerChecker（2/10）、QuickBenchmark（1/10）、AdaptiveThresholds（3/10）、ImplementationTracker（2/10）。替换为硬编码阈值。约 793 行删除。 |
+| 6 | **上下文工程** | `loop.py`、`constraint_engine.py`、`PERSISTENT_CONSTRAINTS.md` | 移除 scope_prefix 注入（无效）、sandbox_design_guidance（上下文膨胀）。添加 `PERSISTENT_CONSTRAINTS.md` 在 `_think()` 中加载。ContextPruner MAX_KEYS 20→14。更新 TIER 列表。 |
+
+### 新增文件
+- `<project>/workspace/STRATEGY_RULES.json` — 3 条人工 FORBIDDEN 规则（Phase 1 禁止训练、禁止跳过验证、禁止架构切换）
+- `<project>/PERSISTENT_CONSTRAINTS.md` — 项目级硬约束，每个 THINK cycle 注入
+
+### 模块大小
+
+| 模块 | v15.5 | v16.1 |
+|------|-------|-------|
+| `core/loop.py` | ~4,350 | ~4,802 |
+| `core/constraint_engine.py` | 1,164 | 422 |
+| `core/monitor.py` | ~300 | 323 |
+| **变化** | | **constraint_engine -742 行（-64%）** |
+
+---
+
 **2026-05-25 (v15.5) — Research ROADMAP：模块级状态机与阶段门控研究**
 
 *防止过早训练模型，强制在提交 GPU 资源前进行结构化理论验证。*
@@ -359,11 +398,11 @@ sandbox:
 ```
 
 ### 阈值动态化
-- `loop.py` 视觉分析触发阈值 → AdaptiveThresholds 的 `severe_degradation`
-- `loop.py` 改进判定阈值 → AdaptiveThresholds 的 `improvement_threshold`
-- `experiment_evaluator.py` gap 阈值 → 从 AdaptiveThresholds 获取
-- `verifier.py` 振荡/过拟合阈值 → 从 AdaptiveThresholds 获取
-- `domain_knowledge.py` stuck domain 阈值 → 从 AdaptiveThresholds 获取
+- `loop.py` 视觉分析触发阈值 → 硬编码 0.35（v16.1: AdaptiveThresholds 已移除）
+- `loop.py` 改进判定阈值 → 硬编码 0.005（v16.1: AdaptiveThresholds 已移除）
+- `experiment_evaluator.py` gap 阈值 → 硬编码 `{"severe_degradation": 0.35, "improvement_threshold": 0.005}`（v16.1）
+- `verifier.py` 振荡/过拟合阈值 → 从配置获取
+- `domain_knowledge.py` stuck domain 阈值 → 从配置获取
 - 各模块 `1e-8` epsilon → 提取为模块级 `_EPS` 常量
 
 ### 原子写入修复
@@ -432,29 +471,29 @@ LLM作为Agent大脑有三个致命弱点，纯靠prompt无法解决：
 v10引入**可验证的硬约束**——每个检查都是机器可验证的，不依赖LLM自觉遵守。
 
 ### 新模块
-- **`core/constraint_engine.py`**（~580行）：6大约束机制
+- **`core/constraint_engine.py`**（~580行 → v16.1: 422行）：原为 6 大约束机制，v16.1 移除 4 个死模块后保留 2 个：
 
 | # | 机制 | 触发阶段 | 解决的LLM问题 |
 |---|------|---------|-------------|
-| 1 | **PlannerChecker** | REFLECT | Code Agent自由发挥——实现了和计划不同的架构 |
-| 2 | **StrategyConstraintEngine** | THINK | 重复失败方向，无视历史教训 |
-| 3 | **QuickBenchmark** | REFLECT | 指标虚报——报告的指标与实际计算不符 |
-| 4 | **AdaptiveThresholds** | THINK | 固定阈值导致不同metric尺度下误诊 |
-| 5 | **ImplementationTracker** | THINK+REFLECT | "假装完成"——悄悄跳过计划模块 |
-| 6 | **ContextPruner** | THINK+REFLECT | 信息过载导致LLM困惑（30+键→前20） |
+| 1 | **StrategyConstraintEngine** | THINK | 重复失败方向，无视历史教训 |
+| 2 | **ContextPruner** | THINK+REFLECT | 信息过载导致LLM困惑（v16.1: 14键上限） |
+
+**v16.1 移除**（死模块，运行时评分 ≤3/10）：
+| # | 机制 | 移除原因 |
+|---|------|---------|
+| ~~PlannerChecker~~ | AST合规检查从未产生实际效果（评分 2/10） |
+| ~~QuickBenchmark~~ | 条件过严，从未触发（评分 1/10） |
+| ~~AdaptiveThresholds~~ | 数据不足无法校准，始终使用默认值（评分 3/10） |
+| ~~ImplementationTracker~~ | 与 research_roadmap 功能重叠（评分 2/10） |
 
 ### 工作原理
-- **PlannerChecker**：扫描 `models/*.py` 的AST，模糊匹配计划模块名，检测stub模式（`pass`、`NotImplementedError`、硬编码返回值、`forward()`不足5行）。生成合规报告和伪造风险评级。
-- **StrategyConstraintEngine**：从SQLite历史（假设校准、死胡同、Pareto前沿）自动生成约束规则。如"edge loss失败5次→禁止再提"、"假设准确率<30%→必须提供证据"。规则持久化到 `STRATEGY_RULES.json`。
-- **QuickBenchmark**：加载模型checkpoint，随机输入推理，对比输出统计量 vs 报告指标。差异>20%标记为异常。以子进程运行（120s超时），不阻塞主循环。
-- **AdaptiveThresholds**：从SQLite读取metric范围，自动校准所有诊断阈值（如 `domain_gap_critical = range * 0.8`）。
-- **ImplementationTracker**：跨cycle持久跟踪模块状态（`pending → implemented → verified`），强制Leader完成待定模块。
-- **ContextPruner**：4级优先级裁剪（始终>情境>条件>罕见），限制20个key以内。
+- **StrategyConstraintEngine**：从SQLite历史（假设校准、死胡同、Pareto前沿）自动生成约束规则。如"edge loss失败5次→禁止再提"、"假设准确率<30%→必须提供证据"。规则持久化到 `STRATEGY_RULES.json`。v16.1：修复 `generate_rules_from_history()` 保留人工规则（`source=human`）。
+- **ContextPruner**：4级优先级裁剪（始终>情境>条件>罕见），限制**14个key**（v16.1从20降低）。确保关键约束（v16.1新增 `persistent_constraints`）不被低优先级信息淹没。
 
-### 上下文注册更新
-- THINK键：19 → 21（新增 `adaptive_thresholds`、`implementation_progress`）
-- REFLECT键：24 → 27（新增 `plan_compliance_warning`、`quick_benchmark_warning`、`implementation_progress`）
-- 总计：48个注册context key，带运行时验证
+### 上下文注册更新（v16.1）
+- THINK键：21 → 18（移除 `adaptive_thresholds`、`implementation_progress`、`sandbox_design_guidance`；新增 `persistent_constraints`）
+- REFLECT键：27 → 24（移除 `plan_compliance_warning`、`quick_benchmark_warning`、`implementation_progress`）
+- 总计：约42个注册context key，带运行时验证
 
 ### 修复的关键Bug（v9→v10）
 - **`memory.py`死代码（关键）**：`__init__`初始化代码在 `_infer_domain_keys()` 的 `return []` 之后不可达——持久化记忆系统静默失效

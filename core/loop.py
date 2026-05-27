@@ -31,11 +31,7 @@ from .verifier import ExperimentVerifier
 from .visual_analyzer import VisualAnalyzer
 from .domain_knowledge import DomainKnowledgeMixin
 from .constraint_engine import (
-    PlannerChecker,
     StrategyConstraintEngine,
-    QuickBenchmark,
-    AdaptiveThresholds,
-    ImplementationTracker,
     ContextPruner,
 )
 from .simulation_sandbox import SimulationSandbox
@@ -96,14 +92,12 @@ class ResearchLoop(DomainKnowledgeMixin):
         )
         self.obsidian = ObsidianExporter(config=config, project_dir=self.project_dir)
 
-        # Adaptive thresholds (initialized early — used by verifier and evaluator)
-        self.adaptive_thresholds = AdaptiveThresholds(self.memory)
-
         # VERIFY phase: module-level result verification
+        # v16.1: Use hardcoded thresholds (AdaptiveThresholds removed)
         self.verifier = ExperimentVerifier(
             project_dir=self.project_dir,
             workspace=self.workspace,
-            thresholds=self.adaptive_thresholds.get_thresholds(),
+            thresholds={"severe_degradation": 0.35, "improvement_threshold": 0.005},
         )
 
         # VISUAL ANALYSIS: inference + multimodal diagnosis when training is stuck
@@ -166,11 +160,9 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._infra_failure_streak: int = 0  # Consecutive infrastructure failures
         self._infra_degradation_threshold: int = 3  # Skip VERIFY after N infra failures
 
-        # ── Constraint Engine (v10): LLM behavior control ──
-        self.planner_checker = PlannerChecker(self.project_dir, self.workspace)
+        # ── Constraint Engine (v10 → v16.1): LLM behavior control ──
+        # v16.1: Removed PlannerChecker, QuickBenchmark, AdaptiveThresholds, ImplementationTracker
         self.strategy_engine = StrategyConstraintEngine(self.project_dir, self.workspace)
-        self.quick_benchmark = QuickBenchmark(self.project_dir, self.workspace, config=config)
-        self.impl_tracker = ImplementationTracker(self.workspace)
         self.context_pruner = ContextPruner()
 
         # ── Simulation Sandbox (v11): Model evaluation engine ──
@@ -274,6 +266,27 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                     # THINK: Analyze and plan
                     think_result = self._think(directive)
+
+                    # ── PHASE GATE (v16): Hard block before ROADMAP check ──
+                    # If phase_focus already constrained THINK, this is a safety net.
+                    # This catches any task that violates current phase's blocked_patterns.
+                    if think_result.get("action") == "experiment":
+                        blocked, block_reason = self._check_phase_blocked(think_result)
+                        if blocked:
+                            logger.warning(f"PHASE GATE BLOCKED: {block_reason[:200]}")
+                            ps = self._load_phase_status()
+                            current_phase = ps.get("phases", {}).get(ps.get("current_phase", ""), {})
+                            focus = current_phase.get("focus_methods", ["data_analysis"])
+                            think_result["action"] = "paper_research"
+                            # agent not needed — _execute_paper_research() 
+                            # always uses "researcher" internally
+                            think_result["task"] = (
+                                f"{block_reason}\n\n"
+                                f"Research alternative approaches using these methods: {', '.join(focus)}.\n"
+                                f"Focus on understanding WHY the current approach may not work "
+                                f"and what methods could close the gap."
+                            )
+                            self.memory.log_decision(f"[PHASE GATE v16] Blocked: {block_reason[:150]}")
 
                     # ── ROADMAP ALIGNMENT CHECK (v15): Detect and correct deviations ──
                     think_result = self._enforce_roadmap_alignment(think_result)
@@ -456,15 +469,33 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                         if high_issues:
                             self._hard_gate_consecutive_blocks += 1
+                            
+                            # v16.1: Phase-aware downgrade — only downgrade if phase is VALIDATED
+                            # v16 bug: 3 consecutive blocks → downgrade allowed training during Phase 1
+                            # Fix: Check phase status before downgrading
+                            ps = self._load_phase_status()
+                            current_phase = ps.get("phases", {}).get(ps.get("current_phase", ""), {})
+                            phase_status = current_phase.get("status", "PENDING")
+                            phase_validated = (phase_status == "VALIDATED")
+                            
                             # ── Anti-deadloop: after 2 consecutive HARD blocks, downgrade to SOFT ──
-                            if self._hard_gate_consecutive_blocks > 2:
+                            # BUT ONLY if phase is VALIDATED (training is legitimate)
+                            if self._hard_gate_consecutive_blocks > 2 and phase_validated:
                                 logger.warning(
                                     f"HARD GATE downgraded to SOFT after "
                                     f"{self._hard_gate_consecutive_blocks} consecutive blocks — "
-                                    f"regex check may be a false positive"
+                                    f"phase is VALIDATED, training is legitimate"
                                 )
                                 self._hard_gate_consecutive_blocks = 0  # reset
                                 # Fall through to SOFT GATE below
+                            elif self._hard_gate_consecutive_blocks > 2 and not phase_validated:
+                                # v16.1: Phase not validated — do NOT downgrade, keep blocking
+                                logger.warning(
+                                    f"HARD GATE NOT downgraded: phase '{ps.get('current_phase')}' "
+                                    f"status is {phase_status}, not VALIDATED. "
+                                    f"Continuing to block training (streak={self._hard_gate_consecutive_blocks})"
+                                )
+                                self._hard_gate_consecutive_blocks = 2  # cap at 2 to avoid overflow
                             else:
                                 # ── HARD GATE: HIGH severity blocks execution entirely ──
                                 logger.warning(
@@ -589,7 +620,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # are severely degraded — the agent MUST look at its own outputs.
                 domain_metrics = (execute_result.get("final_metrics") or {})
                 force_visual = False
-                severe_threshold = self.adaptive_thresholds.get_thresholds().get("severe_degradation", 0.35)
+                severe_threshold = 0.35  # v16.1: hardcoded (AdaptiveThresholds removed)
                 for key, val in domain_metrics.items():
                     if key.startswith("MAE_"):
                         try:
@@ -659,6 +690,15 @@ class ResearchLoop(DomainKnowledgeMixin):
                         "last_error": "",
                     }
                 )
+
+                # ── v16: Update phase status from experiment results ──
+                # Auto-compare experiment results against phase targets
+                try:
+                    final_metrics = execute_result.get("final_metrics") or {}
+                    if final_metrics:
+                        self._update_phase_status_from_results(final_metrics)
+                except Exception as e:
+                    logger.debug(f"Phase status update skipped: {e}")
                 self._record_cycle_outcome(think_result, execute_result, reflect_result,
                                             verify_report_dict=verify_report.to_dict())
 
@@ -759,6 +799,20 @@ class ResearchLoop(DomainKnowledgeMixin):
             "directive": directive,
             "workspace_dir": str(self.workspace),
         }
+
+        # ── v16.1: PERSISTENT CONSTRAINTS ──
+        # Load project-level hard constraints (read-only, agent cannot modify)
+        persistent_constraints_path = self.project_dir / "PERSISTENT_CONSTRAINTS.md"
+        if persistent_constraints_path.exists():
+            try:
+                constraints_text = persistent_constraints_path.read_text().strip()
+                if constraints_text:
+                    context["persistent_constraints"] = (
+                        "PROJECT-LEVEL PERSISTENT CONSTRAINTS (HARD RULES):\n"
+                        + constraints_text
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load PERSISTENT_CONSTRAINTS.md: {e}")
 
         # Inject dataset manifest (if available) so Leader knows data quality issues
         manifest_path = self.workspace / "DATASET_MANIFEST.json"
@@ -1002,8 +1056,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                         f"fusion={arch_plan.get('fusion_strategy', {}).get('method', 'N/A')}, "
                         f"{len(arch_plan.get('risks', []))} risks identified."
                     )
-                    # v10: Update implementation tracker with planned modules
-                    self.impl_tracker.update_from_plan(arch_plan, self.cycle_count)
+                    # v16.1: ImplementationTracker removed
             except Exception as e:
                 logger.warning(f"Architecture plan generation failed: {e}")
 
@@ -1072,39 +1125,10 @@ class ResearchLoop(DomainKnowledgeMixin):
         except Exception as e:
             logger.warning(f"Failed to inject hypothesis calibration: {e}")
 
-        # ── IMPLEMENTATION PROGRESS TRACKER (v10) ──
-        # Show Leader which planned modules are still pending
-        impl_prompt = self.impl_tracker.get_progress_prompt()
-        if impl_prompt:
-            context["implementation_progress"] = impl_prompt
+        # v16.1: ImplementationTracker and AdaptiveThresholds removed
+        # (dead modules, context keys removed)
 
-        # ── ADAPTIVE THRESHOLDS (v10) ──
-        # Inject calibrated thresholds for experiment evaluation
-        thresholds = self.adaptive_thresholds.get_thresholds()
-        if thresholds.get("calibrated"):
-            context["adaptive_thresholds"] = (
-                f"ADAPTIVE THRESHOLDS (calibrated from project history):\n"
-                f"- Domain gap critical: > {thresholds['domain_gap_critical']:.4f}\n"
-                f"- Domain gap high: > {thresholds['domain_gap_high']:.4f}\n"
-                f"- Metric degradation: > {thresholds['metric_degradation_pct']:.0%}\n"
-                f"- Improvement threshold: > {thresholds['improvement_threshold']:.4f}\n"
-            )
-
-        # ── v11: SANDBOX SCALING GUIDANCE ──
-        # Inject previous cycle's sandbox verdict to guide model design
-        try:
-            sandbox_cache = self.workspace / "_sandbox_last_verdict.json"
-            if sandbox_cache.exists():
-                last_verdict = json.loads(sandbox_cache.read_text())
-                if last_verdict.get("recommended_actions"):
-                    context["sandbox_design_guidance"] = (
-                        "SANDBOX DESIGN GUIDANCE (from last evaluation):\n"
-                        + "\n".join(f"- {a}" for a in last_verdict["recommended_actions"][:5])
-                        + f"\n\nScalable modules: {last_verdict.get('scalable_modules', [])}"
-                        + f"\nBottleneck modules: {last_verdict.get('bottleneck_modules', [])}"
-                    )
-        except Exception:
-            pass
+        # v16.1: sandbox_design_guidance removed from context (context key reduction)
 
         # ── RESEARCH ROADMAP (v15): Inject phase constraints ──
         # This is the PRIMARY control mechanism: tells Leader what phase and module to work on.
@@ -1115,6 +1139,13 @@ class ResearchLoop(DomainKnowledgeMixin):
         except Exception as e:
             logger.warning(f"ROADMAP context injection failed: {e}")
 
+        # ── PHASE FOCUS (v16): State-driven structured thinking ──
+        # Replace open-ended "what should we do next?" with structured
+        # "here's the gap, propose how to close it" — constrains the answer space.
+        phase_focus = self._build_phase_focus()
+        if phase_focus:
+            context["phase_focus"] = phase_focus
+
         # ── CONTEXT PRUNING (v10) ──
         # Limit context to most relevant keys to prevent LLM confusion
         context = self.context_pruner.prune(context, "think")
@@ -1124,18 +1155,34 @@ class ResearchLoop(DomainKnowledgeMixin):
             context=context,
         )
 
-        # ── STRATEGY CONSTRAINT CHECK (v10) ──
-        # Check proposed action against learned constraints
+        # ── STRATEGY CONSTRAINT CHECK (v10 → v16 hard gate) ──
+        # Check proposed action against learned constraints.
+        # FORBIDDEN violations → hard block (redirect to data_analysis).
+        # Non-FORBIDDEN violations → silently logged (no context bloat).
         if result.get("action") == "experiment":
             violations = self.strategy_engine.check_constraints(result, self.memory)
             if violations:
-                constraint_prompt = self.strategy_engine.get_constraint_prompt(violations)
-                logger.warning(f"Strategy constraint violations: {len(violations)}")
-                # Inject constraint warnings back into result for the leader
-                result["_constraint_warnings"] = constraint_prompt
-                self.memory.log_decision(
-                    f"[CONSTRAINT] {len(violations)} strategy constraint(s) triggered for proposed experiment"
-                )
+                if self.strategy_engine.has_forbidden_violation(violations):
+                    # HARD GATE: FORBIDDEN constraint → block experiment
+                    blocked_msg = self.strategy_engine.get_constraint_prompt(violations)
+                    logger.warning(f"⛔ FORBIDDEN constraint blocked experiment")
+                    result["action"] = "paper_research"
+                    result["agent"] = "researcher"
+                    result["task"] = (
+                        f"⛔ BLOCKED: Proposed experiment violates FORBIDDEN constraint(s).\n"
+                        f"{blocked_msg}\n\n"
+                        f"Research alternative approaches that avoid the forbidden methods. "
+                        f"Focus on approaches compatible with the current research phase."
+                    )
+                    self.memory.log_decision(
+                        f"[BLOCKED v16] Experiment blocked by FORBIDDEN constraint"
+                    )
+                else:
+                    # Non-FORBIDDEN: just log, don't inject into context (reduces bloat)
+                    logger.info(f"Strategy: {len(violations)} non-FORBIDDEN constraint(s) noted")
+                    self.memory.log_decision(
+                        f"[CONSTRAINT] {len(violations)} non-FORBIDDEN constraint(s) noted"
+                    )
 
         # ── EXPERIMENT VALUE OF INFORMATION (VOI) ──
         # Estimate the value of the proposed experiment before running it.
@@ -1166,6 +1213,8 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         agent_type = plan.get("agent", "code")
         task_description = plan.get("task", "")
+
+        # v16.1: scope_prefix removed (pure text injection ineffective against LLM)
 
         result = self.dispatcher.dispatch_worker(
             agent_type=agent_type,
@@ -1401,6 +1450,10 @@ class ResearchLoop(DomainKnowledgeMixin):
                 train_script_content, model_content
             ))
 
+        # -- Phase 1c: Cross-file duplicate class detection --
+        dup_warnings = self._check_duplicate_classes()
+        warnings.extend(dup_warnings)
+
         # -- Phase 2: LLM semantic review --
         # Only run if Phase 1 found no HIGH issues (otherwise already blocked)
         has_high = any(w["severity"] == "HIGH" for w in warnings)
@@ -1537,6 +1590,62 @@ class ResearchLoop(DomainKnowledgeMixin):
                             ),
                         })
 
+        # -- Check 6: Import inside function body (hot-path performance) --
+        in_function = False
+        func_indent = 0
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            if re.match(r"def\s", stripped):
+                in_function = True
+                func_indent = indent
+            elif in_function:
+                if indent <= func_indent and stripped and not stripped.startswith("#"):
+                    if re.match(r"(def |class |@)", stripped):
+                        in_function = False
+                        if re.match(r"def\s", stripped):
+                            in_function = True
+                            func_indent = indent
+                    elif re.match(r"import\s", stripped) or re.match(r"from\s+\S+\s+import", stripped):
+                        warnings.append({
+                            "severity": "MEDIUM",
+                            "detail": (
+                                "Import statement inside function body detected. "
+                                "Imports in hot-path functions (e.g. __getitem__, forward) "
+                                "add sys.modules lookup overhead on every call and may "
+                                "hide circular dependencies. Move imports to module top level."
+                            ),
+                        })
+                        break
+
+        # -- Check 7: Silent error fallback to random/default data --
+        if re.search(
+            r"except\s+.*:.*(?:torch\.rand|np\.random|random\.random|np\.randn)",
+            code_only, re.IGNORECASE,
+        ):
+            warnings.append({
+                "severity": "HIGH",
+                "detail": (
+                    "Exception handler falls back to random data (torch.rand / np.random). "
+                    "This silently injects noise into training data, corrupting model "
+                    "learning without any visible error. Either raise the exception, "
+                    "return None (let DataLoader skip), or use zero/mean fill instead."
+                ),
+            })
+        elif re.search(
+            r"except\s+(?:Exception|BaseException).*:\s*\n"
+            r"[\s\S]*?(?:torch\.rand|np\.random|random\.random|np\.randn)",
+            code_only, re.IGNORECASE,
+        ):
+            warnings.append({
+                "severity": "HIGH",
+                "detail": (
+                    "Broad exception handler falls back to random data (torch.rand / np.random). "
+                    "This silently injects noise into training, corrupting model learning. "
+                    "Replace with raise or return None to skip the sample."
+                ),
+            })
+
         return warnings
 
     def _regex_code_review_train_script(self, script_content: str, model_content: str) -> list:
@@ -1600,6 +1709,97 @@ class ResearchLoop(DomainKnowledgeMixin):
                 ),
             })
 
+        # -- Check T4: Missing __main__ guard --
+        script_clean = self._strip_comments_and_strings(script_content)
+        if not re.search(r'if\s+__name__\s*==\s*["\']__main__["\']', script_clean):
+            has_multiprocess = bool(re.search(
+                r"num_workers|multiprocessing|DataLoader", script_clean, re.IGNORECASE,
+            ))
+            severity = "MEDIUM" if has_multiprocess else "LOW"
+            detail = (
+                "Training script missing `if __name__ == '__main__':` guard. "
+                "Without this, DataLoader with num_workers > 0 will cause infinite "
+                "spawn on Windows and may cause issues on Linux with fork strategy. "
+                "Wrap main training logic in __main__ guard."
+            )
+            if not has_multiprocess:
+                detail = (
+                    "Training script missing `if __name__ == '__main__':` guard. "
+                    "This is a best practice for all training scripts."
+                )
+            warnings.append({"severity": severity, "detail": detail})
+
+        # -- Check T5: Hardcoded absolute paths --
+        abs_path_matches = re.findall(
+            r'["\'](/home/|/root/|/data/|/mnt/|/opt/)[^"\']+["\']',
+            script_clean,
+        )
+        if abs_path_matches:
+            warnings.append({
+                "severity": "MEDIUM",
+                "detail": (
+                    f"Hardcoded absolute path(s) detected: {abs_path_matches[:3]}. "
+                    f"Absolute paths break portability across machines. "
+                    f"Use argparse, config files, or os.path relative paths instead."
+                ),
+            })
+
+        # -- Check T6: Using sys.argv without argparse --
+        has_sys_argv = bool(re.search(r"sys\.argv", script_clean))
+        has_argparse = bool(re.search(r"argparse|ArgumentParser", script_clean))
+        if has_sys_argv and not has_argparse:
+            warnings.append({
+                "severity": "LOW",
+                "detail": (
+                    "Training script uses sys.argv directly instead of argparse. "
+                    "This makes hyperparameter management fragile and error-prone. "
+                    "Consider using argparse for cleaner CLI interface."
+                ),
+            })
+
+        return warnings
+
+    def _check_duplicate_classes(self) -> list:
+        """Phase 1c: Detect classes defined identically across multiple model files.
+
+        Scans models/ and scripts/ for class definitions. If the same class name
+        appears in 2+ files, emits a MEDIUM warning — this usually indicates
+        copy-paste duplication that should be refactored into a shared module.
+        """
+        warnings = []
+        class_locations = {}  # class_name -> [file_paths]
+
+        search_dirs = [self.project_dir / "models", self.project_dir / "scripts"]
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for py_file in search_dir.glob("*.py"):
+                if py_file.name.startswith("_") and py_file.name == "__init__.py":
+                    continue
+                try:
+                    content = py_file.read_text()
+                except Exception:
+                    continue
+                for match in re.finditer(r"^class\s+(\w+)\s*[(\[:]", content, re.MULTILINE):
+                    cname = match.group(1)
+                    # Skip small utility classes unlikely to be duplicated
+                    skip_names = ("Test", "Config", "Error", "Exception", "Enum",
+                                  "Dataset", "DataLoader", "Sampler", "Transform")
+                    if any(s in cname for s in skip_names):
+                        continue
+                    rel = str(py_file.relative_to(self.project_dir))
+                    class_locations.setdefault(cname, []).append(rel)
+
+        for cname, files in class_locations.items():
+            if len(files) >= 3:
+                warnings.append({
+                    "severity": "MEDIUM",
+                    "detail": (
+                        f"Class '{cname}' is defined in {len(files)} files: {files[:5]}. "
+                        f"Consider extracting it into a shared module (e.g. models/components.py) "
+                        f"to avoid copy-paste drift and ease maintenance."
+                    ),
+                })
         return warnings
 
     def _find_training_script_content(self, think_result: dict) -> str:
@@ -2061,6 +2261,12 @@ class ResearchLoop(DomainKnowledgeMixin):
             "workspace_dir": str(self.workspace),
         }
 
+        # ── v16: Gap-closing reflection ──
+        # Inject phase gap context so REFLECT compares results against targets
+        phase_focus = self._build_phase_focus()
+        if phase_focus:
+            context["phase_focus"] = phase_focus
+
         # Inject VERIFY diagnosis so Leader knows what actually worked/failed
         if verify_report:
             context["verify_report"] = verify_report.to_dict()
@@ -2237,7 +2443,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             from .experiment_evaluator import ExperimentEvaluator
             evaluator = ExperimentEvaluator(
                 self.project_dir, self.workspace,
-                thresholds=self.adaptive_thresholds.get_thresholds(),
+                thresholds={"severe_degradation": 0.35, "improvement_threshold": 0.005},
             )
 
             # Get the architecture plan (from previous think or cached)
@@ -2296,58 +2502,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     f"before trusting the metrics."
                 )
 
-        # ── v10: PLANNER CHECKER — Plan vs Implementation compliance ──
-        # Verify Code Agent faithfully executed the architecture plan
-        arch_plan = getattr(self, '_last_architecture_plan', None)
-        if arch_plan and execute_result.get("experiment_launched"):
-            try:
-                compliance = self.planner_checker.check_plan_compliance(
-                    cycle=self.cycle_count,
-                    architecture_plan=arch_plan,
-                    execute_result=execute_result,
-                )
-                if compliance.warnings:
-                    context["plan_compliance_warning"] = "\n".join(compliance.warnings)
-                    logger.warning(
-                        f"Plan compliance: score={compliance.compliance_score:.0%}, "
-                        f"missing={compliance.missing_modules}, risk={compliance.fabrication_risk}"
-                    )
-                # Update implementation tracker
-                self.impl_tracker.update_from_compliance(compliance)
-            except Exception as e:
-                logger.warning(f"PlannerChecker failed: {e}")
-
-        # ── v10: QUICK BENCHMARK — validate reported metrics ──
-        # Run 5 validation samples to catch metric fabrication
-        final_metrics = execute_result.get("final_metrics") or {}
-        if final_metrics and execute_result.get("experiment_launched"):
-            try:
-                bench_result = self.quick_benchmark.run(
-                    model_path=execute_result.get("model_path", ""),
-                    checkpoint_path="",
-                    val_data_path="",
-                    reported_metrics=final_metrics,
-                    max_samples=5,
-                )
-                if bench_result.run and bench_result.anomaly:
-                    context["quick_benchmark_warning"] = (
-                        f"QUICK BENCHMARK ANOMALY:\n"
-                        f"Independent verification on {bench_result.num_samples} samples found:\n"
-                        f"{bench_result.anomaly_detail}\n\n"
-                        f"DO NOT trust the reported metrics. Investigate the evaluation pipeline."
-                    )
-                    logger.error(f"QuickBenchmark anomaly: {bench_result.anomaly_detail}")
-                    self.memory.log_active_problem(
-                        f"[BENCHMARK] Metric fabrication suspected: {bench_result.anomaly_detail[:200]}"
-                    )
-                elif bench_result.run and bench_result.discrepancy is not None:
-                    logger.info(
-                        f"QuickBenchmark OK: avg={bench_result.avg_metric:.4f}, "
-                        f"reported={bench_result.reported_metric:.4f}, "
-                        f"disc={bench_result.discrepancy:.4f}"
-                    )
-            except Exception as e:
-                logger.debug(f"QuickBenchmark skipped: {e}")
+        # v16.1: PlannerChecker and QuickBenchmark removed (dead modules, scores 2/10 and 1/10)
 
         # ── v11: SIMULATION SANDBOX — full model evaluation ──
         # Run A/B comparison + internal behavior + scaling guidance
@@ -2418,10 +2573,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             except Exception as e:
                 logger.debug(f"Sandbox evaluation skipped: {e}")
 
-        # ── v10: IMPLEMENTATION PROGRESS ──
-        impl_prompt = self.impl_tracker.get_progress_prompt()
-        if impl_prompt:
-            context["implementation_progress"] = impl_prompt
+        # v16.1: ImplementationTracker removed (dead module)
 
         # ── v12: ANALYSIS EXPERIMENT REFLECTION ──
         # When the experiment was a data analysis (no training), inject specialized
@@ -2896,6 +3048,286 @@ class ResearchLoop(DomainKnowledgeMixin):
             logger.debug(f"Architecture dead end analysis failed: {e}")
         return result
 
+    # ── v16: Phase-Gated State-Driven Architecture ──
+
+    # v16.1: _build_scope_prefix removed (pure text injection ineffective against LLM)
+
+    def _load_phase_status(self, force_reload: bool = False) -> dict:
+        """Load PHASE_STATUS.json — the single source of truth for phase state.
+
+        Results are cached per cycle. Use force_reload=True after _save_phase_status.
+        """
+        if not force_reload and hasattr(self, '_phase_status_cache') and self._phase_status_cache is not None:
+            return self._phase_status_cache
+        path = self.workspace / "PHASE_STATUS.json"
+        if path.exists():
+            try:
+                self._phase_status_cache = json.loads(path.read_text())
+                return self._phase_status_cache
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to load PHASE_STATUS.json: {e}")
+        self._phase_status_cache = {}
+        return {}
+
+    def _save_phase_status(self, phase_status: dict):
+        """Persist PHASE_STATUS.json."""
+        path = self.workspace / "PHASE_STATUS.json"
+        try:
+            path.write_text(json.dumps(phase_status, indent=2, ensure_ascii=False))
+            self._phase_status_cache = phase_status  # Keep cache in sync
+        except OSError as e:
+            logger.warning(f"Failed to save PHASE_STATUS.json: {e}")
+
+    def _build_phase_focus(self) -> str:
+        """Build a compact phase focus prompt (5-7 lines) for state-driven THINK.
+
+        Instead of asking LLM "what should we do next?" (open-ended),
+        we ask "here's the gap to the target, propose how to close it" (structured).
+        This constrains the answer space and naturally prevents deviation.
+        """
+        ps = self._load_phase_status()
+        if not ps:
+            return ""
+
+        current_id = ps.get("current_phase", "")
+        phases = ps.get("phases", {})
+        current = phases.get(current_id, {})
+        if not current:
+            return ""
+
+        status = current.get("status", "PENDING")
+        results = current.get("results", {})
+        targets = current.get("targets", {})
+        focus = current.get("focus_methods", [])
+        name = current.get("name", current_id)
+
+        # Phase already validated → allow free exploration
+        if status == "VALIDATED":
+            return ""
+
+        # Phase FAILED → force replan
+        if status == "FAILED":
+            return (
+                f"⛔ PHASE GATE — Phase '{name}' has FAILED.\n"
+                f"Results: {results}\nTargets: {targets}\n"
+                f"You MUST research alternative approaches or analyze why current approach failed.\n"
+                f"DO NOT proceed to next phase."
+            )
+
+        # Phase PARTIAL/PENDING → structured gap-closing prompt
+        gap = {}
+        for metric, target in targets.items():
+            actual = results.get(metric)
+            if actual is not None and target > 0:
+                gap[metric] = round(target - actual, 4)
+
+        gap_str = ", ".join(f"{k}: {v:+.4f}" for k, v in gap.items()) if gap else "no data yet — run baseline first"
+        results_str = ", ".join(f"{k}: {v:.4f}" for k, v in results.items()) if results else "no experiments run yet"
+        targets_str = ", ".join(f"{k}: ≥{v:.4f}" for k, v in targets.items()) if targets else "see PROJECT_BRIEF"
+        focus_str = ", ".join(focus[:6]) if focus else "see PROJECT_BRIEF"
+
+        if not results:
+            instruction = "Run a baseline experiment using focus methods to establish initial results."
+        else:
+            instruction = "Propose a concrete experiment to close the gap using focus methods above."
+
+        return (
+            f"PHASE FOCUS: Phase '{name}' (status={status})\n"
+            f"Target: {targets_str}\n"
+            f"Current: {results_str}\n"
+            f"Gap to close: {gap_str}\n"
+            f"Focus methods: {focus_str}\n"
+            f"{instruction}"
+        )
+
+    def _check_phase_blocked(self, think_result: dict) -> tuple[bool, str]:
+        """v16.1: Check if proposed action violates current phase blocked_patterns.
+        
+        CRITICAL CHANGE from v16: Scan ACTUAL CODE FILES instead of task text.
+        v16 failed because LLM-generated task descriptions use abstract language
+        that doesn't match blocked_patterns keywords (train, epoch, Conv, etc.).
+        
+        This method reuses the file-location logic from PRE-EXECUTE CODE REVIEW,
+        which successfully blocked 6 training attempts by checking actual code.
+
+        Returns (is_blocked, reason).
+        """
+        ps = self._load_phase_status()
+        if not ps:
+            return False, ""
+
+        current_id = ps.get("current_phase", "")
+        phases = ps.get("phases", {})
+        current = phases.get(current_id, {})
+        if not current:
+            return False, ""
+
+        status = current.get("status", "PENDING")
+        # Only block if phase is not yet VALIDATED
+        if status == "VALIDATED":
+            return False, ""
+
+        blocked_patterns = current.get("blocked_patterns", [])
+        if not blocked_patterns:
+            return False, ""
+
+        # v16.1: Scan ACTUAL CODE FILES, not task text
+        code_to_check = ""
+        files_checked = []
+        
+        # 1. Check model file (reuse _extract_model_path_from_task logic)
+        model_rel_path = self._extract_model_path_from_task(think_result)
+        if model_rel_path:
+            model_path = self.project_dir / model_rel_path
+            if model_path.exists():
+                try:
+                    code_to_check += model_path.read_text()
+                    files_checked.append(model_rel_path)
+                except Exception:
+                    pass
+        
+        # 2. Check training script (reuse _find_training_script_content logic)
+        train_script_content = self._find_training_script_content(think_result)
+        if train_script_content:
+            code_to_check += "\n" + train_script_content
+            files_checked.append("training_script")
+        
+        # No code files found (pure analysis task) → allow
+        if not code_to_check:
+            return False, ""
+        
+        # Scan code against blocked patterns
+        matched_patterns = []
+        for pattern in blocked_patterns:
+            try:
+                if re.search(pattern, code_to_check, re.IGNORECASE):
+                    matched_patterns.append(pattern)
+            except re.error:
+                logger.warning(f"Invalid blocked_pattern skipped: {pattern}")
+                continue
+        
+        if matched_patterns:
+            name = current.get("name", current_id)
+            focus = current.get("focus_methods", [])
+            return True, (
+                f"⛔ PHASE GATE v2 BLOCKED: Phase '{name}' status is {status}. "
+                f"Code files contain blocked patterns.\n"
+                f"Files checked: {', '.join(files_checked)}\n"
+                f"Blocked patterns matched: {', '.join(matched_patterns[:3])}\n"
+                f"Focus on: {', '.join(focus[:5])}"
+            )
+
+        return False, ""
+
+    def _update_phase_status_from_results(self, results: dict):
+        """After REFLECT: auto-compare experiment results with phase targets.
+
+        Updates PHASE_STATUS.json status: VALIDATED / PARTIAL / FAILED.
+        """
+        ps = self._load_phase_status()
+        if not ps:
+            return
+
+        current_id = ps.get("current_phase", "")
+        phases = ps.get("phases", {})
+        current = phases.get(current_id, {})
+        if not current:
+            return
+
+        targets = current.get("targets", {})
+        if not targets:
+            return
+
+        # Determine metric direction: higher_is_better for accuracy/auc,
+        # lower_is_better for error/mae/rmse/loss
+        def _is_higher_better(metric_name: str) -> bool:
+            lower_keywords = ("error", "mae", "rmse", "loss", "mse", "cost")
+            return not any(kw in metric_name.lower() for kw in lower_keywords)
+
+        # Extract relevant metrics from results
+        new_results = {}
+        all_met = True
+        any_improved = False
+        for metric, target in targets.items():
+            # Match priority: exact key > val_ prefixed > case-insensitive
+            actual = None
+            # 1. Exact match
+            if metric in results and isinstance(results[metric], (int, float)):
+                actual = float(results[metric])
+            else:
+                # 2. Prefixed match (e.g., val_auc, test_auc) — case-insensitive
+                for prefix in ("val_", "test_", "best_"):
+                    prefixed = f"{prefix}{metric}"
+                    for key, val in results.items():
+                        if key.lower() == prefixed.lower() and isinstance(val, (int, float)):
+                            actual = float(val)
+                            break
+                    if actual is not None:
+                        break
+            if actual is None:
+                # 3. Case-insensitive match as last resort
+                for key, val in results.items():
+                    if metric.lower() == key.lower() and isinstance(val, (int, float)):
+                        actual = float(val)
+                        break
+
+            if actual is not None:
+                new_results[metric] = round(actual, 4)
+                hib = _is_higher_better(metric)
+                met = (actual >= target) if hib else (actual <= target)
+                if not met:
+                    all_met = False
+                # Check if improved from previous
+                prev = current.get("results", {}).get(metric)
+                if prev is None or ((actual > prev) if hib else (actual < prev)):
+                    any_improved = True
+
+        if not new_results:
+            return
+
+        # Update results
+        current["results"] = new_results
+        current["attempts"] = current.get("attempts", 0) + 1
+        current["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Determine status
+        if all_met:
+            current["status"] = "VALIDATED"
+            logger.info(f"✅ PHASE GATE PASSED: {current_id} meets all criteria!")
+            # Auto-advance to next phase
+            phase_ids = list(phases.keys())
+            idx = phase_ids.index(current_id) if current_id in phase_ids else -1
+            if idx + 1 < len(phase_ids):
+                next_id = phase_ids[idx + 1]
+                next_phase = phases[next_id]
+                if next_phase.get("status") == "BLOCKED":
+                    next_phase["status"] = "PENDING"
+                    ps["current_phase"] = next_id
+                    logger.info(f"→ Auto-advancing to {next_id}: {next_phase.get('name', '')}")
+        else:
+            # Check if close (PARTIAL) or far (FAILED)
+            worst_ratio = 1.0
+            for metric, target in targets.items():
+                if metric in new_results and target > 0:
+                    hib = _is_higher_better(metric)
+                    actual = new_results[metric]
+                    # For higher_is_better: ratio = actual/target (e.g. 0.85/0.90 = 0.94)
+                    # For lower_is_better: ratio = target/actual (e.g. 0.10/0.15 = 0.67)
+                    if hib:
+                        ratio = actual / target
+                    else:
+                        ratio = target / actual if actual > 0 else 0
+                    worst_ratio = min(worst_ratio, ratio)
+            if worst_ratio < 0.4:
+                current["status"] = "FAILED"
+                logger.warning(f"❌ PHASE GATE FAILED: {current_id} far below targets (worst ratio={worst_ratio:.2f})")
+            else:
+                current["status"] = "PARTIAL"
+
+        phases[current_id] = current
+        ps["phases"] = phases
+        self._save_phase_status(ps)
+
     # ── v15: Research Roadmap Integration ──
 
     def _init_research_roadmap(self):
@@ -2938,11 +3370,9 @@ class ResearchLoop(DomainKnowledgeMixin):
     def _enforce_roadmap_alignment(self, think_result: dict) -> dict:
         """Check THINK output against ROADMAP and correct deviations.
 
-        This is the HARD GATE: code-level enforcement, not just prompt injection.
-        Strategy:
-          - 1st deviation: inject correction warning into result
-          - 2nd deviation: inject stronger warning
-          - 3rd deviation: override to forced paper_research or data analysis
+        v16 simplification: The phase gate already blocks based on PHASE_STATUS.
+        This method now only handles roadmap-level deviations (not phase violations).
+        Single hard gate: misaligned → redirect immediately (no 3-strike warming).
         """
         try:
             alignment = self.roadmap.check_alignment(think_result)
@@ -2951,52 +3381,50 @@ class ResearchLoop(DomainKnowledgeMixin):
                 self._phase_violation_count = 0
                 return think_result
 
-            # Misaligned — log and correct
+            # Misaligned — single hard gate
             deviation_type = alignment["deviation_type"]
             current_modules = alignment.get("current_modules", [])
             self._phase_violation_count += 1
-            violation_num = self._phase_violation_count
 
             logger.warning(
-                f"ROADMAP DEVIATION (#{violation_num}): "
+                f"ROADMAP DEVIATION (#{self._phase_violation_count}): "
                 f"type={deviation_type}, modules={current_modules}, "
                 f"task={think_result.get('task', '')[:100]}"
             )
 
             self.memory.log_decision(
-                f"[ROADMAP v15] Deviation #{violation_num}: "
-                f"{deviation_type}. "
+                f"[ROADMAP v16] Deviation: {deviation_type}. "
                 f"Active modules: {', '.join(current_modules[:3])}"
             )
 
-            # Hard gate: 3rd consecutive deviation → force paper_research
-            if self._phase_violation_count >= 3:
-                logger.warning("ROADMAP: Forcing paper_research after 3 consecutive deviations")
-                self._phase_violation_count = 0  # Reset after enforcement
-                self.roadmap._deviation_count = 0  # Sync reset with roadmap counter
+            # v16: Single hard gate — force paper_research on ANY deviation
+            # (PHASE GATE already handles the common case; this catches roadmap-level drift)
+            if self._phase_violation_count >= 2:
+                logger.warning("ROADMAP: Forcing paper_research after 2 consecutive deviations")
+                self._phase_violation_count = 0
+                self.roadmap.reset_deviation_count()
                 return {
                     "action": "paper_research",
                     "agent": "paper_researcher",
                     "task": (
-                        "ROADMAP DEVIATION DETECTED — 3 consecutive experiments deviated from the plan.\n\n"
+                        "ROADMAP DEVIATION DETECTED — repeated deviations from the plan.\n\n"
                         "You MUST research methods to verify the following modules:\n"
                         + "\n".join(f"  - {m}" for m in current_modules)
                         + "\n\nFind published methods or techniques to validate the theoretical "
                         "assumptions underlying each module BEFORE implementing them."
                     ),
                     "reason": (
-                        f"Forced paper_research: {violation_num} consecutive "
-                        f"deviations from ROADMAP. Agent keeps proposing {deviation_type} "
+                        f"Forced paper_research: repeated deviations from ROADMAP. "
+                        f"Agent keeps proposing {deviation_type} "
                         f"instead of addressing active modules."
                     ),
                 }
 
-            # 1st-2nd deviation: inject correction into result
+            # 1st deviation: inject correction into result (one chance)
             correction = alignment.get("correction_prompt", "")
             if correction:
                 original_task = think_result.get("task", "")
                 think_result["_roadmap_alignment_warning"] = correction
-                # Append correction to task so Leader sees it
                 think_result["task"] = (
                     f"{original_task}\n\n"
                     f"---\n{correction}\n---"
@@ -3393,7 +3821,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             if not math.isfinite(current_metric):
                 logger.warning(f"METRIC INVALID: {current_metric} — skipping metric tracking")
             else:
-                improvement_threshold = self.adaptive_thresholds.get_thresholds().get("improvement_threshold", 0.005)
+                improvement_threshold = 0.005  # v16.1: hardcoded (AdaptiveThresholds removed)
                 if current_metric < (self._best_metric_ever * (1 + improvement_threshold)):
                     if current_metric < self._best_metric_ever:
                         logger.info(

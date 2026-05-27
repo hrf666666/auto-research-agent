@@ -7,11 +7,11 @@
 
 ## 🚨 CONTRIBUTOR POLICY — NON-NEGOTIABLE
 
-**This repository is owned solely by `Xiangyue-Zhang`. The Contributors list MUST contain only `Xiangyue-Zhang` and no one else, including no AI bot accounts.**
+**This repository is owned solely by `Huang Ruifeng`. The Contributors list MUST contain only `Huang Ruifeng` and no one else, including no AI bot accounts.**
 
 ### Hard rules
 
-1. **Author MUST be `Xiangyue-Zhang <85532891+Xiangyue-Zhang@users.noreply.github.com>`** — never `admin`, never AI bots, never your machine default
+1. **Author MUST be `Huang Ruifeng <hrf666666@users.noreply.github.com>`** — never `admin`, never AI bots, never your machine default
 2. **NEVER add `Co-Authored-By:` trailer** to commit messages
 3. **NEVER mention AI assistant names** in commit messages (`Claude`, `Codex`, `GPT`, `Anthropic`, `OpenAI`, `Copilot`, `Cursor`)
 4. **NEVER toggle repo visibility** (`gh repo edit --visibility ...`) — destroys stars
@@ -25,7 +25,7 @@ git log -1 --format='author=%an <%ae>%nmessage=%B'
 ```
 
 Confirm:
-- author == `Xiangyue-Zhang <85532891+Xiangyue-Zhang@users.noreply.github.com>`
+- author == `Huang Ruifeng <hrf666666@users.noreply.github.com>`
 - no `Co-Authored-By:` line
 - no AI names in message
 
@@ -34,8 +34,8 @@ If any check fails: **STOP. Do not push.** Fix the commit, re-verify, then push.
 ### How to commit properly
 
 ```bash
-git -c user.name="Xiangyue-Zhang" \
-    -c user.email="85532891+Xiangyue-Zhang@users.noreply.github.com" \
+git -c user.name="hrf666666" \
+    -c user.email="hrf666666@users.noreply.github.com" \
     commit -m "your clean message without any Co-Authored-By line"
 ```
 
@@ -45,11 +45,11 @@ git -c user.name="Xiangyue-Zhang" \
 
 You don't need to deploy these — they already exist and will block violations:
 
-1. **Local git config** (`.git/config`) — preset to Xiangyue-Zhang
+1. **Local git config** (`.git/config`) — preset to Huang Ruifeng
 2. **commit-msg hook** (`.git/hooks/commit-msg`) — rejects forbidden trailers and AI names locally
 3. **GitHub Action** (`.github/workflows/contributor-guard.yml`) — validates every push, fails workflow on violation
 4. **Branch protection** on `main` — no force push, no deletion, linear history required
-5. **`.mailmap`** — redirects any leaked AI identity back to Xiangyue-Zhang
+5. **`.mailmap`** — redirects any leaked AI identity back to Huang Ruifeng
 6. **Global AI instructions** in user's home (`~/CLAUDE.md`, `~/AGENTS.md`)
 
 ---

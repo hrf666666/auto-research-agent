@@ -152,6 +152,19 @@ TOKEN_PLAN_PROVIDERS = {
         "env_key": "GLM_CODING_PLAN_API_KEY",
         "strong_model": "glm-5.1",          # Best GLM for complex reasoning
         "fast_model": "glm-5",              # Fast GLM for routine tasks
+        # Model-level failover chains: if primary model fails, try next in list
+        "strong_model_chain": [
+            "glm-5.1",              # GLM 5.1 (strongest)
+            "glm-5",                # GLM 5
+            "glm-5-turbo",          # GLM 5 Turbo (fast)
+            "glm-4.7",              # GLM 4.7
+        ],
+        "fast_model_chain": [
+            "glm-5",                # GLM 5
+            "glm-5-turbo",          # GLM 5 Turbo
+            "glm-4.7",              # GLM 4.7
+            "glm-4.6",              # GLM 4.6
+        ],
         "models": [
             "glm-4.5",              # GLM 4.5
             "glm-4.5-air",          # GLM 4.5 Air (lightweight)
@@ -165,15 +178,33 @@ TOKEN_PLAN_PROVIDERS = {
     "ali_token_plan": {
         "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         "env_key": "ALI_TOKEN_PLAN_API_KEY",
-        "strong_model": "qwen3.6-plus",    # Best reasoning model on Ali token plan
-        "fast_model": "qwen3.6-plus",      # Fallback: same model for all tasks (no lighter tier available)
-        "models": [
+        "strong_model": "qwen3.7-max",      # Best reasoning model on Ali token plan
+        "fast_model": "qwen3.6-plus",       # Fast tier: vision + reasoning + text
+        # Model-level failover chains: if primary model fails, try next in list
+        "strong_model_chain": [
+            "qwen3.7-max",          # Qwen: reasoning, text generation (strongest)
+            "deepseek-v4-pro",      # DeepSeek: reasoning, text generation
+            "glm-5.1",              # Zhipu AI: text generation
+            "qwen3.6-plus",         # Qwen: fallback to fast tier
+        ],
+        "fast_model_chain": [
             "qwen3.6-plus",         # Qwen: reasoning, vision, text generation
+            "qwen3.6-flash",        # Qwen: fastest tier
+            "deepseek-v4-flash",    # DeepSeek: fast reasoning
+            "glm-5",                # Zhipu AI: text generation
+        ],
+        "models": [
+            "qwen3.7-max",          # Qwen: reasoning, text generation (strong)
+            "qwen3.6-plus",         # Qwen: reasoning, vision, text generation (fast)
+            "qwen3.6-flash",        # Qwen: reasoning, vision, text generation (fastest)
             "qwen-image-2.0",       # Qwen: image generation
             "qwen-image-2.0-pro",   # Qwen: image generation (pro)
             "wan2.7-image",         # Wanxiang: image generation
             "wan2.7-image-pro",     # Wanxiang: image generation (pro)
+            "deepseek-v4-pro",      # DeepSeek: reasoning, text generation
+            "deepseek-v4-flash",    # DeepSeek: reasoning, text generation (fast)
             "deepseek-v3.2",        # DeepSeek: reasoning, text generation
+            "glm-5.1",              # Zhipu AI: text generation
             "glm-5",                # Zhipu AI: text generation
             "MiniMax-M2.5",         # MiniMax: reasoning, text generation
         ],
@@ -181,9 +212,13 @@ TOKEN_PLAN_PROVIDERS = {
 }
 
 # Failover order: GLM first, ALI as backup.
-# Routing strategy: all tasks use the PRIMARY provider's models (GLM 5.1 strong / GLM 5 fast).
-# Only if the primary provider fails (error/timeout) do we switch ENTIRELY to the backup
-# provider (ALI: qwen3.6-plus for all tasks). We never mix models across providers.
+#
+# Two-level failover:
+#   Level 1 (model-level): Within a provider, if the primary model fails (e.g. qwen3.7-max),
+#     try the next model in strong_model_chain / fast_model_chain before giving up on the provider.
+#   Level 2 (provider-level): If ALL models in a provider's chain fail, switch to the next
+#     provider in TOKEN_PLAN_FAILOVER_ORDER and try its model chain.
+#
 TOKEN_PLAN_FAILOVER_ORDER = ["glm_token_plan", "ali_token_plan"]
 
 # Tasks that require the strong model (complex reasoning / planning).
@@ -373,19 +408,16 @@ class AgentDispatcher:
     def _call_llm(self, system: str, messages: list, tools: list = None, max_turns: int = 10, task_tier: str = None) -> tuple[str, ToolTrace]:
         """Call the LLM API with tool execution support.
 
-        Routing strategy (per user requirement):
-        - GLM is the PRIMARY provider: glm-5.1 for strong tasks, glm-5 for fast tasks
-        - If GLM fails (error/timeout/rate-limit), ENTIRELY switch to ALI fallback
-        - ALI fallback: qwen3.6-plus for all tasks (no cross-provider model mixing)
-        - Provider health tracking with cooldown prevents flapping
+        Two-level failover:
+        - Level 1 (model-level): Try models in strong/fast_model_chain within provider
+        - Level 2 (provider-level): Switch to next provider in TOKEN_PLAN_FAILOVER_ORDER
 
         Args:
             system: System prompt
             messages: Conversation messages
             tools: Tool definitions
             max_turns: Max tool-call turns
-            task_tier: Task type for model selection ("think", "reflect", "idea",
-                       "researcher" → strong; "code", "writing" → fast).
+            task_tier: Task type for model selection
 
         Returns:
             (response_text, tool_trace)
@@ -402,8 +434,6 @@ class AgentDispatcher:
             if not api_key:
                 missing_keys.append(provider_config["env_key"])
                 logger.debug(f"Skipping {provider_key}: API key not set ({provider_config['env_key']})")
-                # Don't overwrite last_error — a previous provider may have had a real API failure
-                # that's more useful than "key not set" for a fallback provider.
                 if last_error is None:
                     last_error = RuntimeError(
                         f"API key not set: {provider_config['env_key']}. "
@@ -411,41 +441,47 @@ class AgentDispatcher:
                     )
                 continue
 
-            # Resolve model FOR THIS specific provider (each provider has its own models)
-            model = self._resolve_model_for_provider(provider_key, provider_config, task_tier)
+            # ── Level 1: Model-level failover chain ──
+            model_chain = self._resolve_model_chain(provider_config, task_tier)
 
-            try:
-                text = self._call_openai_compatible(
-                    system=system, messages=messages, tools=tools,
-                    max_turns=max_turns, trace=trace,
-                    base_url=provider_config["base_url"],
-                    api_key=api_key,
-                    provider_label=f"token_plan[{provider_key}]",
-                    model=model,
-                    task_tier=task_tier,
-                )
-
-                # Check if the response indicates an API error (not a tool result)
-                # Use JSON parsing to avoid false positives from normal text containing {"error"
+            for model in model_chain:
                 try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, dict) and parsed.get("error") and "API" in str(parsed.get("error", "")):
-                        raise RuntimeError(f"API returned error: {text[:200]}")
-                except (json.JSONDecodeError, TypeError):
-                    pass  # Not JSON — likely a normal text response
+                    text = self._call_openai_compatible(
+                        system=system, messages=messages, tools=tools,
+                        max_turns=max_turns, trace=trace,
+                        base_url=provider_config["base_url"],
+                        api_key=api_key,
+                        provider_label=f"token_plan[{provider_key}]",
+                        model=model,
+                        task_tier=task_tier,
+                    )
 
-                # Success — reset failure counter
-                self._record_provider_success(provider_key)
-                return text, trace
+                    # Check if the response indicates an API error (not a tool result)
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and parsed.get("error") and "API" in str(parsed.get("error", "")):
+                            raise RuntimeError(f"API returned error: {text[:200]}")
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Not JSON — likely a normal text response
 
-            except Exception as e:
-                last_error = e
-                self._record_provider_failure(provider_key, str(e))
-                logger.warning(
-                    f"Provider {provider_key} (model={model}) failed: {e}. "
-                    f"Trying next provider..."
-                )
-                continue
+                    # Success — reset failure counter and return
+                    self._record_provider_success(provider_key)
+                    return text, trace
+
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Provider {provider_key} model {model} failed: {e}. "
+                        f"Trying next model in chain..."
+                    )
+                    continue
+
+            # All models in this provider's chain failed
+            self._record_provider_failure(provider_key, str(last_error))
+            logger.warning(
+                f"All models failed for provider {provider_key}. "
+                f"Trying next provider..."
+            )
 
         # ── All token_plan providers failed — try legacy providers ──
         if missing_keys and last_error and "not set" in str(last_error):
@@ -475,6 +511,31 @@ class AgentDispatcher:
 
         return text, trace
 
+    def _resolve_model_chain(self, provider_config: dict, task_tier: str = None) -> list[str]:
+        """Resolve the model failover chain for a specific provider and task tier.
+
+        Returns an ordered list of models to try. The first is the primary model,
+        subsequent entries are fallbacks within the same provider.
+
+        Falls back to [strong_model] or [fast_model] if no chain is defined.
+        """
+        # Check if user explicitly chose a specific model (not auto/default)
+        if self.model not in ("default", "auto"):
+            if self.model in provider_config.get("models", []):
+                return [self.model]  # User's choice only, no chain
+
+        # Tiered chain selection
+        if task_tier in STRONG_MODEL_TASKS:
+            chain = provider_config.get("strong_model_chain")
+            if chain:
+                return list(chain)
+            return [provider_config["strong_model"]]
+        else:
+            chain = provider_config.get("fast_model_chain")
+            if chain:
+                return list(chain)
+            return [provider_config["fast_model"]]
+
     def _resolve_model_for_provider(self, provider_key: str, provider_config: dict, task_tier: str = None) -> str:
         """Resolve which model to use for a SPECIFIC provider.
 
@@ -483,7 +544,7 @@ class AgentDispatcher:
 
         Routing rules:
         - GLM primary: strong=glm-5.1, fast=glm-5
-        - ALI fallback: strong=qwen3.6-plus, fast=qwen3.6-plus
+        - ALI fallback: strong=qwen3.7-max, fast=qwen3.6-plus
         - If user set a specific model (not auto/default), use it only if
           it's available on that provider.
         """
@@ -494,11 +555,9 @@ class AgentDispatcher:
                 return self.model
             # Model not available on this provider, fall through to tier logic
 
-        # Tiered selection per provider
-        if task_tier in STRONG_MODEL_TASKS:
-            return provider_config["strong_model"]
-        else:
-            return provider_config["fast_model"]
+        # Tiered selection per provider (returns first model in chain)
+        chain = self._resolve_model_chain(provider_config, task_tier)
+        return chain[0]
 
     def _build_provider_queue(self) -> list[tuple[str, dict]]:
         """Build ordered list of (provider_key, config) to try.

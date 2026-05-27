@@ -59,10 +59,10 @@
 │  │  │ Data Scarcity Awareness                           ││     │
 │  │  └──────────────────────────────────────────────────┘│     │
 │  │                                                      │     │
-│  │  ┌──────── Constraint Engine (v10) ─────────────────┐│     │
-│  │  │ PlannerChecker │ StrategyEngine │ QuickBenchmark ││     │
-│  │  │ AdaptiveThresholds │ ImplementationTracker       ││     │
-│  │  │ ContextPruner (20-key limit)                      ││     │
+│  │  ┌──────── Constraint Engine (v10, v16.1 cleanup) ─┐│     │
+│  │  │ StrategyEngine │ ContextPruner (14-key limit)   ││     │
+│  │  │ [Removed: PlannerChecker, QuickBenchmark,       ││     │
+│  │  │  AdaptiveThresholds, ImplementationTracker]     ││     │
 │  │  └──────────────────────────────────────────────────┘│     │
 │  │                                                      │     │
 │  │  ┌──────── Simulation Sandbox (v11) ───────────────┐│     │
@@ -838,30 +838,29 @@ Layer 6: Tool Chain Knowledge
 
 All layers except Layer 2 (project-specific memory) are fully domain-agnostic after v9.
 
-### 30. Constraint Engine (`core/constraint_engine.py`) — v10
+### 30. Constraint Engine (`core/constraint_engine.py`) — v10, cleaned in v16.1
 
-**LLM Behavior Control Layer**: Prevents hallucination, metric fabrication, and corner-cutting through 6 hard verifiable constraint mechanisms:
+**LLM Behavior Control Layer**: Prevents hallucination and corner-cutting through 2 constraint mechanisms (originally 6, 4 removed in v16.1 as dead modules):
 
-1. **PlannerChecker**: Scans implementation AST vs architecture plan. Detects missing modules, stub patterns (pass, NotImplementedError, hardcoded returns), and Code Agent freelancing. Generates `PlanComplianceReport` with compliance score and fabrication risk rating.
-
-2. **StrategyConstraintEngine**: Learns constraint rules from SQLite history. Three rule sources:
+1. **StrategyConstraintEngine**: Learns constraint rules from SQLite history. Three rule sources:
    - Hypothesis calibration → confidence constraints (accuracy < 30%: must cite evidence)
    - Dead ends → forbidden approaches (failed 3+ times: FORBIDDEN)
    - Pareto frontier → dominated method elimination
    Rules persist in `STRATEGY_RULES.json`, checked after THINK dispatch.
+   v16.1: Fixed `generate_rules_from_history()` to preserve human-authored rules (`source=human`).
 
-3. **QuickBenchmark**: Loads checkpoint, runs forward pass on random input with dynamic shape inference. Compares output statistics vs reported metrics. Flags discrepancy > 20%. Runs as subprocess (120s timeout), never blocks main loop.
+2. **ContextPruner**: 4-tier priority system that trims context to **14 keys max** (reduced from 20 in v16.1) before LLM dispatch. Prevents information overload from masking critical constraints.
+   v16.1: Added `persistent_constraints` to TIER_1_ALWAYS, removed keys from deleted modules.
 
-4. **AdaptiveThresholds**: Calibrates diagnostic thresholds from project's historical metric range. E.g., if metric range is [0.05, 0.35], `domain_gap_critical` = 0.24 instead of default 0.30.
+**Removed in v16.1** (dead modules, runtime analysis scores ≤3/10):
+- ~~PlannerChecker~~: AST compliance check never useful (2/10). Only produced warnings that didn't change behavior.
+- ~~QuickBenchmark~~: Conditions too strict, never triggered in production (1/10).
+- ~~AdaptiveThresholds~~: Insufficient data for calibration, always fell back to defaults (3/10). Replaced with hardcoded thresholds: `severe_degradation=0.35`, `improvement_threshold=0.005`.
+- ~~ImplementationTracker~~: Overlapped with research_roadmap functionality (2/10).
 
-5. **ImplementationTracker**: Persistent JSON tracking of planned module status across cycles. Prevents "pretending to be done" by injecting pending module lists into THINK context.
-
-6. **ContextPruner**: 4-tier priority system that trims context to 20 keys max before LLM dispatch. Prevents information overload from masking critical constraints.
-
-**Integration points**:
-- `_think()`: StrategyConstraintEngine check, AdaptiveThresholds injection, ImplementationTracker prompt, ContextPruner pruning
-- `_reflect()`: PlannerChecker compliance, QuickBenchmark verification, ImplementationTracker update, StrategyEngine rule generation, ContextPruner pruning
-- `_think()` (plan generation): ImplementationTracker.update_from_plan()
+**Integration points** (v16.1):
+- `_think()`: StrategyConstraintEngine check, PERSISTENT_CONSTRAINTS.md loading, ContextPruner pruning
+- `_reflect()`: StrategyEngine rule generation, ContextPruner pruning
 
 ### 31. Simulation Sandbox (`core/simulation_sandbox.py`) — v11
 
@@ -932,15 +931,14 @@ sandbox:
 
 **Modules reading from sandbox config:**
 - `SimulationSandbox.__init__()`: Reads all 5 settings, stores as instance attributes
-- `QuickBenchmark.__init__()`: Reads `subprocess_timeout`
-- `loop.py`: Passes config to sandbox and benchmark constructors
+- `loop.py`: Passes config to sandbox constructor
 
-**Modules no longer using hardcoded thresholds:**
-- `loop.py` visual analysis trigger → `AdaptiveThresholds.severe_degradation`
-- `loop.py` improvement detection → `AdaptiveThresholds.improvement_threshold`
-- `experiment_evaluator.py` gap thresholds → `AdaptiveThresholds.domain_gap_critical/high`
-- `verifier.py` oscillation/overfitting → `AdaptiveThresholds` thresholds
-- `domain_knowledge.py` stuck domain → `AdaptiveThresholds.domain_gap_critical`
+**Modules no longer using hardcoded thresholds** (v16.1: AdaptiveThresholds removed, thresholds hardcoded):
+- `loop.py` visual analysis trigger → hardcoded `severe_degradation=0.35`
+- `loop.py` improvement detection → hardcoded `improvement_threshold=0.005`
+- `experiment_evaluator.py` gap thresholds → hardcoded `{"severe_degradation": 0.35, "improvement_threshold": 0.005}`
+- `verifier.py` oscillation/overfitting → from config
+- `domain_knowledge.py` stuck domain → from config
 
 **Numerical safety constants** (`1e-8` epsilon for division):
 - Extracted to module-level `_EPS = 1e-8` in `loop.py`, `verifier.py`, `memory.py`
@@ -964,13 +962,13 @@ Two critical files now use write-to-temp-then-rename to prevent corruption on cr
 - `state.json`: `_update_state()` writes to `.tmp` then `replace()`
 - `MEMORY_LOG.md`: `_write_log()` writes to `.tmp` then `replace()` (was already fixed)
 
-#### Initialization Order Fix
+#### Initialization Order (v16.1)
 
-`AdaptiveThresholds` initialization moved before `ExperimentVerifier` and `ExperimentEvaluator` construction, since both now receive `thresholds=self.adaptive_thresholds.get_thresholds()` at init time:
+`AdaptiveThresholds` was removed in v16.1. `ExperimentVerifier` and `ExperimentEvaluator` now receive hardcoded thresholds directly:
 
 ```
-Before:  Memory → Monitor → Dispatcher → Verifier → ... → AdaptiveThresholds
-After:   Memory → Monitor → Dispatcher → AdaptiveThresholds → Verifier → Evaluator → ...
+Before v16.1:  Memory → Monitor → Dispatcher → AdaptiveThresholds → Verifier → Evaluator → ...
+After v16.1:   Memory → Monitor → Dispatcher → Verifier(thresholds hardcoded) → Evaluator(thresholds hardcoded) → ...
 ```
 
 #### Anthropic Max-Turns Consistency
@@ -1266,3 +1264,58 @@ VERIFY phase:
 | 6 | Cross-assumption consistency check in method suggestions | Ensures verification methods cover inter-assumption interactions |
 | 7 | Markdown parser regex `\[\\w_-+\]` + evidence extraction | Handles hyphenated module names in reflect output |
 | 8 | Removed orphan `roadmap_alignment_warning` ContextKey | Clean context key registry |
+
+### 35. v16.1 — Runtime-Grounded Gate Overhaul & Dead Module Cleanup
+
+**Root Cause**: v16's gates were all text-based — they relied on matching LLM-generated task descriptions against blocked patterns. But LLMs generate abstract descriptions ("frequency analysis") that don't contain concrete keywords (`train`, `epoch`, `Conv`). The result: 0 gate triggers in 11 production cycles, 26 training launches despite Phase 1 being PARTIAL.
+
+#### 6 Fixes
+
+**Fix 1: Phase Gate v2 — Code File Scanning**
+
+`_check_phase_blocked()` rewritten from text-matching to code-scanning:
+- Extracts model file path from task → reads actual `.py` file
+- Extracts training script content from Code agent output
+- `re.search()` scans real code against `blocked_patterns`
+- Reports matched patterns + files checked for debugging
+
+**Fix 2: FORBIDDEN Rules + Rule Preservation**
+
+- Created `STRATEGY_RULES.json` with 3 human FORBIDDEN rules:
+  1. `human_phase1_no_training`: No neural network training before Phase 1 validated
+  2. `human_no_skip_validation`: Must validate data before modeling
+  3. `human_no_architecture_switch`: No architecture switching during Phase 1
+- Fixed `generate_rules_from_history()`: preserves rules with `source=human` instead of overwriting all
+
+**Fix 3: Metrics Pipeline Extension**
+
+`monitor._extract_metrics()` extended with:
+- AUC, FGD, FID, val_MAE regex patterns
+- Generic `key=value` fallback when domain-specific patterns don't match
+- Enables `_update_phase_status_from_results()` to auto-advance phase status
+
+**Fix 4: Phase-Aware PRE-EXECUTE Downgrade**
+
+Before v16.1: After 3 consecutive HARD blocks → always downgrade to SOFT
+After v16.1: After 3 consecutive HARD blocks:
+- If phase is VALIDATED → downgrade (legitimate false positive)
+- If phase is NOT VALIDATED → no downgrade, cap streak at 2
+
+**Fix 5: Dead Module Removal (~793 lines)**
+
+| Module | Lines | Score | Removal Reason |
+|--------|-------|-------|----------------|
+| PlannerChecker | ~250 | 2/10 | AST compliance check never useful |
+| QuickBenchmark | ~288 | 1/10 | Never triggered, conditions too strict |
+| AdaptiveThresholds | ~78 | 3/10 | Insufficient data for calibration |
+| ImplementationTracker | ~145 | 2/10 | Overlapped with research_roadmap |
+
+Replaced with hardcoded thresholds: `severe_degradation=0.35`, `improvement_threshold=0.005`.
+
+**Fix 6: Context Engineering**
+
+- Removed `scope_prefix` injection (pure text, LLM ignored it)
+- Removed `sandbox_design_guidance` context injection
+- Added `PERSISTENT_CONSTRAINTS.md` loading in `_think()` (project-level hard rules)
+- ContextPruner MAX_KEYS: 20 → 14 (reduces information dilution)
+- Updated TIER lists: `persistent_constraints` in TIER_1_ALWAYS, removed dead module keys

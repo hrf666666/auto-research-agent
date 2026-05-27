@@ -412,8 +412,8 @@ class ResearchRoadmap:
 
             mod.last_updated_cycle = cycle
 
-            # Milestone: module made progress
-            if milestone:
+            # Milestone: module made progress (but not if also a dead_end)
+            if milestone and not dead_end:
                 if mod.phase == ModulePhase.THEORY_VERIFICATION:
                     # Check if milestone indicates assumption verification
                     if any(kw in milestone.lower() for kw in ["verified", "validated", "confirmed", "passed"]):
@@ -517,6 +517,10 @@ class ResearchRoadmap:
                 return True
 
         return False
+
+    def reset_deviation_count(self):
+        """Reset deviation counter. Called by loop.py after hard gate enforcement."""
+        self._deviation_count = 0
 
     @property
     def active_module_names(self) -> list[str]:
@@ -658,6 +662,11 @@ class ResearchRoadmap:
 
         # If all attempts are failed/inconclusive and we have ≥3
         if len(failed) + len(inconclusive) == len(mod.attempts) and len(mod.attempts) >= 3:
+            return True
+
+        # Safety valve: if ≥7 attempts with mixed results but no clear path forward,
+        # mark as dead_end to prevent infinite stalling
+        if len(mod.attempts) >= 7 and not mod.is_verified:
             return True
 
         return False
@@ -865,7 +874,7 @@ class ResearchRoadmap:
                 self.global_phase = GlobalPhase.THEORY_VERIFICATION
 
         # Parse module sections
-        module_sections = re.split(r"### (\S+)", content)
+        module_sections = re.split(r"### (.+?)$", content, flags=re.MULTILINE)
         # module_sections: [preamble, name1, body1, name2, body2, ...]
         for i in range(1, len(module_sections), 2):
             name = module_sections[i]
