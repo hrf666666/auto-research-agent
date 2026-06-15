@@ -160,6 +160,24 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._infra_failure_streak: int = 0  # Consecutive infrastructure failures
         self._infra_degradation_threshold: int = 3  # Skip VERIFY after N infra failures
 
+        # ── Phase 4: Failed-launch forced re-dispatch ──
+        # When THINK plans an experiment but EXECUTE never launches it
+        # (convergence_failed or experiment_launched=False without a tool
+        # error), this counter tracks consecutive failures. After 2, the next
+        # cycle's action is forced to a 'fix + launch' task; after 3, the loop
+        # pauses for human intervention instead of burning more quota.
+        # Monotonic — only resets to 0 on a genuine launch.
+        self._consecutive_failed_launches: int = 0
+
+        # ── Fix B: Audit enforcement counters ──
+        # Per-signature monotonic counter, same enforcement model as
+        # _consecutive_failed_launches: 2 strikes → forced re-dispatch with
+        # the specific issue, 3 strikes → pause_human. Previously the audit
+        # system only wrote DIRECTIVE.md text (advisory) and the LLM could
+        # ignore it forever. Now repeated audit issues have real teeth.
+        # Resets only when the issue signature stops recurring for 2 cycles.
+        self._audit_enforcement: dict[str, int] = {}  # sig → consecutive count
+
         # ── Constraint Engine (v10 → v16.1): LLM behavior control ──
         # v16.1: Removed PlannerChecker, QuickBenchmark, AdaptiveThresholds, ImplementationTracker
         self.strategy_engine = StrategyConstraintEngine(self.project_dir, self.workspace)
@@ -292,6 +310,46 @@ class ResearchLoop(DomainKnowledgeMixin):
                     think_result = self._enforce_roadmap_alignment(think_result)
 
                     think_result = self._apply_no_progress_fallback(think_result, directive)
+
+                    # ── Phase 4: Force re-dispatch after consecutive failed launches ──
+                    # Applied AFTER all other think-rewrites so a forced launch
+                    # or pause_human can override them. Only fires for experiment
+                    # actions (paper_research/wait cycles don't involve launches).
+                    if think_result.get("action") == "experiment":
+                        think_result = self._enforce_launch_after_failure(think_result)
+
+                    # ── Fix B: Force action for uncorrected audit issues ──
+                    # Same monotonic-counter model. Applied after launch
+                    # enforcement so a pause_human from either source wins.
+                    think_result = self._enforce_audit_findings(think_result)
+
+                # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
+                # Triggered by _enforce_launch_after_failure after 3 consecutive
+                # failed launches. Stops burning quota on a stuck pattern and
+                # requires human intervention to resume.
+                if think_result.get("action") == "pause_human":
+                    logger.error(
+                        f"⛔ PAUSE-HUMAN: {think_result.get('reason', 'no reason given')}"
+                    )
+                    self._update_state({
+                        "cycle": self.cycle_count,
+                        "status": "pause_human",
+                        "updated_at": time.time(),
+                        "pause_reason": think_result.get("reason", ""),
+                        "suggested_next_step": (
+                            "Inspect the agent's recent cycles to understand why "
+                            "launch_experiment is never called. Common causes: "
+                            "(1) the code agent's turn budget is exhausted by "
+                            "exploration, (2) the training script has an error "
+                            "the agent can't fix, (3) a phase gate is blocking "
+                            "training. Resume with a directive after fixing."
+                        ),
+                    })
+                    self.memory.log_decision(
+                        f"PAUSE-HUMAN: {think_result.get('reason', '')}"
+                    )
+                    self._running = False
+                    break
 
                 if think_result.get("action") == "wait":
                     self._consecutive_wait_count += 1
@@ -577,6 +635,10 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # EXECUTE: Run the plan
                 self._consecutive_wait_count = 0
                 execute_result = self._execute(think_result)
+
+                # Phase 4: update the consecutive-failed-launch counter so the
+                # next cycle's THINK can force a re-dispatch or pause_human.
+                self._update_launch_counter(execute_result)
 
                 if execute_result.get("experiment_launched"):
                     self._update_state(
@@ -1225,12 +1287,32 @@ class ResearchLoop(DomainKnowledgeMixin):
         return result
 
     def _execute_paper_research(self, plan: dict) -> dict:
-        """EXECUTE phase: run deep paper research via researcher agent.
+        """EXECUTE phase: run deep paper research.
 
-        Paper research dispatches to the 'researcher' agent (not 'code') so it
-        gets web search + paper tools instead of training tools.
+        Two paths:
+          - If ``idea_scout.enabled`` is True in config AND the
+            research-idea-scout library is available, run the cross-domain
+            idea-discovery pipeline (gather → filter → score) and return a
+            structured ranked list.
+          - Otherwise, dispatch to the 'researcher' agent (web search + paper
+            tools) as before — unchanged behavior.
         """
-        logger.info("PAPER RESEARCH EXECUTE phase starting...")
+        scout_cfg = self.config.get("idea_scout", {})
+        if scout_cfg.get("enabled", False):
+            try:
+                from core.idea_scout_bridge import is_available as scout_available
+                if scout_available():
+                    return self._execute_idea_scout(plan, scout_cfg)
+                logger.warning(
+                    "idea_scout.enabled=True but research-idea-scout library not "
+                    "found. Falling back to researcher agent."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"IdeaScout pipeline failed ({e}). Falling back to researcher agent."
+                )
+
+        logger.info("PAPER RESEARCH EXECUTE phase starting (researcher agent)...")
 
         task_description = plan.get(
             "task",
@@ -1246,6 +1328,73 @@ class ResearchLoop(DomainKnowledgeMixin):
         # Mark as paper_research so REFLECT knows how to handle it
         result["is_paper_research"] = True
         return result
+
+    def _execute_idea_scout(self, plan: dict, scout_cfg: dict) -> dict:
+        """Run the IdeaScout cross-domain idea-discovery pipeline.
+
+        1. Build a Profile from PROJECT_BRIEF (+ memory dead-ends).
+        2. Gather papers via this agent's search_papers tool.
+        3. Rule-filter candidates (fast keyword pruning).
+        4. LLM-score survivors for transferability (via ProviderRouter).
+        5. Write a ranked Markdown report to the workspace.
+        Returns a result dict with ``idea_scout_ranked`` for VERIFY/REFLECT.
+        """
+        from core.idea_scout_bridge import (
+            build_profile_from_brief, run_pipeline, format_results_markdown,
+        )
+
+        task = plan.get("task", "")
+        logger.info(f"IDEA SCOUT pipeline starting for: {task[:100]}")
+
+        # 1. Profile
+        brief_path = self.project_dir / "PROJECT_BRIEF.md"
+        profile_path = scout_cfg.get("profile_path", "")
+        profile = build_profile_from_brief(
+            brief_path, memory=self.memory,
+            profile_path=profile_path or None,
+        )
+
+        # 2-4. Pipeline (gather → filter → score)
+        pipeline_result = run_pipeline(
+            tools_registry=self.tools,
+            dispatcher=self.dispatcher,
+            profile=profile,
+            query=task,
+            max_papers=scout_cfg.get("max_papers", 50),
+            filter_top_k=scout_cfg.get("filter_top_k", 20),
+            score_top_k=scout_cfg.get("score_top_k", 10),
+            abstract_max_chars=scout_cfg.get("abstract_max_chars", 3000),
+        )
+
+        # 5. Write report
+        report = format_results_markdown(pipeline_result, task)
+        date_str = time.strftime("%Y-%m-%d")
+        report_path = self.workspace / f"idea_scout_results_{date_str}.md"
+        report_path.write_text(report, encoding="utf-8")
+        logger.info(f"IdeaScout report written to {report_path}")
+
+        # Build the execute_result dict (consumed by VERIFY/REFLECT)
+        ranked = pipeline_result.get("ranked", [])
+        top_ideas = [
+            {
+                "title": p.get("title", ""),
+                "rank_score": p.get("rank_score", 0),
+                "priority": p.get("priority", ""),
+                "idea_core": p.get("idea_core", ""),
+                "transferable_mechanism": p.get("transferable_mechanism", ""),
+                "url": p.get("url", ""),
+            }
+            for p in ranked[:5]  # top-5 for the summary
+        ]
+        return {
+            "agent": "idea_scout",
+            "is_paper_research": True,
+            "response": report[:2000],  # truncated for context
+            "idea_scout_ranked": pipeline_result,
+            "top_ideas": top_ideas,
+            "report_path": str(report_path),
+            "papers_scored": pipeline_result.get("papers_scored", 0),
+        }
 
     def _monitor_experiment(self, execute_result: dict) -> dict:
         """Monitor running experiment with ZERO LLM calls."""
@@ -3591,6 +3740,145 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         return think_result
 
+    # ─────────────────────────────────────────────────────────────
+    # Phase 4: Failed-launch forced re-dispatch
+    # ─────────────────────────────────────────────────────────────
+    def _update_launch_counter(self, execute_result: dict):
+        """Update the consecutive-failed-launch counter after EXECUTE.
+
+        A genuine launch (experiment_launched=True) resets the counter to 0.
+        A failed launch (convergence_failed or experiment_launched=False on an
+        experiment plan, absent a tool error) increments it. The counter is
+        monotonic — it never self-resets on firing, only on a real launch.
+        """
+        if execute_result.get("experiment_launched"):
+            self._consecutive_failed_launches = 0
+        elif execute_result.get("convergence_failed") or \
+                (not execute_result.get("launch_error")
+                 and not execute_result.get("deception_detected")
+                 and not execute_result.get("experiment_launched")):
+            self._consecutive_failed_launches += 1
+
+    def _enforce_launch_after_failure(self, think_result: dict) -> dict:
+        """Force action when consecutive failed launches stack up.
+
+        Returns the (possibly rewritten) think_result:
+          - < 2 failures: no change (the cycle proceeds normally).
+          - 2 failures: rewrite the action/task to a forced 'fix + launch'
+            dispatch, carrying the specific failure reason so the code agent
+            knows what went wrong.
+          - ≥ 3 failures: rewrite to pause_human — stop burning quota and
+            surface the problem for human intervention.
+        """
+        n = self._consecutive_failed_launches
+        if n < 2:
+            return think_result
+
+        if n >= 3:
+            logger.error(
+                f"⚠️  PAUSE-HUMAN: {n} consecutive cycles planned an experiment "
+                f"but EXECUTE never launched one. Stopping to avoid burning "
+                f"more quota. Last task: {str(think_result.get('task',''))[:100]}"
+            )
+            return {
+                "action": "pause_human",
+                "reason": (
+                    f"{n} consecutive failed launches. The agent repeatedly "
+                    f"plans an experiment but never calls launch_experiment. "
+                    f"This is likely an infrastructure or prompt issue requiring "
+                    f"human inspection."
+                ),
+                "task": think_result.get("task", ""),
+            }
+
+        # 2 failures: force a targeted 'fix + launch' re-dispatch.
+        logger.warning(
+            f"🔄 FORCED RE-DISPATCH: {n} consecutive failed launches. "
+            f"Forcing a 'fix + launch' task this cycle."
+        )
+        original_task = think_result.get("task", "")
+        return {
+            "action": "experiment",
+            "reason": (
+                f"Forced re-dispatch after {n} failed launches. The previous "
+                f"cycle(s) planned training but launch_experiment was never called."
+            ),
+            "task": (
+                f"CRITICAL — PREVIOUS LAUNCH FAILED.\n\n"
+                f"Last cycle you were asked to run an experiment but you did NOT "
+                f"call launch_experiment. This is your final chance before the "
+                f"system pauses for human intervention.\n\n"
+                f"Original task: {original_task[:300]}\n\n"
+                f"MANDATORY STEPS (do NOT deviate):\n"
+                f"1. Verify the training script exists and is correct (one read_file).\n"
+                f"2. Run a 2-step dry-run to confirm it works (one run_shell).\n"
+                f"3. Call launch_experiment(command=..., log_file=...) IMMEDIATELY.\n"
+                f"4. Do NOT explore further. Do NOT call read_file/list_files more "
+                f"than once each. CONVERGE NOW.\n\n"
+                f"If you cannot launch, explicitly report why in your response — "
+                f"do NOT silently skip the launch."
+            ),
+            "_forced_redispatch": True,
+        }
+
+    def _enforce_audit_findings(self, think_result: dict) -> dict:
+        """Fix B: Force action when repeated audit issues go uncorrected.
+
+        Same enforcement model as _enforce_launch_after_failure: per-signature
+        monotonic counter. If an audit issue has been escalated (DIRECTIVE
+        written) but the agent still hasn't fixed it after 2 cycles, force
+        the action to a targeted fix task. After 3, pause for human
+        intervention. This replaces the old "advisory-only DIRECTIVE.md that
+        the LLM ignores forever" pattern.
+
+        Resets a signature's counter only when the issue stops recurring for
+        2 consecutive cycles (grace period), not on fire.
+        """
+        if not self._audit_enforcement:
+            return think_result
+
+        for sig, n in sorted(self._audit_enforcement.items(), key=lambda x: -x[1]):
+            if n >= 3:
+                logger.error(
+                    f"⛔ PAUSE-HUMAN: audit issue '{sig}' escalated {n} times "
+                    f"without resolution. Stopping for human inspection."
+                )
+                self._audit_enforcement[sig] = 0  # reset on pause
+                return {
+                    "action": "pause_human",
+                    "reason": (
+                        f"Audit issue '{sig}' has been escalated {n} times. "
+                        f"The agent cannot resolve this automatically — likely "
+                        f"an infrastructure or prompt-level issue. Human "
+                        f"inspection required."
+                    ),
+                    "task": think_result.get("task", ""),
+                }
+            if n >= 2:
+                logger.warning(
+                    f"🔄 FORCED FIX: audit issue '{sig}' escalated {n} times. "
+                    f"Forcing a targeted fix task."
+                )
+                self._audit_enforcement[sig] = 0  # give the forced fix a clean slate
+                return {
+                    "action": think_result.get("action", "paper_research"),
+                    "reason": f"Forced fix for recurring audit issue '{sig}'.",
+                    "task": (
+                        f"CRITICAL — RECURRING AUDIT ISSUE (escalated {n} times).\n\n"
+                        f"Issue signature: {sig}\n"
+                        f"This issue has persisted across multiple cycles despite "
+                        f"directives. You MUST diagnose and fix it NOW:\n"
+                        f"1. Identify the root cause (not the symptom)\n"
+                        f"2. Apply the minimal fix\n"
+                        f"3. Verify the fix resolves the issue\n"
+                        f"4. Report what was wrong and what you changed\n\n"
+                        f"Original task: {think_result.get('task', '')[:200]}\n"
+                    ),
+                    "_forced_audit_fix": True,
+                }
+        return think_result
+
+
     def _record_cycle_outcome(self, think_result: dict, execute_result: dict, reflect_result: dict,
                               verify_report_dict: dict = None):
         """Track whether repeated cycles are producing real progress.
@@ -4127,6 +4415,9 @@ class ResearchLoop(DomainKnowledgeMixin):
                     f"Injecting targeted fix into next cycle."
                 )
                 self._inject_error_directive(sig, count, issue, level=1)
+                # Fix B: also increment the enforcement counter so repeated
+                # audit issues get real teeth (forced action rewrite / pause).
+                self._audit_enforcement[sig] = self._audit_enforcement.get(sig, 0) + 1
 
             elif action == "force_error_handler":
                 # Level 2: Force the error-handler skill
@@ -4135,6 +4426,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     f"Forcing error-handler skill."
                 )
                 self._inject_error_directive(sig, count, issue, level=2)
+                self._audit_enforcement[sig] = self._audit_enforcement.get(sig, 0) + 1
 
             elif action == "pause_and_directive":
                 # Level 3: Pause the agent and write a human directive

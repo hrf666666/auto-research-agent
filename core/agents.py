@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -96,8 +97,17 @@ class ToolTrace:
             if call.name == "launch_experiment":
                 try:
                     result_data = json.loads(call.result)
+                    # F1 fix: once we have a successful pid, stop scanning so a
+                    # later failed call (or an earlier stale launch_error)
+                    # can't overwrite/contradict it. Clear any stale error.
                     if "pid" in result_data:
                         facts["pid"] = result_data["pid"]
+                        facts.pop("launch_error", None)
+                        if "log_file" in result_data:
+                            facts["log_file"] = result_data["log_file"]
+                        if "status" in result_data:
+                            facts["launch_status"] = result_data["status"]
+                        break  # successful launch found — done
                     if "log_file" in result_data:
                         facts["log_file"] = result_data["log_file"]
                     if "status" in result_data:
@@ -106,7 +116,13 @@ class ToolTrace:
                     if "error" in result_data:
                         facts["launch_error"] = result_data["error"]
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    # F2 fix: previously `pass` made the anti-deception layer
+                    # blind to non-JSON tool results (plain error strings,
+                    # tracebacks). Record the raw text so a genuine launch
+                    # failure is visible rather than indistinguishable from
+                    # "launch never called".
+                    if "launch_error" not in facts:
+                        facts["launch_error"] = (call.result or "")[:500]
         return facts
 
     def extract_shell_facts(self) -> list[dict]:
@@ -150,11 +166,15 @@ TOKEN_PLAN_PROVIDERS = {
     "glm_token_plan": {
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
         "env_key": "GLM_CODING_PLAN_API_KEY",
-        "strong_model": "glm-5.1",          # Best GLM for complex reasoning
+        # NOTE: glm-5.2 returns 403 (code 1220) on standard Coding Plan tiers
+        # (verified 2026-06). glm-5.1 is the strongest accessible model and has
+        # thinking (reasoning_content) enabled by default. Switch strong_model
+        # to glm-5.2 once the plan is authorized for it.
+        "strong_model": "glm-5.1",            # Strongest accessible GLM (thinking auto-enabled)
         "fast_model": "glm-5",              # Fast GLM for routine tasks
         # Model-level failover chains: if primary model fails, try next in list
         "strong_model_chain": [
-            "glm-5.1",              # GLM 5.1 (strongest)
+            "glm-5.1",              # GLM 5.1 (strongest accessible, thinking)
             "glm-5",                # GLM 5
             "glm-5-turbo",          # GLM 5 Turbo (fast)
             "glm-4.7",              # GLM 4.7
@@ -172,7 +192,8 @@ TOKEN_PLAN_PROVIDERS = {
             "glm-4.7",              # GLM 4.7
             "glm-5",                # GLM 5
             "glm-5-turbo",          # GLM 5 Turbo (fast)
-            "glm-5.1",              # GLM 5.1 (strongest)
+            "glm-5.1",              # GLM 5.1 (thinking) — current strong default
+            "glm-5.2",              # GLM 5.2 (thinking) — 403 on standard plan, reserved for future
         ],
     },
     "ali_token_plan": {
@@ -184,7 +205,7 @@ TOKEN_PLAN_PROVIDERS = {
         "strong_model_chain": [
             "qwen3.7-max",          # Qwen: reasoning, text generation (strongest)
             "deepseek-v4-pro",      # DeepSeek: reasoning, text generation
-            "glm-5.1",              # Zhipu AI: text generation
+            "glm-5.1",              # Zhipu AI: text generation (thinking)
             "qwen3.6-plus",         # Qwen: fallback to fast tier
         ],
         "fast_model_chain": [
@@ -204,6 +225,7 @@ TOKEN_PLAN_PROVIDERS = {
             "deepseek-v4-pro",      # DeepSeek: reasoning, text generation
             "deepseek-v4-flash",    # DeepSeek: reasoning, text generation (fast)
             "deepseek-v3.2",        # DeepSeek: reasoning, text generation
+            "glm-5.2",              # Zhipu AI: thinking (403 on standard GLM plan; valid on some Ali tiers)
             "glm-5.1",              # Zhipu AI: text generation
             "glm-5",                # Zhipu AI: text generation
             "MiniMax-M2.5",         # MiniMax: reasoning, text generation
@@ -224,6 +246,174 @@ TOKEN_PLAN_FAILOVER_ORDER = ["glm_token_plan", "ali_token_plan"]
 # Tasks that require the strong model (complex reasoning / planning).
 # Everything else uses the fast model.
 STRONG_MODEL_TASKS = {"think", "reflect", "idea", "researcher", "code"}
+
+# Exploration-only tools that a code agent is blocked from calling once it
+# passes 60% of its turn budget (Phase 2 convergence gate). Tools NOT in this
+# set (write_file, launch_experiment, run_shell, diagnose_error, analyze_model,
+# probe_model) remain available so the agent can finalize and launch.
+_CODE_EXPLORE_TOOLS = frozenset({
+    "read_file", "list_files", "web_search", "web_fetch",
+    "search_papers", "get_paper",
+})
+
+
+class QuotaExhausted(Exception):
+    """A provider's billing/quota window is exhausted (not a per-call rate limit).
+
+    Raised when a 429 carries a quota-window signal (GLM code 1308,
+    "使用上限"/"quota"/"reset" keywords). Unlike a per-minute rate-limit 429,
+    a quota-window 429 is ACCOUNT-WIDE: every model on the same API key will
+    fail identically until the window resets. Retrying the model chain just
+    burns N doomed calls. The dispatcher must instead cool the whole provider
+    until `reset_time`.
+    """
+
+    def __init__(self, message: str = "", reset_time=None, provider: str = ""):
+        super().__init__(message)
+        self.reset_time = reset_time   # datetime | None
+        self.provider = provider
+
+
+# Quota-window signals. A 429 whose error body matches any of these is a
+# window-exhaustion (permanent-until-reset), not a per-minute rate-limit.
+# GLM uses code 1308 + "使用上限"; other providers use "quota"/"reset".
+_QUOTA_CODE_PATTERNS = {"1308", "1220"}  # GLM quota codes observed in production
+_QUOTA_KEYWORDS = ("使用上限", "配额", "quota", "exhausted", "limit reached",
+                   "will reset", "将在", "重置")
+# Parse a reset timestamp like "2026-06-15 19:42:06" from the error message.
+_RESET_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+
+
+def _extract_error_body(exc: Exception) -> dict:
+    """Best-effort extraction of the structured error body from an SDK exception.
+
+    openai/zai APIStatusError variants expose the parsed JSON body in different
+    ways (``.body``, ``.error``, ``.response``). We probe each and also fall
+    back to scanning the string representation for a JSON object.
+    """
+    for attr in ("body", "error"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    # Fall back to scanning str(exc) for embedded JSON.
+    msg = str(exc)
+    m = re.search(r'\{.*\}', msg)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _classify_429(exc: Exception) -> dict:
+    """Classify a 429 error as rate-limit vs quota-window-exhausted.
+
+    Returns ``{"type": "rate_limit"|"quota_exhausted", "reset_time": datetime|None}``.
+    A quota-exhausted 429 carries the reset timestamp so the caller can cool
+    the provider until the window actually resets, instead of a fixed 300s.
+
+    Detection, in priority order:
+      1. Error body code in _QUOTA_CODE_PATTERNS (GLM 1308/1220).
+      2. Error body/message contains a quota keyword.
+    Falls back to ``rate_limit`` (transient) when no quota signal is found.
+    """
+    msg = str(exc)
+    body = _extract_error_body(exc)
+    # Drill into {"error": {"code": ..., "message": ...}} nesting.
+    err_obj = body.get("error", body) if isinstance(body, dict) else {}
+    code = str(err_obj.get("code", "")) if isinstance(err_obj, dict) else ""
+    inner_msg = str(err_obj.get("message", "")) if isinstance(err_obj, dict) else ""
+
+    # Scan BOTH the raw exception text and the nested error message for a
+    # reset timestamp (GLM puts it in error.message, not in the HTTP reason).
+    reset_time = None
+    for haystack in (inner_msg, msg):
+        m = _RESET_TIME_RE.search(haystack)
+        if m:
+            try:
+                reset_time = datetime.strptime(m.group(1).replace("T", " "),
+                                               "%Y-%m-%d %H:%M:%S")
+                break
+            except ValueError:
+                continue
+
+    combined = f"{code} {inner_msg} {msg}".lower()
+    if code in _QUOTA_CODE_PATTERNS:
+        return {"type": "quota_exhausted", "reset_time": reset_time}
+    for kw in _QUOTA_KEYWORDS:
+        if kw.lower() in combined:
+            return {"type": "quota_exhausted", "reset_time": reset_time}
+    return {"type": "rate_limit", "reset_time": None}
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Classify an exception as a PERMANENT provider error.
+
+    Permanent errors (auth failure, bad model name, forbidden) must not be
+    retried across the whole model×provider matrix — they will fail every
+    time and just burn rate-limit budget.
+
+    Quota-window-exhausted 429s are ALSO permanent-until-reset: the whole
+    API key shares one quota window, so every model in the chain fails
+    identically until the window resets. A per-minute rate-limit 429 stays
+    transient (retry the next model after a short backoff).
+
+    Uses the SDK exception's structured ``status_code`` attribute rather than
+    string-matching error messages (which is brittle: " 400" matches "400
+    samples" in a normal response). The openai and anthropic SDKs both expose
+    ``APIStatusError`` subclasses whose ``status_code`` reflects the real HTTP
+    status, so this is precise. Degrades to "transient" (returns False) when
+    the exception carries no status info, so unknown errors still get retried.
+    """
+    # 0. Quota-window 429 — permanent-until-reset (breaks the model chain).
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return _classify_429(exc)["type"] == "quota_exhausted"
+
+    # 1. Structured status_code attribute (openai/anthropic APIStatusError).
+    if status is not None:
+        # 4xx client errors are permanent (bad request/auth/forbidden/not found).
+        # 5xx server errors are transient.
+        if isinstance(status, int) and 400 <= status < 500:
+            return True
+
+    # 2. SDK type-based fallback (covers cases where status_code wasn't set
+    # but the exception type is unambiguous). Lazy-import so missing SDKs
+    # don't break the module.
+    permanent_types = ()
+    for mod_name in ("openai", "anthropic"):
+        try:
+            mod = __import__(mod_name)
+            permanent_types += (
+                mod.AuthenticationError,
+                mod.PermissionDeniedError,
+                mod.BadRequestError,
+                mod.NotFoundError,
+            )
+        except (ImportError, AttributeError):
+            pass
+    if permanent_types and isinstance(exc, permanent_types):
+        return True
+
+    return False
+
+
+# ── Lightweight synthetic response objects for GLM streaming mode ──
+# Defined at module level to avoid repeated class creation inside the tool loop.
+class _SyntheticMessage:
+    """Mimics openai.types.chat.ChatCompletionMessage for streaming assembly."""
+    __slots__ = ("content", "tool_calls")
+
+
+class _SyntheticChoice:
+    """Mimics openai.types.chat.Choice for streaming assembly."""
+    __slots__ = ("finish_reason", "message")
 
 
 class AgentDispatcher:
@@ -248,30 +438,43 @@ class AgentDispatcher:
         "idea": {
             "prompt_file": "idea_agent.md",
             "max_turns": 12,
-            "tools": ["search_papers", "get_paper", "write_file", "read_file"],
+            # NOTE: "tools" field removed (Fix D) — it was never read (always
+            # overridden by ToolRegistry.get_tools_for(agent_type)). Keeping it
+            # created a divergent second source of truth.
         },
         "code": {
             "prompt_file": "code_agent.md",
             "max_turns": 40,
-            "tools": ["run_shell", "run_python", "launch_experiment", "diagnose_error",
-                      "write_file", "read_file", "list_files", "analyze_model", "probe_model",
-                      "generate_diagnostic", "design_ablation"],
         },
         "writing": {
             "prompt_file": "writing_agent.md",
             "max_turns": 30,
-            "tools": ["write_file", "read_file", "list_files"],
         },
         "researcher": {
             "prompt_file": "researcher_agent.md",
             "max_turns": 30,
-            "tools": ["search_papers", "web_search", "web_fetch", "analyze_image",
-                      "write_file", "read_file", "list_files", "analyze_model"],
         },
     }
 
     # Provider health tracking for auto-failover
     _provider_health: dict[str, dict] = {}  # class-level: shared across instances
+
+    # Max output tokens per task tier. Shared by _call_openai_compatible and
+    # _call_anthropic so the two paths never drift (a previous bug gave the
+    # Anthropic 'code' tier only 8192 while OpenAI-compat got 16384, causing
+    # disproportionate write_file truncation on Claude).
+    _MAX_TOKENS_MAP = {
+        "code": 16384,       # Code agent: complex reasoning + long file writes
+        "writing": 16384,    # Writing agent: long report generation
+        "researcher": 16384, # Researcher: paper analysis, web fetch results
+        "idea": 16384,       # Idea agent: moderate output
+        "think": 16384,      # Leader think: structured JSON decision
+        "reflect": 16384,    # Leader reflect: deep cross-validation + root cause
+    }
+    _MAX_TOKENS_DEFAULT = 8192  # fallback when task_tier is None or unrecognized
+
+    # Lock guarding _provider_health (R3: class-level dict mutated without sync)
+    _provider_health_lock = __import__("threading").Lock()
 
     def __init__(self, model: str = "claude-sonnet-4-6", provider: str = "anthropic", max_steps: int = 3, tools=None):
         self.model = model
@@ -296,6 +499,7 @@ class AgentDispatcher:
                 "last_failure_time": 0,
                 "total_calls": 0,
                 "total_failures": 0,
+                "cooldown_until": 0,
             }
 
         logger.info(f"AgentDispatcher initialized: provider='{self.provider}', model='{self.model}'")
@@ -348,7 +552,7 @@ class AgentDispatcher:
         # Leader tasks (think/reflect) always use strong model
         # REFLECT with tools needs more turns for cross-validation reading
         effective_max_turns = 20 if (task == "reflect" and reflect_tools) else 10
-        response_text, _trace = self._call_llm(
+        response_text, trace = self._call_llm(
             system=system_prompt,
             messages=messages,
             tools=reflect_tools,
@@ -359,7 +563,14 @@ class AgentDispatcher:
         # Persist conversation for within-cycle coherence
         self._leader_history = messages + [{"role": "assistant", "content": response_text}]
 
-        return self._parse_leader_response(response_text)
+        result = self._parse_leader_response(response_text)
+        # F23 fix: previously the REFLECT trace was discarded (_trace). During
+        # REFLECT the Leader uses read_file/list_files for cross-validation,
+        # so the trace records what it actually inspected — valuable both for
+        # anti-deception checks and for downstream verification. Attach it.
+        if trace is not None and trace.calls:
+            result["leader_trace"] = trace.to_dict()
+        return result
 
     def dispatch_worker(self, agent_type: str, task: str, tools: list, max_turns_override: int = None) -> dict:
         """Dispatch a task to a worker agent.
@@ -385,7 +596,13 @@ class AgentDispatcher:
 
         config = self.WORKER_CONFIGS[agent_type]
         system_prompt = self._load_prompt(config["prompt_file"])
-        effective_max_turns = max_turns_override or config["max_turns"]
+        # F24 fix: `or` swallows a legitimate override of 0. Use explicit None
+        # check so 0 is honored (though 0 is unusual, it shouldn't silently
+        # become the config default).
+        effective_max_turns = (
+            max_turns_override if max_turns_override is not None
+            else config["max_turns"]
+        )
 
         logger.info(f"Dispatching {agent_type} agent: {task[:100]}...")
 
@@ -397,7 +614,15 @@ class AgentDispatcher:
             task_tier=agent_type,  # "idea"/"researcher" → strong, "code"/"writing" → fast
         )
 
-        result = self._parse_worker_response(response_text, agent_type, trace)
+        result = self._parse_worker_response(response_text, agent_type, trace,
+                                             task=task)
+
+        if result.get("convergence_failed"):
+            logger.warning(
+                "Code dispatch failed to converge: task mentioned experiment/train "
+                "but launch_experiment was never called."
+            )
+
         logger.info(f"Worker {agent_type} completed: {str(result)[:200]}")
         return result
 
@@ -443,6 +668,7 @@ class AgentDispatcher:
 
             # ── Level 1: Model-level failover chain ──
             model_chain = self._resolve_model_chain(provider_config, task_tier)
+            quota_cooled_this_provider = False
 
             for model in model_chain:
                 try:
@@ -456,13 +682,11 @@ class AgentDispatcher:
                         task_tier=task_tier,
                     )
 
-                    # Check if the response indicates an API error (not a tool result)
-                    try:
-                        parsed = json.loads(text)
-                        if isinstance(parsed, dict) and parsed.get("error") and "API" in str(parsed.get("error", "")):
-                            raise RuntimeError(f"API returned error: {text[:200]}")
-                    except (json.JSONDecodeError, TypeError):
-                        pass  # Not JSON — likely a normal text response
+                    # B2 sentinel check moved to the end of _call_llm. The old
+                    # "API" text-sniff here (R4) was removed: it discarded
+                    # legitimate responses whose JSON happened to mention "API"
+                    # in an error field (e.g. a code agent writing
+                    # {"error":"third-party API down"}), forcing false failover.
 
                     # Success — reset failure counter and return
                     self._record_provider_success(provider_key)
@@ -470,14 +694,52 @@ class AgentDispatcher:
 
                 except Exception as e:
                     last_error = e
+                    # ── Quota-window 429: break the model chain immediately ──
+                    # The whole API key shares one quota window, so every model
+                    # in this provider's chain will 429 identically. Cooling
+                    # this ONE provider until reset and trying the NEXT provider
+                    # (which has its own quota) is correct. Do NOT burn the
+                    # remaining 5 models, and do NOT re-add this provider.
+                    if getattr(e, "status_code", None) == 429 and \
+                            _classify_429(e)["type"] == "quota_exhausted":
+                        info = _classify_429(e)
+                        reset_time = info.get("reset_time")
+                        self._record_provider_failure(
+                            provider_key, str(e), cooldown_until=reset_time,
+                        )
+                        logger.warning(
+                            f"Provider {provider_key} QUOTA EXHAUSTED"
+                            f"{f' until {reset_time}' if reset_time else ''}. "
+                            f"Cooling whole provider (not retrying its model chain). "
+                            f"Trying next provider..."
+                        )
+                        # Mark so the post-loop soft-failure record (which
+                        # clears cooldown_until) is skipped below.
+                        quota_cooled_this_provider = True
+                        break  # exit model loop → next provider in outer loop
+
+                    # ── Other permanent errors: abort the whole matrix ──
+                    if _is_permanent_error(e):
+                        logger.error(
+                            f"Provider {provider_key} model {model} returned a "
+                            f"PERMANENT error ({type(e).__name__}): {e}. "
+                            f"Aborting failover chain — fix the config/key."
+                        )
+                        self._record_provider_failure(provider_key, str(e))
+                        raise
                     logger.warning(
-                        f"Provider {provider_key} model {model} failed: {e}. "
+                        f"Provider {provider_key} model {model} failed "
+                        f"(transient, {type(e).__name__}): {e}. "
                         f"Trying next model in chain..."
                     )
                     continue
 
-            # All models in this provider's chain failed
-            self._record_provider_failure(provider_key, str(last_error))
+            # All models in this provider's chain failed.
+            # If the chain was broken by a quota 429, the cooldown was already
+            # recorded with its reset deadline — skip this soft-failure record
+            # (it would clear cooldown_until, defeating the quota cooldown).
+            if not quota_cooled_this_provider:
+                self._record_provider_failure(provider_key, str(last_error))
             logger.warning(
                 f"All models failed for provider {provider_key}. "
                 f"Trying next provider..."
@@ -495,10 +757,18 @@ class AgentDispatcher:
         if self.provider == "anthropic":
             text = self._call_anthropic(system, messages, tools, max_turns, trace, task_tier=task_tier)
         elif self.provider == "openai":
+            # OPENAI_API_KEY resolved here — _call_openai_compatible now raises
+            # on missing api_key (B2 rework), so we must supply a real key.
+            _openai_key = os.environ.get("OPENAI_API_KEY")
+            if not _openai_key:
+                raise RuntimeError(
+                    "All token_plan providers failed and OPENAI_API_KEY is not set. "
+                    "Set at least one provider key."
+                )
             text = self._call_openai_compatible(
                 system=system, messages=messages, tools=tools,
                 max_turns=max_turns, trace=trace,
-                base_url=None, api_key=None, provider_label="openai",
+                base_url=None, api_key=_openai_key, provider_label="openai",
                 model=self.model,
                 task_tier=task_tier,
             )
@@ -509,6 +779,11 @@ class AgentDispatcher:
                 f"Set a valid API key or configure a failover provider."
             )
 
+        # B2 rework: the old sentinel that sniffed for {"error"...} in the
+        # returned text is gone. The root cause — _call_openai_compatible
+        # returning an error JSON string instead of raising — is fixed at
+        # source (api_key check now raises). All provider paths now either
+        # return genuine LLM output or raise; no downstream guessing needed.
         return text, trace
 
     def _resolve_model_chain(self, provider_config: dict, task_tier: str = None) -> list[str]:
@@ -536,78 +811,143 @@ class AgentDispatcher:
                 return list(chain)
             return [provider_config["fast_model"]]
 
-    def _resolve_model_for_provider(self, provider_key: str, provider_config: dict, task_tier: str = None) -> str:
-        """Resolve which model to use for a SPECIFIC provider.
-
-        Each provider has its own strong/fast models. This ensures we never
-        send an ALI model name to the GLM API (or vice versa).
-
-        Routing rules:
-        - GLM primary: strong=glm-5.1, fast=glm-5
-        - ALI fallback: strong=qwen3.7-max, fast=qwen3.6-plus
-        - If user set a specific model (not auto/default), use it only if
-          it's available on that provider.
-        """
-        # Check if the user explicitly chose a model (not auto/default)
-        if self.model not in ("default", "auto"):
-            # User chose a specific model — use it if available on this provider
-            if self.model in provider_config.get("models", []):
-                return self.model
-            # Model not available on this provider, fall through to tier logic
-
-        # Tiered selection per provider (returns first model in chain)
-        chain = self._resolve_model_chain(provider_config, task_tier)
-        return chain[0]
-
     def _build_provider_queue(self) -> list[tuple[str, dict]]:
         """Build ordered list of (provider_key, config) to try.
 
-        Primary provider first, then failover candidates.
-        Skips providers that are in cooldown (too many recent failures).
+        Primary provider first, then failover candidates. Skips providers that
+        are in cooldown. A provider is in cooldown if EITHER:
+          - it has a ``cooldown_until`` epoch set (quota-window exhaustion) and
+            ``time.time() < cooldown_until``, OR
+          - it has 3+ consecutive failures within the last 5 minutes.
+
+        Quota-cooled providers are NEVER re-added as a "last resort" — re-adding
+        them just burns doomed calls against an exhausted quota window. Only
+        providers cooled by the softer 3-strike rule can be re-added if the
+        queue would otherwise be empty.
         """
         if not self._token_plan_config:
             return []
 
-        queue = []
-        # Always try primary provider first
-        primary = self.provider
-        if primary in TOKEN_PLAN_PROVIDERS:
-            queue.append((primary, TOKEN_PLAN_PROVIDERS[primary]))
+        def _in_cooldown(key: str) -> tuple[bool, bool]:
+            """Return (in_cooldown, is_quota_cooldown)."""
+            health = AgentDispatcher._provider_health.get(key, {})
+            # Quota-window cooldown: absolute deadline, never bypassed.
+            cooldown_until = health.get("cooldown_until", 0)
+            if cooldown_until and time.time() < cooldown_until:
+                return True, True
+            # Soft 3-strike cooldown: 3+ consecutive failures within 5 min.
+            if health.get("consecutive_failures", 0) >= 3:
+                last_fail = health.get("last_failure_time", 0)
+                if time.time() - last_fail < 300:
+                    return True, False
+            return False, False
 
-        # Then failover providers
+        queue = []
+        primary = self.provider
+        primary_skipped = False
+        # Try primary first, but respect cooldown. A quota-exhausted primary
+        # must not block the queue every cycle.
+        if primary in TOKEN_PLAN_PROVIDERS:
+            cooled, is_quota = _in_cooldown(primary)
+            if cooled:
+                logger.debug(
+                    f"Primary {primary} in cooldown"
+                    f"{' (quota-exhausted)' if is_quota else ''}; trying failovers first."
+                )
+                primary_skipped = True
+            else:
+                queue.append((primary, TOKEN_PLAN_PROVIDERS[primary]))
+
+        # Failover providers (also respect cooldown)
         for key in TOKEN_PLAN_FAILOVER_ORDER:
             if key != primary and key in TOKEN_PLAN_PROVIDERS:
-                health = AgentDispatcher._provider_health.get(key, {})
-                # Skip if in cooldown (3+ consecutive failures within last 5 min)
-                if health.get("consecutive_failures", 0) >= 3:
-                    last_fail = health.get("last_failure_time", 0)
-                    if time.time() - last_fail < 300:  # 5 min cooldown
-                        logger.debug(f"Skipping {key}: in cooldown (3+ recent failures)")
-                        continue
-                    # Cooldown expired, give it another chance
+                cooled, is_quota = _in_cooldown(key)
+                if cooled:
+                    logger.debug(f"Skipping {key}: in cooldown"
+                                 f"{' (quota)' if is_quota else ' (3+ failures)'}")
+                    continue
                 queue.append((key, TOKEN_PLAN_PROVIDERS[key]))
+
+        # Last resort: if the queue is empty, re-add the primary ONLY IF it is
+        # not quota-cooled. A quota-exhausted provider must never be retried
+        # before its window resets — doing so just burns more doomed calls.
+        if not queue and primary in TOKEN_PLAN_PROVIDERS:
+            _, is_quota = _in_cooldown(primary)
+            if is_quota:
+                logger.warning(
+                    f"All providers unavailable and primary {primary} is "
+                    f"quota-exhausted — refusing to retry it. Dispatch will fail "
+                    f"until a quota window resets."
+                )
+            else:
+                logger.debug(f"All providers in soft-cooldown; retrying primary {primary}.")
+                queue.append((primary, TOKEN_PLAN_PROVIDERS[primary]))
 
         return queue
 
     def _record_provider_success(self, provider_key: str):
-        """Record a successful API call, resetting failure counter."""
-        health = AgentDispatcher._provider_health.get(provider_key)
-        if health:
+        """Record a successful API call, resetting failure counter.
+
+        B4 fix: lazily initialize the health dict so the success counter and
+        failure-reset actually take effect for providers that weren't pre-seeded
+        in __init__ (previously this no-op'd silently when health was missing).
+        A success also clears any quota-window cooldown (the window evidently
+        reset, or a different key is in use).
+        """
+        with AgentDispatcher._provider_health_lock:
+            health = AgentDispatcher._provider_health.get(provider_key)
+            if health is None:
+                health = {
+                    "consecutive_failures": 0, "last_failure_time": 0,
+                    "total_calls": 0, "total_failures": 0,
+                    "cooldown_until": 0,
+                }
+                AgentDispatcher._provider_health[provider_key] = health
             health["consecutive_failures"] = 0
+            health["cooldown_until"] = 0
             health["total_calls"] += 1
 
-    def _record_provider_failure(self, provider_key: str, error: str):
-        """Record a failed API call, incrementing failure counter."""
-        if provider_key not in AgentDispatcher._provider_health:
-            AgentDispatcher._provider_health[provider_key] = {
-                "consecutive_failures": 0, "last_failure_time": 0,
-                "total_calls": 0, "total_failures": 0,
-            }
-        health = AgentDispatcher._provider_health[provider_key]
-        health["consecutive_failures"] += 1
-        health["last_failure_time"] = time.time()
-        health["total_calls"] += 1
-        health["total_failures"] += 1
+    def _record_provider_failure(self, provider_key: str, error: str,
+                                 cooldown_until=None):
+        """Record a failed API call, incrementing failure counter.
+
+        R3 fix: all mutations of the class-level _provider_health dict are now
+        guarded by _provider_health_lock to prevent lost-update races when
+        multiple dispatchers run concurrently.
+
+        ``cooldown_until``: if given (a datetime), sets an absolute epoch
+        deadline after which the provider may be retried. Used for
+        quota-window exhaustion where the soft 3-strike/5-min rule is far too
+        short (GLM windows are ~5 hours). If parsing the reset time failed, a
+        conservative 1-hour fallback is applied.
+        """
+        with AgentDispatcher._provider_health_lock:
+            if provider_key not in AgentDispatcher._provider_health:
+                AgentDispatcher._provider_health[provider_key] = {
+                    "consecutive_failures": 0, "last_failure_time": 0,
+                    "total_calls": 0, "total_failures": 0,
+                    "cooldown_until": 0,
+                }
+            health = AgentDispatcher._provider_health[provider_key]
+            health["consecutive_failures"] += 1
+            health["last_failure_time"] = time.time()
+            health["total_calls"] += 1
+            health["total_failures"] += 1
+            if cooldown_until is not None:
+                # Convert datetime → epoch. Fallback: 1 hour from now if the
+                # parsed reset time is in the past or unparseable.
+                try:
+                    deadline = cooldown_until.timestamp()
+                    if deadline <= time.time():
+                        deadline = time.time() + 3600  # conservative 1h
+                except (OSError, ValueError):
+                    deadline = time.time() + 3600
+                health["cooldown_until"] = deadline
+            else:
+                # A normal (non-quota) failure does not set an absolute deadline;
+                # the soft 3-strike rule governs. Keep cooldown_until cleared so
+                # a prior quota window doesn't linger after it expires.
+                health["cooldown_until"] = 0
 
     # ─────────────────────────────────────────────────
     # Shared OpenAI-compatible provider (used by token_plan, qwen, openai)
@@ -640,15 +980,7 @@ class AgentDispatcher:
         # Dynamic max_tokens: code agent needs more output space than leader
         # Leader tasks produce short JSON (~2K), code agent produces long tool args
         # This prevents write_file content truncation for code agent tasks.
-        _MAX_TOKENS_MAP = {
-            "code": 16384,      # Code agent: complex reasoning + long file writes (upgraded from 8192)
-            "writing": 16384,   # Writing agent: long report generation
-            "researcher": 16384, # Researcher: paper analysis, web fetch results
-            "idea": 16384,      # Idea agent: moderate output
-            "think": 16384,     # Leader think: structured JSON decision
-            "reflect": 16384,   # Leader reflect: deep cross-validation + root cause analysis
-        }
-        effective_max_tokens = _MAX_TOKENS_MAP.get(task_tier, 4096)
+        effective_max_tokens = self._MAX_TOKENS_MAP.get(task_tier, self._MAX_TOKENS_DEFAULT)
 
         logger.info(
             f"Calling {provider_label} API: model={effective_model}, "
@@ -658,16 +990,49 @@ class AgentDispatcher:
             import openai
 
             if not api_key:
-                logger.error(f"API key not configured for {provider_label}")
-                return json.dumps({"error": f"API key not configured for {provider_label}"})
+                # Raise instead of returning an error JSON string. The old
+                # behavior (return {"error": ...}) was a contract violation:
+                # callers treated the returned string as a valid LLM response,
+                # and _parse_leader_response would turn it into a "run an
+                # experiment" decision with the error message as the task.
+                # Raising lets _call_llm's failover handle it properly.
+                raise RuntimeError(f"API key not configured for {provider_label}")
 
-            kwargs = {
-                "timeout": 120.0,  # 2 min total (was 5 min — causes long hangs)
-                "max_retries": 1,  # 1 retry (vs default 2)
-            }
-            if base_url:
-                kwargs["base_url"] = base_url
-            client = openai.OpenAI(api_key=api_key, **kwargs)
+            # ── Detect GLM provider ──
+            # Use zai.ZhipuAiClient for GLM (supports thinking, tool_stream)
+            # Use openai.OpenAI for all other providers
+            is_glm = "bigmodel.cn" in (base_url or "")
+
+            if is_glm:
+                from zai import ZhipuAiClient
+                # CRITICAL: ZhipuAiClient() with no base_url defaults to the
+                # standard PAAS endpoint (.../api/paas/v4). Coding Plan keys
+                # MUST hit .../api/coding/paas/v4 or billing will silently go
+                # to the wrong quota (verified: client.base_url reflects the
+                # passed value, and a wrong endpoint returns 404). Guard so a
+                # future config change can't silently reroute billing.
+                if not base_url or "/coding/" not in base_url:
+                    logger.error(
+                        f"GLM provider selected but base_url is not a Coding "
+                        f"Plan endpoint (got {base_url!r}). Coding Plan keys "
+                        f"require '/api/coding/paas/v4'. Aborting to avoid "
+                        f"billing the wrong quota."
+                    )
+                    return json.dumps({
+                        "error": (
+                            "GLM Coding Plan endpoint misconfigured: base_url must "
+                            "contain '/coding/'. Check TOKEN_PLAN_PROVIDERS."
+                        )
+                    })
+                client = ZhipuAiClient(api_key=api_key, base_url=base_url)
+            else:
+                kwargs = {
+                    "timeout": 120.0,
+                    "max_retries": 1,
+                }
+                if base_url:
+                    kwargs["base_url"] = base_url
+                client = openai.OpenAI(api_key=api_key, **kwargs)
 
             # Build messages with system prompt
             # GLM coding plan requires non-empty system content (returns 400 otherwise)
@@ -701,6 +1066,12 @@ class AgentDispatcher:
                 }]
                 dummy_tool = True
 
+            # ── GLM streaming + thinking support ──
+            # zai.ZhipuAiClient supports: thinking={"type":"enabled"/"disabled"},
+            # stream=True, tool_stream=True.
+            # GLM-5.2/5.1/5 have built-in thinking by default (reasoning_content auto-returned).
+            # For fast/cheap tasks (writing), disable thinking to save tokens.
+
             # Tool execution loop
             if effective_tools:
                 tool_map = {t["name"]: t for t in effective_tools}
@@ -716,15 +1087,119 @@ class AgentDispatcher:
                 consecutive_list_files = 0  # Track consecutive list_files calls
 
                 for turn in range(max_turns):
-                    response = client.chat.completions.create(
+                    # Build API call kwargs
+                    create_kwargs = dict(
                         model=effective_model,
                         max_tokens=effective_max_tokens,
                         messages=api_messages,
                         tools=list(available_tools.values()) if available_tools else None,
                         tool_choice="auto",
                     )
+                    if is_glm:
+                        create_kwargs["stream"] = True
+                        create_kwargs["tool_stream"] = True
+                        # Disable thinking for fast-tier tasks (writing) to save tokens
+                        if task_tier in ("writing",):
+                            create_kwargs["thinking"] = {"type": "disabled"}
+                            enable_thinking = False
+                        else:
+                            enable_thinking = True
 
-                    choice = response.choices[0]
+                    if is_glm:
+                        # ── GLM Streaming Mode ──
+                        response_stream = client.chat.completions.create(**create_kwargs)
+                        reasoning_parts = []
+                        content_parts = []
+                        final_tool_calls = {}  # idx -> accumulated tool_call
+                        finish_reason = None
+
+                        try:
+                            for chunk in response_stream:
+                                if not chunk.choices:
+                                    continue
+                                delta = chunk.choices[0].delta
+                                # Accumulate reasoning
+                                rc = getattr(delta, 'reasoning_content', None)
+                                if rc:
+                                    reasoning_parts.append(rc)
+                                # Accumulate content
+                                dc = getattr(delta, 'content', None)
+                                if dc:
+                                    content_parts.append(dc)
+                                # Accumulate tool calls
+                                # NOTE: stream deltas are incremental. The first
+                                # fragment carries id + function.name + start of
+                                # arguments; continuation fragments carry only
+                                # index + function.arguments (and function may be
+                                # None on some fragments). Guard accordingly.
+                                tcs = getattr(delta, 'tool_calls', None)
+                                if tcs:
+                                    for tc in tcs:
+                                        idx = getattr(tc, 'index', None)
+                                        if idx is None:
+                                            continue
+                                        fn = getattr(tc, 'function', None)
+                                        if idx not in final_tool_calls:
+                                            # First fragment for this call
+                                            tc_id = getattr(tc, 'id', None) or f"synthetic_tc_{idx}_{turn}"
+                                            fn_name = getattr(fn, 'name', None) if fn else None
+                                            fn_args = (getattr(fn, 'arguments', None) or "") if fn else ""
+                                            final_tool_calls[idx] = tc
+                                            tc.id = tc_id
+                                            if fn is not None:
+                                                if not getattr(fn, 'name', None):
+                                                    fn.name = fn_name
+                                                fn.arguments = fn_args
+                                        else:
+                                            # Continuation fragment: append args only
+                                            if fn is not None and getattr(fn, 'arguments', None):
+                                                base_fn = getattr(final_tool_calls[idx], 'function', None)
+                                                if base_fn is not None:
+                                                    base_fn.arguments = (getattr(base_fn, 'arguments', None) or "") + fn.arguments
+
+                                # Capture finish_reason from last chunk
+                                fr = getattr(chunk.choices[0], 'finish_reason', None)
+                                if fr:
+                                    finish_reason = fr
+                        except Exception as stream_err:
+                            partial_content = "".join(content_parts)
+                            logger.warning(
+                                f"GLM stream interrupted: {stream_err}. "
+                                f"Partial content: {partial_content[:200]}..."
+                            )
+                            raise  # Re-raise for failover
+
+                        reasoning_content = "".join(reasoning_parts)
+                        stream_content = "".join(content_parts)
+
+                        # Log reasoning if present (or warn if thinking enabled but empty)
+                        if reasoning_content:
+                            logger.info(f"[{effective_model} thinking] {reasoning_content[:200]}...")
+                        elif enable_thinking:
+                            logger.debug(f"[{effective_model}] thinking enabled but no reasoning_content returned")
+
+                        # Warn on completely empty response
+                        if not stream_content and not final_tool_calls:
+                            logger.warning(f"GLM stream returned empty: no content, no tool_calls")
+
+                        # Build a synthetic response-like object for downstream logic
+                        syn_msg = _SyntheticMessage()
+                        syn_msg.content = stream_content or None
+                        syn_msg.tool_calls = list(final_tool_calls.values()) if final_tool_calls else None
+
+                        syn_choice = _SyntheticChoice()
+                        # Use tool_calls presence as primary signal, not finish_reason
+                        syn_choice.finish_reason = ("tool_calls" if final_tool_calls
+                                                    else (finish_reason or "stop"))
+                        syn_choice.message = syn_msg
+
+                        # Adapt to non-streaming logic below
+                        choice = syn_choice
+                    else:
+                        # ── Non-GLM: standard synchronous call ──
+                        response = client.chat.completions.create(**create_kwargs)
+                        choice = response.choices[0]
+
                     if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
                         # ── Collect ALL tool_calls into ONE assistant message ──
                         # OpenAI protocol requires exactly one assistant message with
@@ -767,13 +1242,36 @@ class AgentDispatcher:
                                 logger.warning(f"Tool args for {func_name} is {type(func_args).__name__}, wrapping in dict")
                                 func_args = {"raw": func_args}
 
+                            # B7: For write_file, repaired args that LOST the
+                            # content key (Strategy 2 truncation can drop the
+                            # whole trailing field) must be rejected outright —
+                            # otherwise write_file would silently write an empty
+                            # file. The previous guard below only fired when
+                            # "content" was present, so a missing key slipped
+                            # through and wrote garbage.
+                            if repaired and func_name == "write_file":
+                                if not isinstance(func_args, dict) or "content" not in func_args or not func_args.get("content"):
+                                    logger.warning(
+                                        f"Rejecting write_file: repaired args lost the content "
+                                        f"key (truncation during max_tokens). Path="
+                                        f"{func_args.get('path', '?') if isinstance(func_args, dict) else '?'}."
+                                    )
+                                    pending_results.append((
+                                        tool_call.id, func_name,
+                                        json.dumps({
+                                            "error": "File content was LOST to max_tokens truncation. "
+                                                     "The file was NOT written. Please split into smaller chunks."
+                                        })
+                                    ))
+                                    continue
+
                             # For write_file with repaired args, reject if content appears truncated
                             if repaired and func_name == "write_file" and isinstance(func_args, dict) and "content" in func_args:
-                                content = func_args["content"]
-                                if content and not content.rstrip().endswith(('\n', '}', ']', ')', '"""', "'''", '`', '.')):
+                                file_content = func_args["content"]
+                                if file_content and not file_content.rstrip().endswith(('\n', '}', ']', ')', '"""', "'''", '`', '.')):
                                     logger.warning(
                                         f"Rejecting write_file to {func_args.get('path','?')}: "
-                                        f"content appears truncated (ends with: ...{content[-50:]})"
+                                        f"content appears truncated (ends with: ...{file_content[-50:]})"
                                     )
                                     pending_results.append((
                                         tool_call.id, func_name,
@@ -797,6 +1295,32 @@ class AgentDispatcher:
                                     return str(func_args)
 
                             if func_name in tool_map:
+                                # ── Hard convergence gate (Phase 2) ──
+                                # Once a code agent passes 60% of its turn budget,
+                                # block exploration-only tools so the remaining
+                                # turns are spent converging (write_file,
+                                # launch_experiment, diagnose_error). This fixes
+                                # the observed pathology where 59.7% of tool
+                                # calls were read_file/list_files and 0% were
+                                # launch_experiment — the agent explored until
+                                # the budget ran out without ever launching.
+                                if task_tier == "code" and \
+                                        turn >= max_turns * 0.6 and \
+                                        func_name in _CODE_EXPLORE_TOOLS:
+                                    tool_result = json.dumps({
+                                        "error": (
+                                            f"Turn {turn+1}/{max_turns}: past 60% budget. "
+                                            f"'{func_name}' is blocked — stop exploring. "
+                                            f"You MUST now converge: use write_file to finalize "
+                                            f"the script, then launch_experiment to run it. "
+                                            f"Only write_file / launch_experiment / diagnose_error "
+                                            f"are allowed past this point."
+                                        )
+                                    })
+                                    pending_results.append(
+                                        (tool_call.id, func_name, str(tool_result))
+                                    )
+                                    continue
                                 # ── Rate-limit consecutive list_files calls ──
                                 if func_name == "list_files":
                                     consecutive_list_files += 1
@@ -824,6 +1348,7 @@ class AgentDispatcher:
                         # ── Append ONE assistant message with ALL tool_calls ──
                         api_messages.append({
                             "role": "assistant",
+                            "content": None,
                             "tool_calls": assistant_tool_calls,
                         })
 
@@ -878,16 +1403,61 @@ class AgentDispatcher:
                 return self._find_last_assistant_text(api_messages, "Max turns reached")
             else:
                 # No tools, simple call
-                response = client.chat.completions.create(
+                create_kwargs = dict(
                     model=effective_model,
                     max_tokens=effective_max_tokens,
                     messages=api_messages,
                 )
-                return response.choices[0].message.content if response.choices else ""
+                if is_glm:
+                    create_kwargs["stream"] = True
+                    if task_tier in ("writing",):
+                        create_kwargs["thinking"] = {"type": "disabled"}
+
+                if is_glm:
+                    # ── GLM Streaming (no tools) ──
+                    response_stream = client.chat.completions.create(**create_kwargs)
+                    reasoning_parts = []
+                    content_parts = []
+                    try:
+                        for chunk in response_stream:
+                            if not chunk.choices:
+                                continue
+                            delta = chunk.choices[0].delta
+                            rc = getattr(delta, 'reasoning_content', None)
+                            if rc:
+                                reasoning_parts.append(rc)
+                            dc = getattr(delta, 'content', None)
+                            if dc:
+                                content_parts.append(dc)
+                    except Exception as stream_err:
+                        logger.warning(f"GLM stream interrupted (no-tools path): {stream_err}")
+                        raise
+                    reasoning_content = "".join(reasoning_parts)
+                    stream_content = "".join(content_parts)
+                    if reasoning_content:
+                        logger.info(f"[{effective_model} thinking] {reasoning_content[:200]}...")
+                    if not stream_content:
+                        # Empty stream (no content, no error) — likely a server
+                        # hiccup. Returning "" would be misread downstream as a
+                        # valid empty leader decision. Raise so _call_llm can
+                        # fail over to the next provider/model.
+                        raise RuntimeError(
+                            f"GLM {effective_model} returned an empty stream "
+                            f"(no content). Triggering failover."
+                        )
+                    return stream_content
+                else:
+                    response = client.chat.completions.create(**create_kwargs)
+                    return response.choices[0].message.content if response.choices else ""
 
         except ImportError:
-            logger.warning("openai package not installed. Using mock response.")
-            return json.dumps({"action": "wait", "reason": "LLM not available"})
+            # R7 fix: previously returned a mock {"action":"wait"} string that
+            # _parse_leader_response mistook for a legitimate "wait" decision,
+            # making an unattended agent hang silently forever. Raise so the
+            # caller sees a real error and can surface it.
+            raise RuntimeError(
+                "openai package not installed. Install with: pip install openai"
+            )
         except Exception as e:
             logger.error(f"{provider_label} API call failed: {e}")
             # Re-raise so _call_llm can try failover
@@ -899,18 +1469,21 @@ class AgentDispatcher:
 
     def _call_anthropic(self, system: str, messages: list, tools: list = None, max_turns: int = 10, trace: ToolTrace = None, task_tier: str = None) -> str:
         """Call Anthropic Claude API with tool execution support."""
-        # Dynamic max_tokens for Anthropic
-        _MAX_TOKENS_MAP = {
-            "code": 8192, "writing": 16384, "researcher": 16384,
-            "idea": 16384, "think": 16384, "reflect": 16384,
-        }
-        effective_max_tokens = _MAX_TOKENS_MAP.get(task_tier, 16384)
+        # Use the shared class-level token map (B5 fix: previously this was a
+        # local copy where 'code' was only 8192 vs 16384 elsewhere, causing
+        # disproportionate write_file truncation on Claude).
+        effective_max_tokens = self._MAX_TOKENS_MAP.get(task_tier, self._MAX_TOKENS_DEFAULT)
 
         logger.info(f"Calling Anthropic Claude API: model={self.model}, messages={len(messages)}, tools={bool(tools)}")
         try:
             import anthropic
 
-            client = anthropic.Anthropic()
+            # R8 fix: explicit timeout/retries to match the OpenAI-compatible
+            # path. The SDK defaults (600s timeout, 2 retries) would block a
+            # whole cycle for 10+ minutes on a hung Claude call with no
+            # failover. Anthropic path has no provider-level failover, so a
+            # bounded timeout is the only protection against indefinite hangs.
+            client = anthropic.Anthropic(timeout=120.0, max_retries=1)
 
             api_messages = []
             for msg in messages:
@@ -940,55 +1513,75 @@ class AgentDispatcher:
                         for block in (content or [])
                     )
 
-                    if has_tool_use:
-                        # Collect text blocks for the conversation history
-                        text_parts = []
-                        for block in content:
-                            if hasattr(block, "type") and block.type == "text":
-                                text_parts.append(block.text)
-                            elif hasattr(block, "type") and block.type == "tool_use":
-                                func_name = block.name
-                                func_args = block.input
-                                logger.info(f"Executing tool: {func_name}")
-
-                                if func_name in tool_map:
-                                    tool_result = self._execute_tool_with_trace(func_name, func_args, trace)
-                                    api_messages.append({"role": "user", "content": [{
-                                        "type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": str(tool_result)[:8000]
-                                    }]})
-                                else:
-                                    api_messages.append({"role": "user", "content": [{
-                                        "type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": json.dumps({"error": f"Unknown tool: {func_name}"})
-                                    }]})
-
-                        # If there were text blocks alongside tool_use, log them
-                        if text_parts:
-                            logger.debug(f"Anthropic text alongside tool_use: {' '.join(text_parts)[:200]}")
-                        continue
-                    else:
+                    if not has_tool_use:
                         # No tool calls — extract text from content blocks
-                        text_parts = []
-                        for block in (content or []):
-                            if hasattr(block, "type") and block.type == "text":
-                                text_parts.append(block.text)
+                        text_parts = [
+                            block.text for block in (content or [])
+                            if hasattr(block, "type") and block.type == "text"
+                        ]
                         return "\n".join(text_parts) if text_parts else ""
+
+                    # Has tool_use: the Anthropic Messages API requires every
+                    # tool_result user message to be preceded by the matching
+                    # assistant tool_use turn. Append the assistant turn FIRST
+                    # (right after receiving it), then append tool_result
+                    # messages. This keeps ordering naturally correct without
+                    # any peel-off/re-insert gymnastics. Serialize SDK blocks
+                    # to plain dicts so they round-trip through the next request.
+                    assistant_blocks = []
+                    for block in content:
+                        if hasattr(block, "type") and block.type == "text":
+                            assistant_blocks.append({"type": "text", "text": block.text})
+                        elif hasattr(block, "type") and block.type == "tool_use":
+                            assistant_blocks.append({
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            })
+                    api_messages.append({"role": "assistant", "content": assistant_blocks})
+
+                    # Now execute each tool_use and append tool_result messages
+                    for block in content:
+                        if not (hasattr(block, "type") and block.type == "tool_use"):
+                            continue
+                        func_name = block.name
+                        func_args = block.input
+                        logger.info(f"Executing tool: {func_name}")
+
+                        if func_name in tool_map:
+                            tool_result = self._execute_tool_with_trace(func_name, func_args, trace)
+                            result_content = str(tool_result)[:8000]
+                        else:
+                            result_content = json.dumps({"error": f"Unknown tool: {func_name}"})
+                        api_messages.append({"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_content,
+                        }]})
+
+                    continue
 
                 # Max turns reached — find last assistant text
                 return self._find_last_assistant_text(api_messages, "Max turns reached")
             else:
                 response = client.messages.create(**kwargs)
-                return response.content[0].text if response.content else ""
+                # No-tools path: extract text from content blocks (handles
+                # thinking blocks gracefully by only joining text blocks).
+                text_parts = [
+                    block.text for block in (response.content or [])
+                    if hasattr(block, "type") and block.type == "text"
+                ]
+                return "\n".join(text_parts) if text_parts else ""
 
         except ImportError:
-            logger.warning("anthropic package not installed. Trying openai fallback.")
-            return self._call_openai_compatible(
-                system=system, messages=messages, tools=tools,
-                max_turns=max_turns, trace=trace,
-                base_url=None, api_key=None, provider_label="openai_fallback",
+            # R7 fix: previously fell back to _call_openai_compatible with
+            # api_key=None, which returned an error JSON that downstream code
+            # mistook for a valid leader response (B2 chain). Raise so the
+            # caller sees a real, actionable error.
+            raise RuntimeError(
+                "anthropic package not installed but provider='anthropic'. "
+                "Install with: pip install anthropic"
             )
 
     # ─────────────────────────────────────────────────
@@ -997,49 +1590,107 @@ class AgentDispatcher:
 
     @staticmethod
     def _repair_json_args(raw: str) -> dict:
-        """Attempt to recover a dict from truncated JSON tool arguments.
+        """Recover a dict from (possibly truncated) LLM tool arguments.
 
-        LLM output can be cut off mid-string (e.g. by max_tokens), producing
-        invalid JSON like: {"path": "src/model.py", "content": "def foo():\n  r
-        This tries several recovery strategies.
+        LLM output can be cut off mid-string by max_tokens, producing invalid
+        JSON like ``{"path": "src/model.py", "content": "def foo():\\n  r``.
+
+        Strategy, in order of safety:
+        1. ``raw_decode`` — parse a complete leading object, ignoring trailing
+           junk. Handles "complete JSON + prose" and "multiple objects, take
+           first" with zero heuristics.
+        2. Close obvious truncation — append common closers and try json.loads.
+        3. Truncate-back — scan for the last structural ``,``, drop everything
+           after it, close the object. The scan is string-aware (tracks
+           in-string + escapes) so a ``,`` *inside* a string value (e.g. code
+           containing ``print("a", b)``) is never mistaken for a structural
+           separator. This replaces the old ``rfind('",')`` which corrupted
+           file contents by matching inside strings.
+        4. Give up → empty dict (tool fails with a clear error).
+
+        Returns {} on failure; callers (write_file guard) reject repaired args
+        that lost expected keys.
         """
         if not raw:
             return {}
 
-        # Strategy 1: close all open braces/brackets
-        for suffix in ['"}', '"}]', '"]}', '"}]}']:
-            try:
-                return json.loads(raw + suffix)
-            except json.JSONDecodeError:
-                pass
+        raw = raw.strip()
+        decoder = json.JSONDecoder()
 
-        # Strategy 1.5: handle single-quote JSON (LLMs sometimes use single quotes)
+        # Strategy 1: raw_decode handles "complete object + trailing text"
+        # and "first of several objects" cleanly, no guessing.
+        try:
+            obj, _end = decoder.raw_decode(raw)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 1.5: single-quote JSON (some LLMs emit {'k': 'v'})
         if "'" in raw and '"' not in raw:
             try:
                 return json.loads(raw.replace("'", '"'))
             except json.JSONDecodeError:
                 pass
 
-        # Strategy 2: strip trailing incomplete key-value pair
-        # Find last complete key-value and truncate there
-        s = raw.rstrip()
-        attempts = 0
-        while s and not s.endswith('}') and attempts < 5:
-            attempts += 1
-            last_comma = s.rfind('",')
-            if last_comma < 0:
-                last_comma = s.rfind("',")
-            if last_comma > 0:
-                s = s[:last_comma + 1] + '}'
-            else:
-                break
+        # Strategy 2: append common closers for simple truncation. Covers two
+        # truncation shapes: (a) cut inside a string value — needs a closing
+        # quote before the brace ('"' + closer); (b) cut right after a complete
+        # value, just missing the object/array close (bare closer).
+        for suffix in ('"}', '"}]', '"]}', '"}]}', '}', ']', ']}'):
             try:
-                return json.loads(s)
+                obj = json.loads(raw + suffix)
+                if isinstance(obj, dict):
+                    return obj
             except json.JSONDecodeError:
-                continue
+                pass
 
-        # Strategy 3: return empty dict — let the tool fail gracefully
+        # Strategy 3: truncate back to the last structural comma (string-aware).
+        pos = AgentDispatcher._last_structural_comma_pos(raw)
+        if pos > 0:
+            candidate = raw[:pos] + '}'
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+
         return {}
+
+    @staticmethod
+    def _last_structural_comma_pos(s: str) -> int:
+        """Index of the last structural ``,`` in JSON-ish ``s`` (string-aware).
+
+        Returns the position to truncate *after* (i.e. the ``,`` index), or -1.
+        A structural comma is one at JSON nesting level 1 (directly inside the
+        top object) and NOT inside a string value. String-awareness is the
+        whole point: ``rfind('",')`` matched inside ``"print(a, b)"`` and
+        truncated file contents.
+        """
+        in_string = False
+        escape = False
+        depth = 0
+        last_comma = -1
+        for i, ch in enumerate(s):
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == '{' or ch == '[':
+                depth += 1
+            elif ch == '}' or ch == ']':
+                depth -= 1
+            elif ch == ',' and depth == 1:
+                last_comma = i
+        return last_comma
 
     @staticmethod
     def _find_last_assistant_text(api_messages: list, fallback: str) -> str:
@@ -1175,7 +1826,16 @@ class AgentDispatcher:
         return ""
 
     def _format_leader_input(self, task: str, context: dict) -> str:
-        """Format context into a structured input for the Leader."""
+        """Format context into a structured input for the Leader.
+
+        Register-driven: iterates the ContextKey registry, calling each key's
+        serializer. This is the SINGLE serialization path — adding a key to
+        the registry (context_keys.py) automatically makes it appear in the
+        prompt. Previously this was a 170-line hardcoded if-block chain that
+        silently dropped 37 of 48 injected context keys.
+        """
+        from .context_keys import serialize_context
+
         parts = [f"## Task: {task.upper()}\n"]
 
         # Inject reasoning principles reminder for every dispatch
@@ -1194,155 +1854,126 @@ class AgentDispatcher:
                 "This lets you trace visual analysis findings back to concrete code/data causes.\n\n"
             )
 
-        # Inject working directory so LLM uses correct paths
-        if context.get("workspace_dir"):
-            parts.append(
-                f"## Working Directory (CRITICAL)\n"
-                f"The code agent's working directory is: `{context['workspace_dir']}`\n"
-                f"All file paths and commands must be relative to this directory.\n"
-                f"Do NOT use /workspace or any other hardcoded path.\n\n"
-            )
-
-        # Inject project knowledge summary (auto-generated)
+        # Inject project knowledge summary (auto-generated, not in registry)
         project_knowledge = self._generate_project_knowledge(context)
         if project_knowledge:
             parts.append(f"## Project Knowledge\n{project_knowledge}\n")
 
-        if context.get("directive"):
-            parts.append(f"## Human Directive (HIGHEST PRIORITY)\n{context['directive']}\n")
-
-        parts.append(f"## Project Brief\n{context.get('brief', 'N/A')}\n")
-        parts.append(f"## Memory Log\n{context.get('memory_log', 'N/A')}\n")
-        parts.append(f"## Cycle: {context.get('cycle', 'N/A')}\n")
-
-        # ── Inject session statistics from SQLite (if available) ──
-        stats = context.get("session_stats")
-        if stats and stats.get("total_cycles", 0) > 0:
-            parts.append("## Session Statistics\n")
-            parts.append(f"- Total cycles: {stats['total_cycles']}\n")
-            parts.append(f"- Experiments launched: {stats['experiments_launched']} ({stats['launch_rate']*100:.0f}%)\n")
-            parts.append(f"- Dead ends accumulated: {stats['dead_ends_count']}\n")
-            recent_failures = context.get("recent_failures", [])
-            if recent_failures:
-                parts.append("\n### Recent Failure Patterns:\n")
-                for f in recent_failures[:3]:
-                    diag = f.get("verify_diagnosis", "") or f.get("active_problem", "")
-                    parts.append(f"- Cycle {f.get('cycle', '?')}: {diag[:150]}\n")
-
-        # ── Inject code review lessons from knowledge base ──
-        # These are past mistakes the agent has learned from.
-        code_review_lessons = context.get("code_review_lessons")
-        if code_review_lessons:
-            parts.append(f"\n{code_review_lessons}\n")
-        relevant_lessons = context.get("relevant_code_review_lessons")
-        if relevant_lessons:
-            parts.append(f"\n{relevant_lessons}\n")
-
-        if context.get("experiment_result"):
-            # Cap experiment result to prevent context overflow
-            result_str = json.dumps(context['experiment_result'], indent=2)
-            if len(result_str) > 4000:
-                result_str = result_str[:4000] + "\n... (truncated for brevity)"
-            parts.append(f"## Experiment Result\n{result_str}\n")
-
-        # Inject VERIFY report diagnosis for REFLECT tasks
-        if context.get("verify_diagnosis"):
-            parts.append("## VERIFY Report — Module Diagnosis\n")
-            parts.append("**CRITICAL: You MUST address these verification failures before drawing conclusions.**\n")
-            parts.append("The following modules did NOT function correctly:\n")
-            for diag in context["verify_diagnosis"]:
-                parts.append(f"- {diag}\n")
-            if context.get("verify_failed_modules"):
-                parts.append(f"\nFailed modules: {', '.join(context['verify_failed_modules'])}\n")
-            parts.append(
-                "\n**Action required**: Before deciding this experiment 'failed' or 'succeeded', "
-                "determine whether the failure is in the experiment logic or in a broken module. "
-                "If a module is broken, the experiment results are UNRELIABLE — fix the module first.\n"
-            )
-
-        # ── ANTI-DECEPTION: Inject fabrication warning if detected ──
-        if context.get("llm_fabrication_detected"):
-            parts.append("## LLM FABRICATION DETECTED \n")
-            parts.append("**The Code agent CLAIMED to perform actions that it did NOT actually perform.**\n\n")
-            parts.append("Evidence:\n")
-            for detail in context.get("fabrication_details", []):
-                parts.append(f"- {detail}\n")
-            parts.append(
-                "\n**MANDATORY ACTIONS:**\n"
-                "1. Do NOT trust any claims from the previous EXECUTE phase\n"
-                "2. Mark this cycle's results as UNRELIABLE\n"
-                "3. Record `module_failure` for 'llm_honesty' — the Code agent must be re-instructed\n"
-                "4. The next THINK must explicitly verify tool trace before trusting any output\n"
-            )
-
-        # ── VISUAL ANALYSIS: Inject multimodal diagnosis when available ──
-        va = context.get("visual_analysis")
-        if va and va.get("triggered"):
-            severity_emoji = {"critical": "CRITICAL", "warning": "WARNING", "info": "INFO"}
-            sev = severity_emoji.get(va.get("severity", "info"), "INFO")
-            parts.append(f"## {sev}: VISUAL ANALYSIS DIAGNOSIS\n")
-            parts.append(
-                f"The agent has run **inference + multimodal image analysis** after "
-                f"{context.get('visual_analysis', {}).get('images_analyzed', '?')} images.\n"
-                f"This analysis LOOKS at model predictions (not just numbers) to find failures.\n\n"
-            )
-            va_diags = context.get("visual_analysis_diagnosis", [])
-            if va_diags:
-                parts.append("### Visual Findings:\n")
-                for d in va_diags[:5]:
-                    parts.append(f"- {d}\n")
-            va_actions = context.get("visual_analysis_actions", [])
-            if va_actions:
-                parts.append("\n### Recommended Actions (from visual analysis):\n")
-                for a in va_actions[:5]:
-                    parts.append(f"1. {a}\n")
-                parts.append(
-                    "\n**IMPORTANT**: These recommendations come from actual visual inspection of "
-                    "model outputs. They reveal problems invisible to numeric metrics alone. "
-                    "You SHOULD incorporate them into your next experiment plan.\n"
-                )
+        # ── Register-driven serialization of all context keys ──
+        # This replaces ~150 lines of hardcoded if-blocks. Every ContextKey
+        # in the registry whose serializer returns a non-None string is
+        # included. Previously-dropped keys (domain_knowledge,
+        # architecture_plan_summary, training_curve_analysis, etc.) now
+        # reach the Leader automatically.
+        phase = "reflect" if task == "reflect" else "think"
+        parts.append(serialize_context(context, phase))
 
         return "\n".join(parts)
 
     def _parse_leader_response(self, response: str) -> dict:
         """Parse Leader's response into structured action."""
-        try:
-            # Try to find JSON in response (supports nested braces)
-            depth = 0
-            start = None
-            for i, ch in enumerate(response):
-                if ch == '{':
-                    if depth == 0:
-                        start = i
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0 and start is not None:
-                        candidate = response[start:i + 1]
-                        try:
-                            parsed = json.loads(candidate)
-                            # Validate it's a decision JSON with an "action" field
-                            if isinstance(parsed, dict) and "action" in parsed:
-                                return parsed
-                            # Not a decision — keep searching for the actual decision JSON
-                        except json.JSONDecodeError:
-                            # This brace pair wasn't valid JSON; keep searching
-                            start = None
-        except (AttributeError, IndexError):
-            pass
+        parsed = self._extract_first_decision_json(response)
+        if parsed is not None:
+            return parsed
 
         # Fallback: extract action from text
         response_lower = response.lower()
         if "wait" in response_lower or "no experiment" in response_lower:
             return {"action": "wait", "reason": response[:200]}
 
+        # Parse failure must NEVER auto-trigger an experiment. A confused,
+        # truncated, or empty leader response used as a task description would
+        # send the code agent off to modify code on garbage instructions. Wait
+        # is the safe default — the next cycle can retry with fresh context.
+        logger.warning(
+            f"Leader response unparseable (no decision JSON found). "
+            f"Defaulting to wait. Response head: {response[:200]!r}"
+        )
         return {
-            "action": "experiment",
-            "agent": "code",
-            "task": response,
+            "action": "wait",
+            "reason": f"Unparseable leader response: {response[:200]}",
         }
 
-    def _parse_worker_response(self, response: str, agent_type: str, trace: ToolTrace = None) -> dict:
+    @staticmethod
+    def _extract_first_decision_json(response: str) -> Optional[dict]:
+        """Find the first balanced {...} in `response` that parses to a dict
+        with an ``action`` key.
+
+        B6 fix: the old walker counted braces without tracking string context,
+        so a brace inside a JSON string value (e.g. ``"task": "apply {x:1}"``)
+        made depth hit 0 at the wrong offset and the real JSON was never
+        extracted. This version is string-aware: it tracks ``in_string`` and
+        handles ``\\`` escapes, and it also strips ``` ```json ``` fences first.
+        Returns None if no decision JSON is found.
+        """
+        if not response:
+            return None
+
+        # Strip markdown code fences so fenced JSON is parsed directly.
+        # Keep this conservative: only strip a leading fence and a trailing fence.
+        stripped = response.strip()
+        if stripped.startswith("```"):
+            first_nl = stripped.find("\n")
+            if first_nl != -1:
+                inner = stripped[first_nl + 1:]
+                if inner.rstrip().endswith("```"):
+                    stripped = inner.rstrip()[:-3]
+
+        depth = 0
+        start = None
+        in_string = False
+        escape = False
+        for i, ch in enumerate(stripped):
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            # Not inside a string
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        candidate = stripped[start:i + 1]
+                        try:
+                            parsed = json.loads(candidate)
+                            if isinstance(parsed, dict) and "action" in parsed:
+                                return parsed
+                            # Balanced & valid JSON but not a decision — keep scanning.
+                        except json.JSONDecodeError:
+                            pass
+                        start = None
+        return None
+
+        # Fallback: extract action from text
+        response_lower = response.lower()
+        if "wait" in response_lower or "no experiment" in response_lower:
+            return {"action": "wait", "reason": response[:200]}
+
+        # Parse failure must NEVER auto-trigger an experiment. A confused,
+        # truncated, or empty leader response used as a task description would
+        # send the code agent off to modify code on garbage instructions. Wait
+        # is the safe default — the next cycle can retry with fresh context.
+        logger.warning(
+            f"Leader response unparseable (no decision JSON found). "
+            f"Defaulting to wait. Response head: {response[:200]!r}"
+        )
+        return {
+            "action": "wait",
+            "reason": f"Unparseable leader response: {response[:200]}",
+        }
+
+    def _parse_worker_response(self, response: str, agent_type: str, trace: ToolTrace = None, task: str = "") -> dict:
         """Parse worker response into structured result.
 
         ANTI-DECEPTION DESIGN:
@@ -1381,44 +2012,49 @@ class AgentDispatcher:
                     result["experiment_launched"] = False
                     result["launch_error"] = launch_facts["launch_error"]
             else:
-                # launch_experiment was NEVER called — but maybe the code agent
-                # launched training via run_shell (nohup/python train.py).
-                # This is a common pattern when LLMs don't follow instructions.
+                # launch_experiment was NEVER called. Check whether the agent
+                # tried to launch training via run_shell instead — this is a
+                # contract violation: training MUST go through launch_experiment
+                # (which writes the structured manifest and returns a real PID).
+                # The old code accepted shell-launched training via a brittle
+                # 4-branch regex that silently missed renamed scripts, `python
+                # -m`, torchrun, etc. — causing experiment_launched=False and
+                # no-progress miscounting. Now we DETECT the violation and flag
+                # it explicitly rather than guessing from free text.
                 shell_facts = trace.extract_shell_facts()
                 training_via_shell = False
                 for sf in shell_facts:
                     cmd = sf.get("command", "")
-                    # Detect training commands launched via run_shell
-                    # Exclude --help, --dry_run, and other non-training invocations
-                    is_help = bool(re.search(r'\b--help\b|\b-h$', cmd))
-                    is_inspect = bool(re.search(r'\bpython\s+-c\b', cmd) and not re.search(r'train|epoch', cmd, re.IGNORECASE))
-                    if not sf.get("had_error", False) and not is_help and not is_inspect and re.search(
-                        r'\bnohup\s+.*python.*train'
-                        r'|\bpython\s+.*train.*\.py\s'
-                        r'|\bpython\s+.*train.*\.py$',
+                    # Broad detection: does this look like it's launching a
+                    # training process (python + train, torchrun, accelerate)?
+                    # We want to CATCH the violation, not miss it.
+                    looks_like_training = bool(re.search(
+                        r'\bpython\b[^|;&]*\w*train\w*\.py\b'
+                        r'|\btorchrun\b'
+                        r'|\baccelerate\b[^|;&]*launch'
+                        r'|\bpython\s+-m\s+\S*train\w*\b'
+                        r'|\bnohup\b[^|;&]*\bpython\b',
                         cmd, re.IGNORECASE,
-                    ):
+                    ))
+                    if looks_like_training:
                         training_via_shell = True
-                        result["experiment_launched"] = True
-                        result["launch_via_shell"] = True
-                        logger.info(
-                            f"Detected training via run_shell (not launch_experiment): "
-                            f"{cmd[:100]}"
+                        result["experiment_launched"] = False
+                        result["launch_error"] = (
+                            "Training was launched via run_shell instead of "
+                            "launch_experiment. This is forbidden — launch_experiment "
+                            "writes the structured manifest and returns a trackable "
+                            "PID. Re-launch using launch_experiment(command=..., "
+                            f"log_file=...). Detected command: {cmd[:120]}"
                         )
-                        # Try to extract PID from nohup output
-                        stdout = sf.get("stdout_preview", "")
-                        pid_match = re.search(r'\bPID[=:]\s*(\d+)', stdout, re.IGNORECASE)
-                        if not pid_match:
-                            pid_match = re.search(r'\[(\d+)\]', stdout)
-                        if pid_match:
-                            try:
-                                result["pid"] = int(pid_match.group(1))
-                            except ValueError:
-                                pass
+                        logger.warning(
+                            f"FORBIDDEN launch path: code agent ran training via "
+                            f"run_shell instead of launch_experiment: {cmd[:100]}"
+                        )
                         break
 
                 if not training_via_shell:
-                    # Check if the LLM falsely claimed to have launched
+                    # No training attempt at all. Check if the LLM falsely
+                    # claimed to have launched (anti-deception).
                     llm_claims_launch = bool(re.search(
                         r'\bexperiment\s+(?:was\s+)?launched\b'
                         r'|\bPID\s*[=:]\s*\d+'
@@ -1466,5 +2102,19 @@ class AgentDispatcher:
                 pid_match = re.search(r"PID[=:\s]+(\d+)", response)
                 if pid_match:
                     result["pid"] = int(pid_match.group(1))
+
+        # Phase 2 convergence flag: a code dispatch asked to run an experiment
+        # that never launched (and wasn't blocked by a tool error or flagged
+        # as deception) failed to converge. This gives the loop (Phase 4) a
+        # clean signal to force a re-dispatch. Only flagged when the task
+        # explicitly mentions experiment/train/launch so pure-analysis code
+        # dispatches aren't mis-flagged.
+        if agent_type == "code" \
+                and not result.get("experiment_launched") \
+                and not result.get("launch_error") \
+                and not result.get("deception_detected") \
+                and re.search(r'\b(experiment|train|launch)',
+                              task or "", re.IGNORECASE):
+            result["convergence_failed"] = True
 
         return result

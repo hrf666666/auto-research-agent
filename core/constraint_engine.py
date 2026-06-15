@@ -159,7 +159,10 @@ class StrategyConstraintEngine:
                                 f"changed, you must explicitly justify why this time is different."
                             ),
                             source="dead_ends",
-                            priority="high" if count >= 5 else "medium",
+                            # Fix B: 5+ failures = hard block (forbidden), not just "high".
+                            # Previously this was always "high"/"medium", making
+                            # has_forbidden_violation unreachable for auto-generated rules.
+                            priority="forbidden" if count >= 5 else ("high" if count >= 3 else "medium"),
                         ))
         except Exception as e:
             logger.debug(f"Dead-end rule generation skipped: {e}")

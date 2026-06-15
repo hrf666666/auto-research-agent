@@ -1,176 +1,288 @@
 """
-Central registry of all context injection keys used in THINK and REFLECT phases.
+Central registry of all context injection keys — the SINGLE SOURCE OF TRUTH.
 
 Every key injected into the Leader's context dict is defined here with:
-- name: The exact dict key (must match between injection and prompt templates)
-- phase: "think" or "reflect"
-- description: What this key contains, for maintainer reference
-- required: Whether the system should warn if injection fails
+- name:       The exact dict key (injection, pruning, and serialization all read this)
+- phase:      "think" or "reflect"
+- description: Human-readable note
+- serializer: A function (value, context) -> str | None that formats the value
+              into a prompt section. Returns None to skip. This is what makes
+              _format_leader_input register-driven instead of hardcoded.
+- tier:       Pruning priority (1=always, 2=situational, 3=conditional, 4=rare)
+- required:   If True, warn on injection failure
 
-Usage in loop.py:
-    from .context_keys import THINK_KEYS, REFLECT_KEYS, ContextKey
+This registry replaces three previously-independent hardcoded lists:
+  1. The inline `context["..."] = ...` blocks in loop.py (injection side)
+  2. ContextPruner's TIER_1/2/3/4 sets (pruning side)
+  3. _format_leader_input's manual `if context.get(...)` blocks (serialization)
 
-In agent prompts (leader.md, code_agent.md):
-    Keys are referenced as {key_name} in the prompt template.
+Adding a new context key now requires exactly ONE change: add a ContextKey
+entry here. Injection, pruning, and serialization all pick it up automatically.
 """
+from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+
+# Type alias: a serializer takes (value, full_context) and returns a prompt
+# section string, or None to skip.
+Serializer = Callable[[Any, dict], Optional[str]]
+
+
+# ── Serializer helpers (reusable across keys) ──
+
+def _text_section(heading: str, max_chars: int = 2000) -> Serializer:
+    """Serialize a string value under a heading, with truncation."""
+    def serialize(value, _ctx):
+        if not value:
+            return None
+        s = str(value)
+        if len(s) > max_chars:
+            s = s[:max_chars] + "\n... (truncated)"
+        return f"## {heading}\n{s}\n"
+    return serialize
+
+
+def _json_section(heading: str, max_chars: int = 3000) -> Serializer:
+    """Serialize a dict/list value as indented JSON under a heading."""
+    import json
+    def serialize(value, _ctx):
+        if not value:
+            return None
+        s = json.dumps(value, indent=2, ensure_ascii=False, default=str)
+        if len(s) > max_chars:
+            s = s[:max_chars] + "\n... (truncated)"
+        return f"## {heading}\n{s}\n"
+    return serialize
+
+
+def _list_section(heading: str, max_items: int = 5, prefix: str = "-") -> Serializer:
+    """Serialize a list of strings as bullet points."""
+    def serialize(value, _ctx):
+        if not value or not isinstance(value, (list, tuple)):
+            return None
+        lines = [f"## {heading}"]
+        for item in value[:max_items]:
+            lines.append(f"{prefix} {item}")
+        return "\n".join(lines) + "\n" if len(lines) > 1 else None
+    return serialize
+
+
+# ── Custom serializers that need special formatting ──
+
+def _serialize_session_stats(value, _ctx):
+    if not value or not isinstance(value, dict) or value.get("total_cycles", 0) == 0:
+        return None
+    lines = ["## Session Statistics",
+             f"- Total cycles: {value.get('total_cycles', '?')}",
+             f"- Experiments launched: {value.get('experiments_launched', '?')} "
+             f"({value.get('launch_rate', 0)*100:.0f}%)" if isinstance(value.get('launch_rate'), (int, float)) else "",
+             f"- Dead ends: {value.get('dead_ends_count', '?')}"]
+    return "\n".join(l for l in lines if l) + "\n"
+
+
+def _serialize_fabrication_warning(value, ctx):
+    if not value:
+        return None
+    parts = ["## LLM FABRICATION DETECTED",
+             "**The Code agent CLAIMED actions it did NOT perform.**",
+             "**Do NOT trust claims from the previous EXECUTE phase.**"]
+    details = ctx.get("fabrication_details", [])
+    for d in details[:5]:
+        parts.append(f"- {d}")
+    return "\n".join(parts) + "\n"
+
+
+def _serialize_visual_analysis(value, _ctx):
+    if not value or not isinstance(value, dict) or not value.get("triggered"):
+        return None
+    sev = {"critical": "CRITICAL", "warning": "WARNING", "info": "INFO"}.get(
+        value.get("severity", "info"), "INFO")
+    return (
+        f"## {sev}: VISUAL ANALYSIS DIAGNOSIS\n"
+        f"Analyzed {value.get('images_analyzed', '?')} prediction images.\n"
+    )
 
 
 @dataclass(frozen=True)
 class ContextKey:
     """Definition of a single context injection key."""
     name: str
-    phase: str  # "think" or "reflect"
+    phase: str           # "think" or "reflect"
     description: str
-    required: bool = False  # If True, warn on injection failure
+    serializer: Serializer = field(default=None)
+    tier: int = 3        # 1=always, 2=situational, 3=conditional, 4=rare
+    required: bool = False
 
 
-# ── THINK phase context keys ──
+# ─────────────────────────────────────────────────────────────
+# THINK phase context keys
+# ─────────────────────────────────────────────────────────────
 
 THINK_KEYS = [
-    # Core context (always present)
-    ContextKey("brief", "think", "PROJECT_BRIEF.md content (truncated)"),
-    ContextKey("memory_log", "think", "MEMORY_LOG.md recent entries"),
-    ContextKey("cycle", "think", "Current cycle number"),
-    ContextKey("directive", "think", "Human directive from DIRECTIVE.md (if any)"),
-    ContextKey("workspace_dir", "think", "Path to workspace directory"),
+    # ── Core (tier 1, always present) ──
+    ContextKey("brief", "think", "PROJECT_BRIEF.md content",
+               serializer=_text_section("Project Brief", 3000), tier=1),
+    ContextKey("memory_log", "think", "MEMORY_LOG.md recent entries",
+               serializer=_text_section("Memory Log", 4000), tier=1),
+    ContextKey("cycle", "think", "Current cycle number",
+               serializer=lambda v, _c: f"## Cycle: {v}\n" if v else None, tier=1),
+    ContextKey("workspace_dir", "think", "Path to workspace directory",
+               serializer=lambda v, _c: (
+                   f"## Working Directory (CRITICAL)\n"
+                   f"The code agent's working directory is: `{v}`\n"
+                   f"All file paths must be relative to this directory.\n"
+               ) if v else None, tier=1),
+    ContextKey("directive", "think", "Human directive from DIRECTIVE.md",
+               serializer=_text_section("Human Directive (HIGHEST PRIORITY)", 2000), tier=1),
+    ContextKey("persistent_constraints", "think", "Project-level hard rules",
+               serializer=_text_section("Persistent Constraints", 1000), tier=1),
 
-    # Dataset understanding
-    ContextKey("dataset_manifest_summary", "think",
-               "DATASET_MANIFEST.json summary: training recommendations, quality issues, per-dataset counts"),
+    # ── Session intelligence (tier 2) ──
+    ContextKey("session_stats", "think", "SQLite summary: cycles, experiments, dead ends",
+               serializer=_serialize_session_stats, tier=2),
+    ContextKey("recent_failures", "think", "Recent experiment failures (last 3)",
+               serializer=_list_section("Recent Failure Patterns", 3), tier=2),
+    ContextKey("code_review_lessons", "think", "Past mistakes from knowledge base",
+               serializer=_text_section("Code Review Lessons", 1500), tier=2),
+    ContextKey("relevant_code_review_lessons", "think", "Targeted lessons for current task",
+               serializer=_text_section("Relevant Lessons", 1500), tier=2),
 
-    # Session statistics
-    ContextKey("session_stats", "think",
-               "SQLite summary: total_cycles, best_metric, experiment_count"),
-    ContextKey("recent_failures", "think",
-               "Recent experiment failures from SQLite (last 3)"),
-
-    # Domain knowledge
+    # ── Domain knowledge (tier 2) — PREVIOUSLY DROPPED, now serialized ──
     ContextKey("domain_knowledge", "think",
-               "Method-property mappings, domain compatibility, method assumptions from domain_knowledge.py"),
-    ContextKey("data_constraints", "think",
-               "Top-level data constraints extracted from PROJECT_BRIEF"),
-    ContextKey("data_scarcity_warning", "think",
-               "Warning when any domain has < 10 training samples (blocks architecture proposals)"),
-
-    # Direction control
-    ContextKey("idea_guardian_check", "think",
-               "Injected every 5 cycles: mandatory direction alignment check"),
-    ContextKey("direction_circuit_breaker", "think",
-               "Injected when direction stagnation count exceeds threshold"),
-
-    # Cross-experiment insights
+               "Method-property mappings, domain compatibility, method assumptions",
+               serializer=_text_section("Domain Knowledge", 2500), tier=2),
+    ContextKey("data_constraints", "think", "Top-level data constraints from PROJECT_BRIEF",
+               serializer=_text_section("Data Constraints", 1000), tier=2),
     ContextKey("cross_experiment_insights", "think",
-               "Meta-patterns across experiments: dominant methods, hypothesis accuracy, calibration"),
+               "Meta-patterns: dominant methods, hypothesis accuracy, calibration",
+               serializer=_text_section("Cross-Experiment Insights", 2000), tier=2),
 
-    # Architecture plan
-    ContextKey("architecture_plan", "think",
-               "Full IdeaPlanner 9-phase plan dict (when available)"),
-    ContextKey("architecture_plan_summary", "think",
-               "One-line summary of architecture plan for quick scanning"),
+    # ── Architecture planning (tier 2) — PREVIOUSLY DROPPED ──
+    ContextKey("architecture_plan", "think", "Full IdeaPlanner plan dict",
+               serializer=_json_section("Architecture Plan", 2000), tier=2),
+    ContextKey("architecture_plan_summary", "think", "One-line plan summary",
+               serializer=_text_section("Architecture Plan Summary", 500), tier=2),
 
-    # Experiment intelligence
-    ContextKey("pareto_frontier", "think",
-               "Pareto-optimal methods per domain from SQLite pareto_matrix"),
-    ContextKey("causal_history", "think",
-               "Past design decisions with verified actual effects"),
-    ContextKey("hypothesis_calibration", "think",
-               "Historical hypothesis accuracy and confidence calibration"),
+    # ── Experiment intelligence (tier 2) — PREVIOUSLY DROPPED ──
+    ContextKey("pareto_frontier", "think", "Pareto-optimal methods per domain",
+               serializer=_text_section("Pareto Frontier", 1500), tier=2),
+    ContextKey("causal_history", "think", "Past design decisions with verified effects",
+               serializer=_text_section("Causal History", 1500), tier=2),
+    ContextKey("hypothesis_calibration", "think", "Historical hypothesis accuracy",
+               serializer=_text_section("Hypothesis Calibration", 800), tier=2),
 
-    # Constraint engine (v10)
-    ContextKey("adaptive_thresholds", "think",
-               "Calibrated diagnostic thresholds from project history"),
-    ContextKey("implementation_progress", "think",
-               "ImplementationTracker: pending modules and completion rate"),
+    # ── Research roadmap (tier 2) — PREVIOUSLY DROPPED ──
+    ContextKey("research_roadmap", "think", "Module decomposition, phase constraints",
+               serializer=_text_section("Research Roadmap", 2000), tier=2),
+    ContextKey("phase_focus", "think", "Current phase requirements and allowed actions",
+               serializer=_text_section("Phase Focus", 1000), tier=2),
 
-    # Simulation sandbox (v11)
-    ContextKey("sandbox_design_guidance", "think",
-               "Sandbox scaling guidance from previous cycle's model evaluation"),
+    # ── Direction control (tier 3) — PREVIOUSLY DROPPED ──
+    ContextKey("idea_guardian_check", "think", "Mandatory direction alignment check (every 5 cycles)",
+               serializer=_text_section("Idea Guardian Check", 1000), tier=3),
+    ContextKey("direction_circuit_breaker", "think", "Direction stagnation warning",
+               serializer=_text_section("Direction Circuit Breaker", 800), tier=3),
+    ContextKey("architecture_circuit_breaker", "think", "Architecture stagnation warning",
+               serializer=_text_section("Architecture Circuit Breaker", 800), tier=3),
+    ContextKey("architecture_survey_gate", "think", "Architecture survey requirement",
+               serializer=_text_section("Architecture Survey Gate", 500), tier=3),
+    ContextKey("data_scarcity_warning", "think", "Warning when < 10 training samples",
+               serializer=_text_section("Data Scarcity Warning", 500), tier=3),
+    ContextKey("method_inadequacy_retry_prompt", "think", "Retry guidance for inadequate methods",
+               serializer=_text_section("Method Inadequacy Retry", 1000), tier=3),
 
-    # Research roadmap (v15)
-    ContextKey("research_roadmap", "think",
-               "ResearchRoadmap: module decomposition, phase constraints, active module requirements"),
+    # ── Dataset understanding (tier 3) ──
+    ContextKey("dataset_manifest_summary", "think", "DATASET_MANIFEST.json summary",
+               serializer=_text_section("Dataset Manifest", 1500), tier=3),
 ]
 
-# ── REFLECT phase context keys ──
+# ─────────────────────────────────────────────────────────────
+# REFLECT phase context keys
+# ─────────────────────────────────────────────────────────────
 
 REFLECT_KEYS = [
-    # Core context (always present)
-    ContextKey("brief", "reflect", "PROJECT_BRIEF.md content (truncated)"),
-    ContextKey("memory_log", "reflect", "MEMORY_LOG.md recent entries"),
-    ContextKey("experiment_result", "reflect", "Full execute_result dict from EXECUTE phase"),
-    ContextKey("cycle", "reflect", "Current cycle number"),
-    ContextKey("workspace_dir", "reflect", "Path to workspace directory"),
+    # ── Core (tier 1) ──
+    ContextKey("brief", "reflect", "PROJECT_BRIEF.md content",
+               serializer=_text_section("Project Brief", 3000), tier=1),
+    ContextKey("memory_log", "reflect", "MEMORY_LOG.md recent entries",
+               serializer=_text_section("Memory Log", 4000), tier=1),
+    ContextKey("cycle", "reflect", "Current cycle number",
+               serializer=lambda v, _c: f"## Cycle: {v}\n" if v else None, tier=1),
+    ContextKey("workspace_dir", "reflect", "Path to workspace directory",
+               serializer=lambda v, _c: (
+                   f"## Working Directory\n`{v}`\n"
+               ) if v else None, tier=1),
+    ContextKey("persistent_constraints", "reflect", "Project-level hard rules",
+               serializer=_text_section("Persistent Constraints", 1000), tier=1),
 
-    # VERIFY report
-    ContextKey("verify_report", "reflect",
-               "Full VerifyReport dict (all 10 layers)"),
-    ContextKey("verify_diagnosis", "reflect",
-               "List of diagnosis strings from VerifyReport"),
-    ContextKey("verify_failed_modules", "reflect",
-               "List of module names that failed VERIFY"),
+    # ── Experiment result + VERIFY (tier 1) ──
+    ContextKey("experiment_result", "reflect", "Full execute_result dict",
+               serializer=_json_section("Experiment Result", 4000), tier=1),
+    # NOTE: injection side uses "experiment_evaluation" — also register it
+    ContextKey("experiment_evaluation", "reflect", "ExperimentEvaluator output",
+               serializer=_json_section("Experiment Evaluation", 3000), tier=2),
+    ContextKey("verify_diagnosis", "reflect", "List of VERIFY diagnosis strings",
+               serializer=_list_section("VERIFY Report — Module Diagnosis", 8), tier=1),
+    ContextKey("verify_failed_modules", "reflect", "Modules that failed VERIFY",
+               serializer=lambda v, _c: (
+                   f"\nFailed modules: {', '.join(v)}\n" if v else None
+               ), tier=1),
 
-    # Anti-deception
-    ContextKey("llm_fabrication_detected", "reflect",
-               "True if VERIFY detected LLM fabrication (claimed actions not performed)"),
-    ContextKey("fabrication_details", "reflect",
-               "List of fabrication evidence strings"),
+    # ── Anti-deception (tier 2) ──
+    ContextKey("llm_fabrication_detected", "reflect", "True if fabrication detected",
+               serializer=_serialize_fabrication_warning, tier=2),
+    ContextKey("fabrication_details", "reflect", "List of fabrication evidence",
+               serializer=_list_section("Fabrication Evidence", 5), tier=2),
 
-    # Dataset quality
-    ContextKey("dataset_quality_issues", "reflect",
-               "List of dataset quality issue strings from VERIFY"),
-    ContextKey("dataset_val_counts", "reflect",
-               "Per-domain validation scene counts"),
-    ContextKey("dataset_train_counts", "reflect",
-               "Per-domain training scene counts"),
-    ContextKey("dataset_quality_prompt", "reflect",
-               "Mandatory dataset reliability guidance prompt"),
-
-    # Visual analysis
-    ContextKey("visual_analysis", "reflect",
-               "VisualAnalysisResult dict (when triggered)"),
-    ContextKey("visual_analysis_diagnosis", "reflect",
-               "List of visual diagnosis strings"),
-    ContextKey("visual_analysis_actions", "reflect",
-               "List of recommended actions from visual analysis"),
-
-    # Domain analysis
-    ContextKey("domain_analysis_prompt", "reflect",
-               "Cross-domain metric comparison with mandatory analysis questions"),
-    ContextKey("architecture_feedback_prompt", "reflect",
-               "Result-to-architecture feedback when domain gap > 0.10"),
-
-    # Hypothesis validation
-    ContextKey("hypothesis_validation_prompt", "reflect",
-               "Forced hypothesis validation when quality_alert_streak >= 2"),
-
-    # Training curve
+    # ── Training analysis (tier 2) — PREVIOUSLY DROPPED ──
     ContextKey("training_curve_analysis", "reflect",
-               "Training curve diagnostics: overfitting, oscillation, convergence speed, plateau"),
+               "Training curve diagnostics: overfitting, oscillation, plateau",
+               serializer=_text_section("Training Curve Analysis", 2000), tier=2),
+    ContextKey("aux_loss_trend", "reflect", "Auxiliary loss trend analysis",
+               serializer=_text_section("Aux Loss Trend", 500), tier=3),
+    ContextKey("per_domain_mae_trend", "reflect", "Per-domain MAE trend",
+               serializer=_text_section("Per-Domain MAE Trend", 800), tier=3),
 
-    # Experiment evaluation (v9)
-    ContextKey("experiment_evaluation", "reflect",
-               "ExperimentEvaluator output: plan_vs_result, failure_diagnoses, iteration_guidance"),
-    ContextKey("iteration_guidance_prompt", "reflect",
-               "Priority-sorted mandatory next steps from ExperimentEvaluator"),
+    # ── Evaluation (tier 2) — PREVIOUSLY DROPPED ──
+    ContextKey("iteration_guidance_prompt", "reflect", "Priority-sorted next steps",
+               serializer=_text_section("Iteration Guidance", 1500), tier=2),
+    ContextKey("sandbox_evaluation", "reflect", "Sandbox evaluation: feasibility, design, verdict",
+               serializer=_text_section("Sandbox Evaluation", 2000), tier=2),
 
-    # Independent assessment (v9)
-    ContextKey("independent_assessment_warning", "reflect",
-               "Third-party probe anomaly warning from IndependentProbe"),
+    # ── Visual analysis (tier 2) ──
+    ContextKey("visual_analysis", "reflect", "VisualAnalysisResult dict (when triggered)",
+               serializer=_serialize_visual_analysis, tier=2),
+    ContextKey("visual_analysis_diagnosis", "reflect", "Visual diagnosis strings",
+               serializer=_list_section("Visual Findings", 5), tier=2),
+    ContextKey("visual_analysis_actions", "reflect", "Recommended actions from visual analysis",
+               serializer=_list_section("Recommended Actions (Visual)", 5, prefix="1."), tier=2),
 
-    # Constraint engine (v10)
-    ContextKey("plan_compliance_warning", "reflect",
-               "PlannerChecker: warnings when Code Agent didn't implement planned modules"),
-    ContextKey("quick_benchmark_warning", "reflect",
-               "QuickBenchmark: anomaly warning when reported metrics don't match actual computation"),
-    ContextKey("implementation_progress", "reflect",
-               "ImplementationTracker: pending modules and completion rate"),
+    # ── Domain/quality prompts (tier 3) — PREVIOUSLY DROPPED ──
+    ContextKey("domain_analysis_prompt", "reflect", "Cross-domain metric comparison",
+               serializer=_text_section("Domain Analysis", 1500), tier=3),
+    ContextKey("architecture_feedback_prompt", "reflect", "Result-to-architecture feedback",
+               serializer=_text_section("Architecture Feedback", 1000), tier=3),
+    ContextKey("hypothesis_validation_prompt", "reflect", "Forced hypothesis validation",
+               serializer=_text_section("Hypothesis Validation", 1000), tier=3),
+    ContextKey("training_architecture_reflection_prompt", "reflect",
+               "Training architecture reflection",
+               serializer=_text_section("Training Architecture Reflection", 1000), tier=3),
+    ContextKey("analysis_reflection_prompt", "reflect", "Analysis reflection guidance",
+               serializer=_text_section("Analysis Reflection", 1000), tier=3),
 
-    # Simulation sandbox (v11)
-    ContextKey("sandbox_evaluation", "reflect",
-               "Full sandbox evaluation: feasibility, design A/B, reference + internal behavior, verdict"),
+    # ── Dataset quality (tier 3) ──
+    ContextKey("dataset_quality_issues", "reflect", "Dataset quality issue strings",
+               serializer=_list_section("Dataset Quality Issues", 5), tier=3),
+    ContextKey("dataset_quality_prompt", "reflect", "Mandatory dataset reliability guidance",
+               serializer=_text_section("Dataset Quality Guidance", 1000), tier=3),
+    ContextKey("independent_assessment_warning", "reflect", "Third-party probe anomaly warning",
+               serializer=_text_section("Independent Assessment Warning", 500), tier=3),
+    ContextKey("method_inadequacy_history", "reflect", "Method inadequacy history",
+               serializer=_text_section("Method Inadequacy History", 1000), tier=3),
 ]
+
 
 # ── Lookup helpers ──
 
@@ -178,21 +290,58 @@ THINK_KEY_NAMES = {k.name for k in THINK_KEYS}
 REFLECT_KEY_NAMES = {k.name for k in REFLECT_KEYS}
 ALL_KEY_NAMES = THINK_KEY_NAMES | REFLECT_KEY_NAMES
 
+# Organized by (phase, tier) for the pruning logic
+_KEY_INDEX: dict[tuple[str, int], list[ContextKey]] = {}
+for _k in THINK_KEYS + REFLECT_KEYS:
+    _KEY_INDEX.setdefault((_k.phase, _k.tier), []).append(_k)
+
+
+def get_keys_for_phase(phase: str) -> list[ContextKey]:
+    """Return all registered keys for a phase, in tier order."""
+    return [k for k in (THINK_KEYS if phase == "think" else REFLECT_KEYS)]
+
+
+def get_serializer(name: str, phase: str) -> Optional[Serializer]:
+    """Look up the serializer for a key by name + phase."""
+    for k in (THINK_KEYS if phase == "think" else REFLECT_KEYS):
+        if k.name == name:
+            return k.serializer
+    return None
+
+
+def serialize_context(context: dict, phase: str) -> str:
+    """Serialize a context dict into a prompt string, register-driven.
+
+    Iterates keys in tier order, calling each key's serializer. This is the
+    SINGLE serialization path — replacing _format_leader_input's hardcoded
+    if-blocks. Adding a key to the registry automatically makes it appear
+    in the prompt.
+    """
+    parts = []
+    keys = get_keys_for_phase(phase)
+    for key in keys:
+        value = context.get(key.name)
+        if value is None:
+            continue
+        if key.serializer is None:
+            # Keys without a serializer are internal (e.g., experiment_result
+            # is read directly by the old code path during transition)
+            continue
+        section = key.serializer(value, context)
+        if section:
+            parts.append(str(section))
+    return "\n".join(parts)
+
 
 def validate_context(context: dict, phase: str) -> list[str]:
     """Validate a context dict against the registry. Returns list of warnings."""
     warnings = []
     expected = THINK_KEY_NAMES if phase == "think" else REFLECT_KEY_NAMES
-    required = {k.name for k in (THINK_KEYS if phase == "think" else REFLECT_KEYS) if k.required}
-
-    # Check for unknown keys
     for key in context:
-        if key not in expected:
+        if key not in expected and key not in ALL_KEY_NAMES:
             warnings.append(f"Unknown context key '{key}' in {phase} phase")
-
-    # Check for missing required keys
+    required = {k.name for k in (THINK_KEYS if phase == "think" else REFLECT_KEYS) if k.required}
     for key in required:
         if key not in context:
             warnings.append(f"Missing required context key '{key}' in {phase} phase")
-
     return warnings

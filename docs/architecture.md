@@ -1319,3 +1319,82 @@ Replaced with hardcoded thresholds: `severe_degradation=0.35`, `improvement_thre
 - Added `PERSISTENT_CONSTRAINTS.md` loading in `_think()` (project-level hard rules)
 - ContextPruner MAX_KEYS: 20 → 14 (reduces information dilution)
 - Updated TIER lists: `persistent_constraints` in TIER_1_ALWAYS, removed dead module keys
+
+---
+
+### 36. v17 — Systemic Architecture Fixes (5 root causes, 97 tests)
+
+A function-level code review identified that the codebase had **5 structural
+diseases** (not 40 isolated bugs). Each disease had one root cause and one
+systemic fix. All fixes are test-protected (97 tests, up from 0).
+
+#### Disease A: Signal Disconnect — Context Schema (P0, highest impact)
+
+**Root cause**: Context key injection (loop.py, 48 keys), pruning
+(constraint_engine.py), and serialization (agents.py `_format_leader_input`)
+were three independent hardcoded processes with no synchronization. Result:
+**37 of 48 injected keys were silently dropped** — 77% of context computation
+wasted. DomainKnowledgeMixin (650 lines), IdeaPlanner, TrainingCurveAnalysis,
+ExperimentEvaluator all computed output that never reached the Leader LLM.
+
+**Fix**: `core/context_keys.py` became the **single source of truth** — every
+`ContextKey` declares its own `serializer` function. `_format_leader_input`
+shrank from 170 lines of hardcoded if-blocks to 8 lines calling
+`serialize_context()`. Adding a key now requires exactly ONE change (the
+registry); injection, pruning, and serialization all pick it up automatically.
+
+**Measured improvement**: Leader prompt sections 13→21 (+62%); keys reaching
+LLM 19%→98%; `_format_leader_input` 170→8 lines (-95%).
+
+#### Disease B: Execution Disconnect — Advisory→Enforced
+
+**Root cause**: Two subsystems detected problems but couldn't change behavior:
+1. **Audit escalation** wrote `DIRECTIVE.md` text the LLM could ignore forever.
+2. **Constraint engine** `FORBIDDEN` hard gate was unreachable (auto-rules only
+   produced `high`/`medium` priority, never `forbidden`).
+
+**Fix**:
+- Audit: per-signature monotonic enforcement counter (`_audit_enforcement`).
+  After 2 uncorrected escalations → forced targeted-fix task; after 3 →
+  `pause_human`. Same model as Phase 4's `_consecutive_failed_launches`.
+- Constraint engine: dead-end rules with `count >= 5` now set
+  `priority="forbidden"`, making the FORBIDDEN hard gate reachable.
+
+#### Disease C: Code Duplication — Shared Primitives
+
+**Root cause**: 15+ copies of `ast.walk`→`nn.Module` scanning and 4 copies of
+loss-parsing regex with 3 divergent thresholds, spread across verifier.py,
+experiment_evaluator.py, simulation_sandbox.py, model_analyzer.py.
+
+**Fix**: Two shared modules:
+- `core/training_log_parser.py`: one `parse_loss_series` + one
+  `classify_loss_trend` (unified thresholds) + `extract_metrics`.
+- `core/model_structure_scanner.py`: one `scan_model_file` that finds modules,
+  collects init-assignments, detects dead branches, and estimates params.
+  **Also fixes the kwargs bug**: `_estimate_params` now reads keyword arguments
+  (`Conv2d(in_channels=3, out_channels=64)`), not just positional — the old
+  estimator returned 0 for modern PyTorch style.
+
+#### Disease D: Dead Code (~200 lines)
+
+Deleted: `_resolve_model_for_provider` (0 callers), `_extract_first_decision_json`
+unreachable tail, 6 dead `memory.py` methods (`get_metric_trend`,
+`get_full_context`, `resolve_active_problem`, `get_log_summary`,
+`log_roadmap_update`, `get_roadmap_history`), `WORKER_CONFIGS["tools"]`
+(never-read divergent field). `roadmap_history` table DDL flagged for removal.
+
+#### Disease E: Structural Bloat — Deferred
+
+`loop.py` (5018 lines) is a god-object, but 0 dead methods and the split is
+pure maintainability (no runtime impact). Deferred until A+B produce runtime
+baseline data proving the split is worth the regression risk.
+
+#### IdeaScout Integration (cross-domain idea discovery)
+
+`core/idea_scout_bridge.py` integrates the [research-idea-scout](https://github.com/YangyangQu/research-idea-scout)
+toolkit into the `paper_research` phase. When `idea_scout.enabled=true` in
+config, the pipeline: gathers papers (via `search_papers`) → rule-filters
+(profile-guided keyword scoring) → LLM-scores for cross-domain transferability
+(via ProviderRouter, not codex CLI) → writes a ranked Markdown report. A
+`Profile` is auto-generated from `PROJECT_BRIEF.md`. Disabled by default
+(zero behavior change).

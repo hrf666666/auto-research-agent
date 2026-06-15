@@ -310,31 +310,6 @@ class MemoryManager:
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]
 
-    def get_metric_trend(self, metric_name: str = "loss", limit: int = 50) -> list[dict]:
-        """Get a specific metric's trend across experiments."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT cycle, timestamp, metrics_json, experiment_launched
-                FROM experiments
-                WHERE experiment_launched = 1
-                ORDER BY cycle ASC
-                LIMIT ?
-            """, (limit,)).fetchall()
-
-            trend = []
-            for row in rows:
-                try:
-                    metrics = json.loads(row["metrics_json"])
-                    if metric_name in metrics:
-                        trend.append({
-                            "cycle": row["cycle"],
-                            "value": metrics[metric_name],
-                        })
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            return trend
-
     def get_dead_ends_full(self) -> list[str]:
         """Get ALL dead ends from SQLite (survives MEMORY_LOG compaction)."""
         with sqlite3.connect(str(self.db_path)) as conn:
@@ -747,12 +722,6 @@ class MemoryManager:
             return self.log_path.read_text()
         return ""
 
-    def get_full_context(self) -> str:
-        """Return combined memory for agent consumption."""
-        brief = self.get_brief()
-        log = self.get_log()
-        return f"## Project Brief\n{brief}\n\n## Memory Log\n{log}"
-
     def log_milestone(self, entry: str, cycle: int = None):
         """Add a key result milestone. Auto-compacts if over budget."""
         sections = self._parse_log()
@@ -823,16 +792,6 @@ class MemoryManager:
         sections["active_problems"].append(f"[{timestamp}] {entry}")
         self._record_memory_entry("active_problem", entry, cycle)
         self._write_log(sections)
-
-    def resolve_active_problem(self, index: int, resolution: str = ""):
-        """Move an active problem to dead ends with resolution note."""
-        sections = self._parse_log()
-        if 0 <= index < len(sections["active_problems"]):
-            entry = sections["active_problems"].pop(index)
-            if resolution:
-                entry = f"{entry} → RESOLVED: {resolution}"
-            sections["dead_ends"].append(entry)
-            self._write_log(sections)
 
     def log_major_event(self, entry: str, cycle: int = None):
         """Log a major research event (e.g., paper research breakthrough, paradigm shift).
@@ -1114,87 +1073,3 @@ class MemoryManager:
             compressed = f"[Historical {len(old)} entries: {'; '.join(themes[:3])}]"
             return [compressed] + recent
         return recent
-
-    def get_log_summary(self, max_chars: int = 2000) -> str:
-        """Return a compressed summary of the log for LLM context."""
-        full_log = self.get_log()
-        if len(full_log) <= max_chars:
-            return full_log
-
-        sections = self._parse_log()
-        lines = ["# Memory Log (summary)", ""]
-
-        # Active Problems: keep all (most important)
-        lines.append("## Active Problems")
-        lines.extend(sections["active_problems"])
-        lines.append("")
-
-        # Dead Ends: keep recent 5
-        lines.append("## Dead Ends (recent)")
-        lines.extend(sections["dead_ends"][-5:])
-        if len(sections["dead_ends"]) > 5:
-            lines.append(f"[... {len(sections['dead_ends']) - 5} older entries in SQLite]")
-        lines.append("")
-
-        # Decisions: keep recent 5
-        lines.append("## Recent Decisions")
-        lines.extend(sections["decisions"][-5:])
-        lines.append("")
-
-        # Milestones: keep recent 3
-        lines.append("## Key Results (recent)")
-        lines.extend(sections["milestones"][-3:])
-        if len(sections["milestones"]) > 3:
-            lines.append(f"[... {len(sections['milestones']) - 3} older milestones in SQLite]")
-        lines.append("")
-
-        return "\n".join(lines)
-
-    # ── v15: Roadmap History ──
-
-    def log_roadmap_update(self, cycle: int, event_type: str, module_name: str = "",
-                           old_phase: str = "", new_phase: str = "",
-                           details: str = "", global_phase: str = ""):
-        """Record a ROADMAP state change to the roadmap_history table.
-
-        Args:
-            cycle: Current cycle number
-            event_type: "phase_advance" | "dead_end" | "generated" | "deviation" | "alignment_reset"
-            module_name: Name of the affected module
-            old_phase: Previous phase of the module
-            new_phase: New phase of the module
-            details: Description of the change
-            global_phase: Current global research phase
-        """
-        try:
-            with sqlite3.connect(str(self.db_path)) as conn:
-                conn.execute(
-                    """INSERT INTO roadmap_history
-                       (timestamp, cycle, event_type, module_name, old_phase, new_phase, details, global_phase)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (time.time(), cycle, event_type, module_name, old_phase, new_phase,
-                     details[:500], global_phase),
-                )
-        except Exception as e:
-            logger.debug(f"Failed to log roadmap update: {e}")
-
-    def get_roadmap_history(self, module_name: str = None, event_type: str = None,
-                            limit: int = 20) -> list[dict]:
-        """Query roadmap history for a module or event type."""
-        try:
-            with sqlite3.connect(str(self.db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                query = "SELECT * FROM roadmap_history WHERE 1=1"
-                params = []
-                if module_name:
-                    query += " AND module_name = ?"
-                    params.append(module_name)
-                if event_type:
-                    query += " AND event_type = ?"
-                    params.append(event_type)
-                query += " ORDER BY timestamp DESC LIMIT ?"
-                params.append(limit)
-                rows = conn.execute(query, params).fetchall()
-                return [dict(r) for r in rows]
-        except Exception:
-            return []

@@ -1637,6 +1637,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 
 
+## v17 — Systemic Architecture Fixes
+
+A function-level code review found **5 structural diseases** (not 40 isolated bugs). Each had one root cause and one systemic fix. **97 tests** (up from 0) protect every fix.
+
+| Fix | Disease | Impact | Measured improvement |
+|-----|---------|--------|---------------------|
+| **A. Context Schema** | 37/48 context keys silently dropped — domain knowledge, architecture plans, training analysis all computed but never reached the LLM | `context_keys.py` became the single source of truth (inject + prune + serialize all read one registry); `_format_leader_input` 170→8 lines | Prompt sections 13→21; keys reaching LLM 19%→98% |
+| **B. Advisory→Enforced** | Audit + constraint engine detected problems but couldn't change behavior (LLM ignored text directives) | Audit: per-signature counter, 2 strikes→forced fix, 3→pause. Constraint: dead-end 5+ now sets `forbidden` (hard gate reachable) | FORBIDDEN gate reachable; audit escalations have enforcement teeth |
+| **C. Shared Primitives** | 15+ AST-scan copies + 4 loss-parse copies with 3 divergent thresholds | `training_log_parser.py` + `model_structure_scanner.py` | Also fixes "0 params" bug (kwargs now handled) |
+| **D. Dead Code** | ~200 lines of never-called methods | Deleted 7 dead methods + dead config fields | — |
+| **E. loop.py split** | 5018-line god-object | Deferred (0 dead methods, pure maintainability, needs runtime baseline) | — |
+
+**IdeaScout integration**: `core/idea_scout_bridge.py` adds cross-domain idea discovery to the `paper_research` phase. Finds papers from other fields whose core ideas can transfer to your task (not just keyword-similar papers). Auto-generates a research profile from `PROJECT_BRIEF.md`. Disabled by default (`idea_scout.enabled: false`).
+
+See `docs/architecture.md §36` for full details.
+
+---
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

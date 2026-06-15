@@ -2,5 +2,13 @@
 anthropic>=0.40.0    # For Claude Sonnet 4.6 / Opus 4.6
 openai>=1.30.0       # For Codex 5.3 / GPT 5.4 / GLM5.1 /Qwen3.6plus
 
+# GLM (Zhipu) native SDK — required when provider="glm_token_plan"
+# Provides ZhipuAiClient with streaming + thinking (reasoning_content) + tool_stream.
+# NOTE: PyPI also publishes a placeholder package named "zai"; the real one is "zai-sdk".
+zai-sdk>=0.2.0
+
 # Core
 pyyaml>=6.0
+
+# Testing (dev)
+pytest>=8.0

@@ -885,6 +885,28 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 cwd=str(self.workspace),
             )
 
+        # Write a structured manifest alongside the log. This is the single
+        # source of truth for "an experiment was launched" — replacing the
+        # brittle regex that used to sniff run_shell command text for
+        # `python train.py`. The dispatcher reads pid/status from the tool
+        # return value (truth), and VERIFY/REFLECT can read this manifest
+        # for the full record (script, gpu, timestamp).
+        manifest = {
+            "pid": proc.pid,
+            "command": command,
+            "log_file": str(log_path),
+            "gpu": gpu,
+            "workspace": str(self.workspace),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "status": "launched",
+        }
+        manifest_path = log_path.parent / "experiment_manifest.json"
+        try:
+            with open(manifest_path, "w") as mf:
+                json.dump(manifest, mf, indent=2)
+        except OSError:
+            logger.warning(f"Could not write experiment_manifest.json at {manifest_path}")
+
         return json.dumps({"pid": proc.pid, "log_file": str(log_path), "status": "launched"})
 
     def _exec_write_file(self, path: str, content: str) -> str:

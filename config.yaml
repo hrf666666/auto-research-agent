@@ -14,7 +14,9 @@ agent:
   #   ali_token_plan: Aliyun Token Plan for code agents (requires ALI_TOKEN_PLAN_API_KEY)
   #                   strong: qwen3.6-plus | fast: deepseek-v3.2
   #   glm_token_plan: Zhipu GLM Coding Plan (requires GLM_CODING_PLAN_API_KEY)
-  #                   Primary: strong=glm-5.1, fast=glm-5
+  #                   Primary: strong=glm-5.1 (thinking auto-enabled), fast=glm-5
+  #                   NOTE: glm-5.2 returns 403 (code 1220) on standard Coding Plan
+  #                   tiers as of 2026-06; using glm-5.1 as strong until authorized.
   #                   Auto-failover: if primary fails, switches to ali_token_plan
   provider: "glm_token_plan"
 
@@ -24,7 +26,7 @@ agent:
   #   - Explicit model name: use that model for ALL tasks (overrides tier logic)
   #
   # Per-provider models:
-  #   glm_token_plan: glm-5.1 (strong) | glm-5 (fast) | glm-5-turbo | glm-4.7 | glm-4.6 | glm-4.5
+  #   glm_token_plan: glm-5.1 (strong, thinking) | glm-5 (fast) | glm-5-turbo | glm-4.7 | glm-4.6 | glm-4.5
   #   ali_token_plan: qwen3.6-plus (all tasks) | deepseek-v3.2 | glm-5 | MiniMax-M2.5
   #   anthropic:      claude-sonnet-4-6 (fast) | claude-opus-4-6 (strongest)
   #   openai:         codex-5.3 (fast)         | gpt-5.4 (strongest)
@@ -99,3 +101,19 @@ multimodal_mcp:
 # Auto-detected at runtime. Only used when GLM key is available.
 # Provides specialized visual understanding tools via MCP protocol.
 # No manual configuration needed — endpoints are resolved by provider detection.
+
+# IdeaScout — Cross-domain research idea discovery (research-idea-scout)
+# When enabled, the paper_research phase uses IdeaScout's profile-guided
+# pipeline (gather → rule-filter → LLM transferability score) instead of the
+# default researcher agent. A Profile is auto-generated from PROJECT_BRIEF.md;
+# set profile_path to use a hand-written YAML profile instead.
+# Requires the research-idea-scout package on sys.path (auto-detected at
+# ~/code/research-idea-scout or /home/bigboss/code/research-idea-scout).
+idea_scout:
+  enabled: false                # Set true to activate (default off, zero behavior change)
+  max_papers: 50                # Max papers to gather via search_papers
+  filter_top_k: 20              # Candidates kept after rule-based filtering
+  score_top_k: 10               # Candidates LLM-scored and ranked in the report
+  abstract_max_chars: 3000
+  # profile_path: ""            # Optional: path to a hand-written profile YAML
+  # lib_path: ""                # Optional: override research-idea-scout install path
