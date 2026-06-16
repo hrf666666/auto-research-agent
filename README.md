@@ -1655,6 +1655,23 @@ See `docs/architecture.md §36` for full details.
 
 ---
 
+## v18 — Architecture Reform (principle-driven, 4 phases)
+
+A 25-dimension system audit found **8 structural root causes**. Reform follows 5 principles: safety is a tool property (not a layer), information is queried (not injected), LLM works autonomously, memory replaces enforcement, prompt defines methodology (not control). **134 tests** (up from 0).
+
+| Phase | What changed | Measured effect |
+|-------|-------------|-----------------|
+| **1. Knowledge loop** | 89 lessons + 102 causal chains + experiment values were stored but 0% consumed. Fixed consumption (SQL schema, verified filter, models/ fallback). System writes quantitative metrics to MEMORY_LOG. Goal tracking + auto-stop on achievement. | Knowledge injection: 0% → >80% |
+| **2. Tool safety** | write_file enforces naming conventions (root .py/train_*/debug_*). Deterministic GC (no LLM, no quota). Dry-run gate. | tools/ files: 117 → auto-archived |
+| **3. Remove enforcement** | Deleted 245 lines of 0-trigger research-decision methods (stagnation/architecture-switch). Disabled 4 circuit breakers. | Enforcement layers: 7 → 3 |
+| **4. Generalization** | Metric keys config-driven (not hardcoded val_MAE). Prompt trimmed. | Domain-agnostic metrics |
+
+New modules: `signal_arbiter.py`, `garbage_collector.py`, `training_log_parser.py`, `model_structure_scanner.py`, `idea_scout_bridge.py`. Context key registry (`context_keys.py`) is the single source of truth for injection/pruning/serialization.
+
+See `docs/architecture.md §37` for full details.
+
+---
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

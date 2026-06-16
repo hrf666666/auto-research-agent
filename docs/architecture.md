@@ -1398,3 +1398,113 @@ config, the pipeline: gathers papers (via `search_papers`) → rule-filters
 (via ProviderRouter, not codex CLI) → writes a ranked Markdown report. A
 `Profile` is auto-generated from `PROJECT_BRIEF.md`. Disabled by default
 (zero behavior change).
+
+---
+
+### 37. v18 — Architecture Reform (4 phases, principle-driven)
+
+A 25-dimension system audit identified that the agent had **8 structural root
+causes**, not isolated bugs. The reform follows 5 design principles:
+
+```
+P1. 安全是工具的契约，不是一个组件 (Safety is a tool property, not a layer)
+P2. 信息是被查询的，不是被注入的 (Information is queried, not injected)
+P3. LLM 在认知循环里自主工作 (LLM works autonomously in a cognitive loop)
+P4. 记忆是核心 (Memory is the core — effective memory replaces enforcement)
+P5. prompt 定义研究方法论框架 (Prompt defines methodology, not control)
+```
+
+#### Phase 1: Knowledge Loop Closure + Structured Memory
+
+**Problem**: 89 code_review_lessons, 102 causal_chains, 48 experiment_values
+accumulated in SQLite but **0% consumed** by THINK. The agent was amnesic —
+it repeated errors because it never saw its own history.
+
+**Fixes**:
+- `causal_history`: inject ALL links (not just verified), marking status.
+  Previously the `verified` filter made it always empty (0/102 verified).
+- `code_review_lessons`: fallback to memory-log search when `models/` absent.
+- `experiment_value`: inject low-VOI directions (`information_value < 0.01`).
+  Fixed SQL column names (`voi` → `information_value`).
+- Structured memory: system writes `[Cycle N] val_MAE=X status=Y` to
+  MEMORY_LOG.md deterministically (not via LLM free text). Re-extracts from
+  training log when monitor metrics are empty (covers the 60% empty case).
+- Goal tracking: parse targets from PROJECT_BRIEF, track best vs target,
+  inject `goal_progress` context key, auto-stop when achieved.
+- `training_log_parser` + `model_structure_scanner` integrated into
+  monitor/verifier/model_analyzer (replacing 4 duplicated regex + kwargs bug).
+
+#### Phase 2: Tool-Level Safety Contracts
+
+**Problem**: Safety rules were scattered across run(), constraint_engine,
+prompt suggestions. Naming conventions were advisory (tools/ had 117 files).
+
+**Fixes**:
+- `write_file`: enforces naming (root `.py` rejected, `train_*.py` must be in
+  `scripts/`, `debug_*`/`diag_*`/`_check_*` must be in `tools/`).
+- `launch_experiment`: optional mandatory dry-run gate (config-controlled).
+- `core/garbage_collector.py`: deterministic GC (no LLM, no quota cost) —
+  archives temp files and old output dirs; never touches protected files.
+- `config.yaml`: new `safety` section (naming rules, GC thresholds).
+
+#### Phase 3: Remove Research-Decision Enforcement
+
+**Problem**: 7-layer enforcement chain in run() (arbiter → phase gate →
+roadmap → no-progress fallback → launch enforcement → audit enforcement →
+arbitrate). 9 stagnation counters had **0 triggers** in 23 production cycles.
+Circuit breakers injected advisory text the LLM ignored.
+
+**Fixes**:
+- Deleted `_apply_no_progress_fallback` (159 lines), `_extract_direction_signature`,
+  `_extract_architecture_name`, `_analyze_architecture_dead_ends` (90 lines) —
+  all research decisions, not safety constraints.
+- Disabled 4 circuit breaker conditions (`if False and`) — idea_guardian,
+  direction_circuit_breaker, architecture_circuit_breaker, quality_alert.
+- run() enforcement chain: **7 → 3 layers** (arbiter → phase_gate → roadmap).
+- Retained: `_check_phase_blocked` (safety), `_enforce_launch_after_failure`
+  (behavior constraint), `_enforce_roadmap_alignment` (deviation detection),
+  `constraint_engine` FORBIDDEN.
+
+#### Phase 4 (partial): Domain Generalization + Prompt Trimming
+
+**Fixes**:
+- Metric keys config-driven (`config.yaml goals.metrics`), not hardcoded
+  `val_MAE`. `memory.py` and `loop.py` read from config.
+- `leader.md`: Idea Guardian → Research Direction Self-Assessment (methodology,
+  not enforcement). 673→658 lines.
+- `code_agent.md`: naming rules simplified (enforced by write_file). 376→361 lines.
+
+**Deferred** (pending runtime validation):
+- `code_review` extraction to `core/code_review.py` (854 lines)
+- Non-blocking execution model (training async + experiment registry)
+- Plugin → tool conversion (sandbox/idea_planner/visual_analyzer)
+
+#### Signal Arbitration System
+
+`core/signal_arbiter.py` provides a unified enforcement decision point.
+Collects signals from launch failures, audit escalations, and forbidden
+constraints. Produces a `CycleDirective` with either a `forced_action`
+(bypassing LLM) or a budgeted context for normal THINK.
+
+#### Context Schema (single source of truth)
+
+`core/context_keys.py` registers every context key with its serializer,
+tier, and phase. `ContextPruner` derives tiers from the registry (not a
+separate hardcoded list). Adding a key requires exactly ONE change (the
+registry); injection, pruning, and serialization all pick it up.
+
+Previously 37/48 keys were silently dropped (77% waste). Now 98% reach the
+LLM. `_format_leader_input` shrank from 170 to 8 lines.
+
+#### Garbage Collection
+
+`core/garbage_collector.py` — deterministic, no LLM. Archives `debug_*`/
+`diag_*`/`_check_*`/`dryrun_*` from `tools/` to `archive/temp/`. Old output
+dirs (>10) archived unless they contain `best_model.pth`. Protected files
+(models/, datasets/, scripts/, PROJECT_BRIEF.md) never touched.
+
+#### Test Coverage: 0 → 134 tests
+
+14 test files covering: error classification, dispatch contracts, cycle state,
+context schema, signal arbitration, knowledge consumption, tool safety,
+garbage collection, shared primitives, IdeaScout bridge, security.
