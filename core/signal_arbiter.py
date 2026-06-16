@@ -144,15 +144,6 @@ class SignalArbiter:
                       forced_reason=sig.forced_reason,
                       escalation_count=sig.escalation_count + 1)
 
-    def _build_forced_task(self, sig):
-        return (
-            f"CRITICAL - UNRESOLVED ISSUE (escalated {sig.escalation_count} cycles).\n\n"
-            f"Signal source: {sig.source}\nIssue key: {sig.key}\n\n"
-            f"This has persisted across multiple cycles. Fix it NOW:\n"
-            f"1. Identify the root cause.\n"
-            f"2. Apply the minimal fix.\n"
-            f"3. Verify the fix.\n"
-        )
 
     def _dedup(self, signals):
         by_key = {}

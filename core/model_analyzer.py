@@ -68,7 +68,7 @@ class ModelAnalyzerMixin:
                     "or kwargs-only instantiation that AST cannot resolve."
                 )
         except Exception:
-            result["total_params_estimate"] = self._estimate_params_from_ast(tree)
+            result["total_params_estimate"] = 0  # scanner failed, no fallback
 
         # Check branch balance
         if result["branch_analysis"]:
@@ -182,29 +182,6 @@ class ModelAnalyzerMixin:
                         return ch
         return 0
 
-    def _estimate_params_from_ast(self, tree) -> int:
-        """Rough parameter estimate from AST."""
-        import ast
-        total = 0
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if node.func.attr == "Conv2d" and len(node.args) >= 2:
-                    in_ch = node.args[0]
-                    out_ch = node.args[1]
-                    kernel = node.args[2] if len(node.args) > 2 else ast.Constant(3)
-                    if isinstance(in_ch, ast.Constant) and isinstance(out_ch, ast.Constant):
-                        ic, oc = in_ch.value, out_ch.value
-                        if isinstance(kernel, ast.Constant):
-                            k = kernel.value if isinstance(kernel.value, int) else 3
-                        else:
-                            k = 3
-                        total += ic * oc * k * k
-                elif node.func.attr in ("Linear", "BatchNorm2d", "GroupNorm"):
-                    if node.args:
-                        ch = node.args[0]
-                        if isinstance(ch, ast.Constant):
-                            total += ch.value * 2  # rough estimate
-        return total
 
     def _parse_target_size(self, size_str: str) -> tuple:
         try:

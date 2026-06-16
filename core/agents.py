@@ -256,26 +256,6 @@ _CODE_EXPLORE_TOOLS = frozenset({
 })
 
 
-class QuotaExhausted(Exception):
-    """A provider's billing/quota window is exhausted (not a per-call rate limit).
-
-    Raised when a 429 carries a quota-window signal (GLM code 1308,
-    "使用上限"/"quota"/"reset" keywords). Unlike a per-minute rate-limit 429,
-    a quota-window 429 is ACCOUNT-WIDE: every model on the same API key will
-    fail identically until the window resets. Retrying the model chain just
-    burns N doomed calls. The dispatcher must instead cool the whole provider
-    until `reset_time`.
-    """
-
-    def __init__(self, message: str = "", reset_time=None, provider: str = ""):
-        super().__init__(message)
-        self.reset_time = reset_time   # datetime | None
-        self.provider = provider
-
-
-# Quota-window signals. A 429 whose error body matches any of these is a
-# window-exhaustion (permanent-until-reset), not a per-minute rate-limit.
-# GLM uses code 1308 + "使用上限"; other providers use "quota"/"reset".
 _QUOTA_CODE_PATTERNS = {"1308", "1220"}  # GLM quota codes observed in production
 _QUOTA_KEYWORDS = ("使用上限", "配额", "quota", "exhausted", "limit reached",
                    "will reset", "将在", "重置")

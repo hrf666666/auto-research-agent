@@ -138,20 +138,15 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Fix 1: Output quality awareness ──
         # Track per-domain metrics to detect when agent produces "successful bad results"
         self._best_domain_metrics: dict[str, float] = {}  # domain → best MAE
-        self._quality_alert_streak: int = 0  # Consecutive cycles with quality degradation
 
         # ── Fix 3: Strategic abandonment ──
         # Track whether the agent is stuck in a research direction
-        self._current_direction_signature: str = ""  # Hash of current research direction
-        self._direction_stagnation_count: int = 0     # Cycles without improvement in current direction
         self._direction_change_threshold: int = 3     # Force paper research after N stagnations
 
         # ── v14: Architecture-level stagnation (independent of direction stagnation) ──
         # Tracks whether the agent is stuck patching the SAME architecture.
         # Unlike direction stagnation, this is NOT reset by paper_research —
         # only reset when a genuinely different architecture is detected.
-        self._current_architecture_name: str = ""           # Detected architecture name (e.g., "epi", "unet")
-        self._architecture_stagnation_count: int = 0        # Cycles on same architecture without improvement
         self._architecture_stagnation_threshold: int = 5    # Trigger architecture switch after N cycles
         self._architecture_survey_done: bool = False        # Whether architecture survey has been completed
         self._architecture_survey_path = self.workspace / "ARCHITECTURE_SURVEY.md"
@@ -449,7 +444,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                     self._record_cycle_outcome(think_result, execute_result, reflect_result,
                                                 verify_report_dict=verify_report.to_dict() if verify_report else None)
                     self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
-                    self._auto_code_cleanup(execute_result, reflect_result)
                     self._gc.run()  # Phase 2: deterministic GC
                     # Post-reflect code review: learn from mistakes
                     self._post_reflect_code_review(execute_result, reflect_result, verify_report)
@@ -499,7 +493,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                         verify_report_dict=verify_report.to_dict() if verify_report else None
                     )
                     self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
-                    self._auto_code_cleanup(execute_result, reflect_result)
                     self._gc.run()  # Phase 2: deterministic GC
                     self._post_reflect_code_review(execute_result, reflect_result, verify_report)
                     self._save_cycle_counter()
@@ -800,7 +793,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                     self._save_cycle_counter()
 
                 # AUTO CODE-CLEANUP: Check trigger conditions after each cycle
-                self._auto_code_cleanup(execute_result, reflect_result)
                 self._gc.run()  # Phase 2: deterministic GC
 
                 # AUDIT ESCALATION: Check if VERIFY failures are recurring
@@ -994,52 +986,10 @@ class ResearchLoop(DomainKnowledgeMixin):
             and self.roadmap.is_theory_verification_phase
         )
 
-        if False and self._direction_stagnation_count >= self._direction_change_threshold:  # v18: disabled
-            if _roadmap_active:
-                # Override: don't suggest changing direction, suggest verifying current module
-                active_names = self.roadmap.active_module_names[:3]
-                mod_names = ", ".join(active_names)
-                context["direction_circuit_breaker"] = (
-                    f"ROADMAP PRIORITY OVERRIDE (v15): Direction stagnation detected, "
-                    f"but research is still in theory_verification phase.\n"
-                    f"Active modules: {mod_names}\n"
-                    f"Instead of changing direction, you MUST verify the assumptions of these modules.\n"
-                    f"Propose a DATA ANALYSIS experiment to test the core assumptions."
-                )
-            else:
-                context["direction_circuit_breaker"] = (
-                    f"DIRECTION CIRCUIT BREAKER TRIGGERED: {self._direction_stagnation_count} "
-                    f"cycles without progress on current direction.\n"
-                    f"STOP and re-read PROJECT_BRIEF. You MUST propose a FUNDAMENTALLY different approach.\n"
-                    f"Record the current direction as a dead end before proceeding."
-                )
-
         # ── v14: ARCHITECTURE CIRCUIT BREAKER ──
         # When the same architecture has been patched for too many cycles without
         # improvement, force the agent to SWITCH to a completely different architecture.
         # v15: During theory_verification, architecture switching is premature.
-        if False and self._architecture_stagnation_count >= self._architecture_stagnation_threshold:  # v18: disabled
-            if _roadmap_active:
-                # Suppress architecture switch during theory verification
-                logger.info(
-                    "ROADMAP priority: suppressing architecture_circuit_breaker "
-                    "during theory_verification phase"
-                )
-            else:
-                context["architecture_circuit_breaker"] = (
-                    f"ARCHITECTURE CIRCUIT BREAKER (v14): {self._architecture_stagnation_count} "
-                    f"cycles spent on architecture '{self._current_architecture_name}' without improvement.\n"
-                    f"This architecture is a DEAD END — incremental patches will NOT help.\n\n"
-                    f"MANDATORY ACTIONS:\n"
-                    f"1. Record '{self._current_architecture_name}' architecture as a dead end\n"
-                    f"2. Read ARCHITECTURE_SURVEY.md (if exists) for candidate alternatives\n"
-                    f"3. If no survey exists, do paper_research to find 3+ alternative architectures\n"
-                    f"4. Select the best alternative based on: assumption compatibility with data, "
-                    f"parameter efficiency, and implementation feasibility\n"
-                    f"5. Design a pilot experiment (2-5 epochs) to validate the new architecture\n"
-                    f"6. Do NOT propose ANY change to the current '{self._current_architecture_name}' architecture"
-            )
-
         # ── v14: ARCHITECTURE SURVEY GATE ──
         # In early cycles (1-2), force an architecture survey before committing to any model.
         # This prevents the agent from blindly using PROJECT_BRIEF's suggested baseline.
@@ -2643,20 +2593,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Fix 1 (实验设计): Inject hypothesis validation prompt ──
         # When a domain is severely degraded, force the agent to verify
         # whether the method's core assumptions hold in that domain.
-        if False and self._quality_alert_streak >= 2:  # v18: disabled
-            context["hypothesis_validation_prompt"] = (
-                "HYPOTHESIS VALIDATION REQUIRED:\n"
-                "Your method has been producing severely degraded results for multiple cycles. "
-                "Before proposing another experiment, you MUST:\n"
-                "1. State the CORE ASSUMPTION of your current method (e.g., 'EPI slope encodes depth').\n"
-                "2. Identify which domain(s) violate this assumption.\n"
-                "3. If the assumption is violated, incremental improvements (loss weights, "
-                "data augmentation, hyperparameters) will NOT help. You need a NEW method.\n"
-                "4. Propose a method that does NOT rely on the violated assumption.\n"
-            )
-
-        # ── TRAINING CURVE ANALYSIS INJECTION ──
-        # Provide curve-level diagnostics to augment the Leader's reflection
         self._inject_training_curve_analysis(context, execute_result)
 
         # ── EXPERIMENT EVALUATOR INJECTION ──
@@ -3764,17 +3700,10 @@ class ResearchLoop(DomainKnowledgeMixin):
         return think_result
 
 
-    def _build_goal_progress(self) -> str:
-        """Phase 1: Build a goal progress string from PROJECT_BRIEF + SQLite.
 
-        Extracts target metrics from the brief (e.g., "val_MAE < 0.20"),
-        queries SQLite for the best achieved metric, and formats a progress
-        report showing achieved vs unachieved targets.
-        """
+    def _parse_goals_from_brief(self) -> list[dict]:
+        """Parse target metrics from PROJECT_BRIEF. Shared by goal_progress and goal_achieved."""
         import re as _re
-
-        # Parse targets from PROJECT_BRIEF
-        # Captures optional sub-domain prefix: "Lambertian val_MAE < 0.16"
         brief = self.memory.get_brief()
         targets = []
         for m in _re.finditer(
@@ -3783,7 +3712,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             brief, _re.IGNORECASE
         ):
             sub = m.group(1) or ""
-            # Normalize sub-domain to English key suffix
             sub_map = {"lambertian": "Lambertian", "non-lambertian": "NonLambertian",
                        "non lambertian": "NonLambertian", "mixed": "Mixed",
                        "urban": "Urban", "整体": "overall", "overall": "overall"}
@@ -3795,6 +3723,16 @@ class ResearchLoop(DomainKnowledgeMixin):
                     targets.append({"key": full_key, "target": val})
             except ValueError:
                 continue
+        return targets
+
+    def _build_goal_progress(self) -> str:
+        """Phase 1: Build a goal progress string from PROJECT_BRIEF + SQLite.
+
+        Extracts target metrics from the brief (e.g., "val_MAE < 0.20"),
+        queries SQLite for the best achieved metric, and formats a progress
+        report showing achieved vs unachieved targets.
+        """
+        targets = self._parse_goals_from_brief()
 
         if not targets:
             return ""
@@ -3827,27 +3765,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         skipped (not treated as unmet), because get_best_metric's fallback to
         val_MAE would use the wrong comparison (overall vs sub-domain target).
         """
-        import re as _re
-
-        brief = self.memory.get_brief()
-        targets = []
-        for m in _re.finditer(
-            r'(?:(Lambertian|Non.Lambertian|Mixed|Urban|整体|overall)\s+\S*\s+)?'
-            r'(?:val_)?(MAE|mae)\s*(?:<|>|<=|>=)\s*([0-9.]+)',
-            brief, _re.IGNORECASE
-        ):
-            sub = m.group(1) or ""
-            sub_map = {"lambertian": "Lambertian", "non-lambertian": "NonLambertian",
-                       "non lambertian": "NonLambertian", "mixed": "Mixed",
-                       "urban": "Urban", "整体": "overall", "overall": "overall"}
-            sub_key = sub_map.get(sub.lower().strip(), "") if sub else ""
-            full_key = f"val_MAE_{sub_key}" if sub_key else "val_MAE"
-            try:
-                val = float(m.group(3))
-                if not any(t["key"] == full_key and t["target"] == val for t in targets):
-                    targets.append({"key": full_key, "target": val})
-            except ValueError:
-                continue
+        targets = self._parse_goals_from_brief()
 
         if not targets:
             return False  # no targets parsed → don't stop
@@ -3862,10 +3780,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             if key != "val_MAE" and key != "val_MAE_overall":
                 continue  # skip sub-domain targets (no data to verify)
             try:
-                best = self.memory._query_best(
-                    __import__('sqlite3').connect(":memory:"), key
-                ) if False else None
-                # Use the direct query method (not the fallback version)
                 best = self.memory._query_best_raw(key)
             except Exception:
                 best = None
@@ -3914,7 +3828,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             self._no_progress_streak = 0
             self._last_no_progress_signature = ""
             self._metric_no_progress_streak = 0
-            self._direction_stagnation_count = 0  # Reset direction stagnation
             self._infra_failure_streak = 0
             # v14: Do NOT reset _architecture_stagnation_count — paper research alone
             # does not change the underlying architecture being used.
@@ -4068,27 +3981,12 @@ class ResearchLoop(DomainKnowledgeMixin):
                 )
             except Exception as e:
                 logger.debug(f"Experiment value update skipped: {e}")
-            if quality_degraded:
-                self._quality_alert_streak += 1
-                if False and self._quality_alert_streak >= 2:  # v18: disabled
-                    logger.warning(
-                        f"QUALITY ALERT: {self._quality_alert_streak} consecutive cycles with "
-                        f"degraded domain metrics. Forcing visual analysis + paper research."
-                    )
-                    self.memory.log_decision(
-                        f"[QUALITY] {self._quality_alert_streak} cycles of degraded quality. "
-                        f"Agent must diagnose root cause before next experiment."
-                    )
-            else:
-                self._quality_alert_streak = 0
         else:
-            self._quality_alert_streak = 0
-
-        # v18 Phase 3: Direction/architecture stagnation tracking removed.
+            # v18 Phase 3: Direction/architecture stagnation tracking removed.
         # These counters had 0 triggers in 23 cycles of production. The LLM
         # should decide to change direction based on experiment history
         # (Phase 1 knowledge loop), not system-enforced stagnation detection.
-        task_text = think_result.get("task", "")[:200]
+            task_text = think_result.get("task", "")[:200]
 
         # Check architecture survey completion
         if not self._architecture_survey_done and self._architecture_survey_path.exists():
@@ -4155,130 +4053,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             time.sleep(sleep_chunk)
             elapsed += sleep_chunk
 
-    def _auto_code_cleanup(self, execute_result: dict, reflect_result: dict):
-        """Automatically trigger code-cleanup when conditions are met.
-
-        Trigger conditions:
-        1. Root .py files > 15
-        2. logs/ or outputs/ has > 10 unarchived log files
-        3. outputs/ has > 10 experiment directories
-        4. archive/ has > 20 experiments (needs pruning)
-        5. scripts/ has > 10 .py files (naming pollution / stale scripts)
-        6. Experiment failed or hit major bug (MUST trigger immediately)
-        """
-        project = self.project_dir
-        should_cleanup = False
-        reasons = []
-
-        # Condition 1: Root .py files > 15
-        root_py_count = len(list(project.glob("*.py")))
-        if root_py_count > 15:
-            should_cleanup = True
-            reasons.append(f"Root .py files: {root_py_count} (> 15)")
-
-        # Condition 2: logs/ or outputs/ has > 10 unarchived files
-        logs_dir = project / "logs"
-        outputs_dir = project / "outputs"
-        log_count = 0
-        if logs_dir.exists():
-            log_count = len(list(logs_dir.rglob("*.log"))) + len(list(logs_dir.rglob("*.csv")))
-        if outputs_dir.exists():
-            log_count += len(list(outputs_dir.rglob("*.log"))) + len(list(outputs_dir.rglob("*.csv")))
-        if log_count > 10:
-            should_cleanup = True
-            reasons.append(f"Unarchived log files: {log_count} (> 10)")
-
-        # Condition 3: outputs/ has too many experiment dirs
-        if outputs_dir.exists():
-            exp_dirs = [d for d in outputs_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-            if len(exp_dirs) > 10:
-                should_cleanup = True
-                reasons.append(f"Output experiment dirs: {len(exp_dirs)} (> 10)")
-
-        # Condition 4: archive/ is bloated
-        archive_dir = project / "archive" / "experiments"
-        if archive_dir.exists():
-            archive_count = len([d for d in archive_dir.iterdir() if d.is_dir()])
-            if archive_count > 20:
-                should_cleanup = True
-                reasons.append(f"Archive experiments: {archive_count} (> 20)")
-
-        # Condition 5: scripts/ has too many files (naming pollution)
-        scripts_dir = project / "scripts"
-        if scripts_dir.exists():
-            script_count = len([f for f in scripts_dir.iterdir() if f.suffix == ".py"])
-            if script_count > 10:
-                should_cleanup = True
-                reasons.append(f"scripts/ files: {script_count} (> 10, likely stale scripts)")
-
-        # Condition 6: Experiment failed
-        if execute_result.get("response", "").startswith('{"error"'):
-            should_cleanup = True
-            reasons.append("Experiment API error — cleanup to prevent raw log accumulation")
-
-        if not execute_result.get("experiment_launched") and execute_result.get("agent") == "code":
-            if self._no_progress_streak >= 4:
-                should_cleanup = True
-                reasons.append(f"Code agent failed to launch experiment for {self._no_progress_streak} consecutive cycles")
-
-        if not should_cleanup:
-            logger.debug("Code-cleanup conditions not met. Skipping.")
-            return
-
-        logger.info(f"Auto code-cleanup triggered: {'; '.join(reasons)}")
-
-        # Dispatch code agent to execute code-cleanup
-        cleanup_task = (
-            "AUTO CODE-CLEANUP TRIGGERED\n\n"
-            f"Reasons: {'; '.join(reasons)}\n\n"
-            "You have MAXIMUM 10 tool calls. Be EFFICIENT.\n\n"
-            "Execute the following cleanup steps:\n\n"
-            "## Step 1: Clean up outputs/ (2 tool calls max)\n"
-            "For experiments in outputs/ that are NOT the latest/best:\n"
-            "- Keep only best_checkpoint.pt (delete final_checkpoint.pt)\n"
-            "- Delete dry-run experiments entirely (dirs starting with 'dry_' or 'dryrun_')\n"
-            "- Delete superseded experiments (not current or previous cycle)\n"
-            "Example:\n"
-            "```bash\n"
-            "find outputs/ -name 'final_checkpoint.pt' -delete\n"
-            "rm -rf outputs/dry_* outputs/dryrun_*\n"
-            "```\n\n"
-            "## Step 2: Prune archive/ (2 tool calls max)\n"
-            "- Delete ALL .pt checkpoint files (too large to keep)\n"
-            "- Delete dirs without SUMMARY.md (no useful info)\n"
-            "- If archive has > 20 entries, delete oldest 50%\n"
-            "```bash\n"
-            "find archive/ -name '*.pt' -delete\n"
-            "find archive/experiments/ -mindepth 1 -maxdepth 1 -type d "
-            "| while read d; do [ -f \"$d/SUMMARY.md\" ] || rm -rf \"$d\"; done\n"
-            "```\n\n"
-            "## Step 3: Clean up scripts/ (2 tool calls max)\n"
-            "Delete scripts that violate naming convention or are obsolete:\n"
-            "- One-time diagnostics (test_*.py, audit_*.py, diagnose_forward.py)\n"
-            "- Superseded versions (*_v2.py, *_fix.py when newer version exists)\n"
-            "- Scripts importing models that no longer exist\n"
-            "- Keep: train_*.py (one per model), eval_*.py, inference_*.py, dry_run.py\n"
-            "```bash\n"
-            "rm -f scripts/test_*.py scripts/audit_*.py scripts/diagnose_forward.py\n"
-            "```\n\n"
-            "## Step 4: Clean up root .py files (1 tool call max)\n"
-            "Remove obsolete .py files in project root.\n\n"
-            "CRITICAL RULES:\n"
-            "- NEVER delete: models/, datasets/, scripts/, data/, DATASET_MANIFEST.json, config.yaml\n"
-            "- NEVER delete any .npy or .png in data/\n"
-            "- Use run_shell for batch operations\n"
-            "- Maximum 10 tool calls total\n"
-            "- Git history is the backup\n"
-            "- Checkpoints (.pt files) are the #1 disk hog — always clean them first"
-        )
-
-        cleanup_result = self.dispatcher.dispatch_worker(
-            agent_type="code",
-            task=cleanup_task,
-            tools=self.tools.get_tools_for("code"),
-            max_turns_override=12,  # Limit cleanup to avoid wasting 40+ turns
-        )
-        logger.info(f"Auto code-cleanup completed: {str(cleanup_result)[:200]}")
 
     def _check_audit_escalation(self, issues: list[str]) -> list[dict]:
         """Check if any audit issue has repeated enough times to warrant escalation.
