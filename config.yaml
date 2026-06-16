@@ -117,3 +117,17 @@ idea_scout:
   abstract_max_chars: 3000
   # profile_path: ""            # Optional: path to a hand-written profile YAML
   # lib_path: ""                # Optional: override research-idea-scout install path
+
+# Safety — Phase 2: tool-level safety contracts (P1)
+# These are enforced INSIDE the tools (write_file, launch_experiment),
+# not by an external guard layer.
+safety:
+  mandatory_dry_run: false     # When true, launch_experiment requires recent dry-run
+  naming:
+    train_scripts_dir: "scripts/"
+    tools_dir: "tools/"
+    forbidden_root_py: true    # Block .py files in workspace root
+  garbage_collection:
+    temp_patterns: ["debug_", "diag_", "_check_", "dryrun_", "dry_run_"]
+    max_output_dirs: 10
+    archive_dir: "archive/temp/"

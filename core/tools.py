@@ -43,9 +43,11 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     - web_fetch: MCP web_reader → urllib direct fetch
     """
 
-    def __init__(self, workspace: Path, memory=None):
+    def __init__(self, workspace: Path, memory=None, config: dict = None):
         self.workspace = Path(workspace).resolve()
         self._memory = memory  # Optional MemoryManager reference for log_memory tool
+        # Phase 2: safety config (tool-level contracts)
+        self._mandatory_dry_run = (config or {}).get("safety", {}).get("mandatory_dry_run", False)
 
         # Protected files and directories — always initialized
         self._protected_files = {
@@ -866,6 +868,21 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                              f"Use train_v11.py or a proper training script instead."
                 })
 
+        # Phase 2 change 2: mandatory dry-run check (P1: safety in the tool)
+        # When config safety.mandatory_dry_run is true, require that a dry-run
+        # of this script was recently performed (within 10 minutes).
+        # Default: OFF (does not change existing behavior).
+        if getattr(self, '_mandatory_dry_run', False):
+            script_name = self._extract_script_name(command)
+            if script_name and not self._has_recent_dry_run(script_name):
+                return json.dumps({
+                    "error": (
+                        f"Dry-run required before launching '{script_name}'. "
+                        f"Run: python {script_name} --dry_run first, then retry. "
+                        f"This prevents wasting GPU on scripts with import/shape errors."
+                    )
+                })
+
         env = os.environ.copy()
         if gpu:
             env["CUDA_VISIBLE_DEVICES"] = gpu
@@ -948,6 +965,38 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                              f"Write new files to the project root or logs/ directory."
                 })
 
+        # Phase 2 change 1: naming convention enforcement (P1: safety in the tool)
+        # Python files must go in scripts/ or tools/, not the workspace root.
+        # Training scripts (train_*.py) must be in scripts/.
+        # Diagnostic scripts (debug_*/diag_*/_check_*) must be in tools/.
+        if resolved.suffix == ".py":
+            top_dir = parts[0] if len(parts) > 1 else ""
+            name = resolved.name
+            if len(parts) == 1:
+                # .py file in workspace root
+                return json.dumps({
+                    "error": (
+                        f"Python files must not be written to the workspace root. "
+                        f"Use scripts/ for training scripts or tools/ for utilities. "
+                        f"Got: {path}. Suggested: scripts/{name}"
+                    )
+                })
+            if name.startswith("train_") and top_dir != "scripts":
+                return json.dumps({
+                    "error": (
+                        f"Training scripts (train_*.py) must be in scripts/. "
+                        f"Got: {path}. Suggested: scripts/{name}"
+                    )
+                })
+            if (name.startswith(("debug_", "diag_", "_check_", "dryrun_", "dry_run_"))
+                    and top_dir != "tools"):
+                return json.dumps({
+                    "error": (
+                        f"Diagnostic scripts must be in tools/. "
+                        f"Got: {path}. Suggested: tools/{name}"
+                    )
+                })
+
         file_path = resolved
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -998,6 +1047,45 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             content = "\n".join(lines)
 
         return content[:10000]  # Cap at 10K chars
+
+    def _extract_script_name(self, command: str) -> str:
+        """Extract the python script name from a launch command."""
+        import re
+        # Match python [flags] script.py
+        m = re.search(r'(?:python|python3)\s+(?:[^\s]*\s+)*?([a-zA-Z_][\w/]*\.py)', command)
+        return m.group(1) if m else ""
+
+    def _has_recent_dry_run(self, script_name: str, max_age_seconds: int = 600) -> bool:
+        """Check if a dry-run of this script was performed recently.
+
+        Looks for experiment_manifest.json entries with a dry-run marker
+        within the last max_age_seconds (default 10 minutes).
+        """
+        import time
+        # Check outputs/*/experiment_manifest.json for dry-run records
+        outputs_dir = self.workspace / "outputs"
+        if not outputs_dir.exists():
+            return False
+        script_basename = Path(script_name).name
+        now = time.time()
+        for manifest_path in outputs_dir.glob("*/experiment_manifest.json"):
+            try:
+                data = json.loads(manifest_path.read_text())
+                cmd = data.get("command", "")
+                ts = data.get("timestamp", "")
+                # Parse timestamp and check age
+                from datetime import datetime
+                dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S") if ts else None
+                if dt:
+                    age = now - dt.timestamp()
+                    if age > max_age_seconds:
+                        continue
+                # Check if this is a dry-run of the same script
+                if script_basename in cmd and ("--dry" in cmd or "dry_run" in cmd or "dryrun" in cmd):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _exec_list_files(self, path: str = ".") -> str:
         """List directory contents."""

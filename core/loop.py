@@ -182,6 +182,10 @@ class ResearchLoop(DomainKnowledgeMixin):
         arbiter_budget = self.config.get("context_budget", 12000)
         self.arbiter = SignalArbiter(budget_chars=arbiter_budget)
 
+        # Phase 2: deterministic garbage collector
+        from .garbage_collector import GarbageCollector
+        self._gc = GarbageCollector(self.project_dir)
+
         # ── Constraint Engine (v10 → v16.1): LLM behavior control ──
         # v16.1: Removed PlannerChecker, QuickBenchmark, AdaptiveThresholds, ImplementationTracker
         self.strategy_engine = StrategyConstraintEngine(self.project_dir, self.workspace)
@@ -446,6 +450,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                                                 verify_report_dict=verify_report.to_dict() if verify_report else None)
                     self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
                     self._auto_code_cleanup(execute_result, reflect_result)
+                    self._gc.run()  # Phase 2: deterministic GC
                     # Post-reflect code review: learn from mistakes
                     self._post_reflect_code_review(execute_result, reflect_result, verify_report)
                     # Paper research is meaningful work — persist cycle counter
@@ -495,6 +500,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
                     self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
                     self._auto_code_cleanup(execute_result, reflect_result)
+                    self._gc.run()  # Phase 2: deterministic GC
                     self._post_reflect_code_review(execute_result, reflect_result, verify_report)
                     self._save_cycle_counter()
                     continue
@@ -795,6 +801,7 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                 # AUTO CODE-CLEANUP: Check trigger conditions after each cycle
                 self._auto_code_cleanup(execute_result, reflect_result)
+                self._gc.run()  # Phase 2: deterministic GC
 
                 # AUDIT ESCALATION: Check if VERIFY failures are recurring
                 audit_issues = [
