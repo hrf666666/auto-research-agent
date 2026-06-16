@@ -500,29 +500,6 @@ class MemoryManager:
 
     # ── Causal Chain Tracking ──
 
-    def record_causal_link(self, cycle: int, design_decision: str,
-                           architectural_property: str, metric_affected: str,
-                           expected_effect: str = ""):
-        """Record a design decision → architectural property → metric causal link."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                INSERT INTO causal_chain
-                    (cycle, design_decision, architectural_property,
-                     metric_affected, expected_effect, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (cycle, design_decision[:300], architectural_property[:300],
-                  metric_affected[:200], expected_effect[:300], time.time()))
-
-    def update_causal_actual(self, cycle: int, metric_affected: str,
-                             actual_effect: str):
-        """Update the actual effect for a causal link after experiment."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                UPDATE causal_chain
-                SET actual_effect = ?, verified = 1
-                WHERE cycle = ? AND metric_affected = ? AND verified = 0
-            """, (actual_effect[:300], cycle, metric_affected[:200]))
-
     def get_causal_history(self, limit: int = 20) -> list[dict]:
         """Get recent causal chain entries for reasoning."""
         with sqlite3.connect(str(self.db_path)) as conn:
@@ -537,31 +514,6 @@ class MemoryManager:
             return [dict(r) for r in rows]
 
     # ── Experiment Value of Information ──
-
-    def record_experiment_value(self, cycle: int, hypothesis: str,
-                                expected_improvement: float,
-                                prior_probability: float,
-                                information_value: float):
-        """Record the estimated value of an experiment before running it."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                INSERT INTO experiment_value
-                    (cycle, hypothesis, expected_improvement,
-                     prior_probability, information_value, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (cycle, hypothesis[:500], expected_improvement,
-                  prior_probability, information_value, time.time()))
-
-    def update_experiment_value_actual(self, cycle: int,
-                                        actual_improvement: float,
-                                        was_correct: bool):
-        """Update experiment value after seeing results."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                UPDATE experiment_value
-                SET actual_improvement = ?, was_correct = ?
-                WHERE cycle = ?
-            """, (actual_improvement, 1 if was_correct else 0, cycle))
 
     def get_experiment_calibration(self) -> dict:
         """Get calibration data: how often do hypotheses actually work?
@@ -617,26 +569,6 @@ class MemoryManager:
         except Exception:
             return []
 
-    def get_best_metric(self, metric_key: str) -> float | None:
-        """Phase 1: Get the best (lowest) value for a metric key from history.
-
-        Used by goal progress tracking to compare current best vs target.
-        Returns None if no experiments recorded this metric.
-
-        Fallback: if the exact key (e.g. val_MAE_Lambertian) isn't found,
-        tries val_MAE (the overall metric) as a conservative approximation.
-        """
-        try:
-            with sqlite3.connect(str(self.db_path)) as conn:
-                best = self._query_best(conn, metric_key)
-                if best is None and metric_key != "val_MAE":
-                    # Fallback: sub-domain metrics (val_MAE_Lambertian etc.)
-                    # aren't stored separately — approximate with overall val_MAE
-                    best = self._query_best(conn, "val_MAE")
-                return best
-        except Exception:
-            return None
-
     def _query_best(self, conn, metric_key: str) -> float | None:
         """Query best metric value for a specific key from metrics_json."""
         best = None
@@ -656,20 +588,6 @@ class MemoryManager:
             except (json.JSONDecodeError, TypeError):
                 continue
         return best
-
-    def _query_best_raw(self, metric_key: str) -> float | None:
-        """Query best metric WITHOUT fallback. Used by _goal_achieved to
-        avoid false-negatives from sub-domain→overall approximation."""
-        try:
-            with sqlite3.connect(str(self.db_path)) as conn:
-                return self._query_best(conn, metric_key)
-        except Exception:
-            return None
-
-    # ── Structured Meta-Pattern Queries ──
-    # NOTE: These methods contain PROJECT-SPECIFIC hardcoded keywords (depth estimation domain).
-    # If adapting this framework for a different research domain, override these methods
-    # or provide domain keywords via config.
 
     def get_method_domain_effect_matrix(self) -> dict:
         """Build method→domain→effect matrix from structured data.
@@ -919,54 +837,6 @@ class MemoryManager:
     # ─────────────────────────────────────────────────
     # Code Review Lessons (Knowledge Base)
     # ─────────────────────────────────────────────────
-
-    def record_code_review_lesson(
-        self,
-        cycle: int,
-        severity: str,
-        category: str,
-        pattern: str,
-        description: str,
-        file_pattern: str = "",
-        code_snippet: str = "",
-        fix_suggestion: str = "",
-        evidence: str = "",
-        source: str = "auto",
-    ):
-        """Record a code review lesson learned from a past mistake.
-
-        Deduplicates by pattern+category: if an identical pattern already exists,
-        increments hit_count and updates last_hit_cycle instead of inserting a row.
-        """
-        now = time.time()
-        with sqlite3.connect(str(self.db_path)) as conn:
-            existing = conn.execute(
-                "SELECT id, hit_count, severity FROM code_review_lessons WHERE pattern = ? AND category = ?",
-                (pattern, category),
-            ).fetchone()
-            if existing:
-                # Severity ordering: HIGH=2 > MEDIUM=1 > LOW=0
-                sev_rank = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
-                old_sev = existing[2]
-                new_sev = severity if sev_rank.get(severity, 1) > sev_rank.get(old_sev, 1) else old_sev
-                conn.execute(
-                    "UPDATE code_review_lessons SET hit_count = hit_count + 1, "
-                    "last_hit_cycle = ?, timestamp = ?, "
-                    "evidence = COALESCE(?, evidence), "
-                    "fix_suggestion = COALESCE(?, fix_suggestion), "
-                    "severity = ? "
-                    "WHERE id = ?",
-                    (cycle, now, evidence or None, fix_suggestion or None, new_sev, existing[0]),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO code_review_lessons "
-                    "(timestamp, cycle, severity, category, pattern, description, "
-                    "file_pattern, code_snippet, fix_suggestion, evidence, hit_count, last_hit_cycle, source) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                    (now, cycle, severity, category, pattern, description,
-                     file_pattern, code_snippet, fix_suggestion, evidence, cycle, source),
-                )
 
     def get_code_review_lessons(self, severity: str = None, category: str = None, limit: int = 30) -> list[dict]:
         """Retrieve code review lessons, optionally filtered."""

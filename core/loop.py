@@ -329,14 +329,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                         # Override wait → experiment
                         think_result = {
                             "action": "experiment",
-                            "reason": reason,
-                            "agent": "code",
-                            "task": (
-                                "The agent has been idling with no active experiments. "
-                                "You MUST propose and launch a concrete experiment now. "
-                                "Read workspace/MEMORY_LOG.md for context and propose a "
-                                "specific improvement to try."
-                            ),
+                            "task": "Propose and launch a concrete experiment now.",
                         }
                     else:
                         self._update_state(
@@ -390,49 +383,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
                 # This is triggered when the architecture stagnation threshold is reached.
                 # The agent researches alternative architectures AND starts implementing.
-                if think_result.get("action") == "architecture_switch":
-                    self._consecutive_wait_count = 0
-                    logger.info(
-                        f"ARCHITECTURE SWITCH triggered — researching alternatives to "
-                        f"'(unknown)'."
-                    )
-                    self._update_state(
-                        {
-                            "cycle": self.cycle_count,
-                            "status": "architecture_switch",
-                            "updated_at": time.time(),
-                        }
-                    )
-                    # Architecture switch is dispatched as paper_research (uses researcher agent)
-                    # but with a specific architecture-switch task.
-                    execute_result = self._execute_paper_research(think_result)
-
-                    verify_report = self._verify(self.cycle_count, think_result, execute_result)
-                    execute_result["verify_report"] = verify_report.to_dict()
-
-                    reflect_result = self._reflect(execute_result, verify_report=verify_report)
-                    self._update_state(
-                        {
-                            "cycle": self.cycle_count,
-                            "updated_at": time.time(),
-                            "last_milestone": reflect_result.get("milestone", ""),
-                            "last_decision": reflect_result.get("decision", ""),
-                            "suggested_next_step": reflect_result.get("decision", "")
-                            or reflect_result.get("reason", ""),
-                        }
-                    )
-                    # Record as paper_research for outcome tracking purposes
-                    think_result_for_record = dict(think_result)
-                    think_result_for_record["action"] = "paper_research"
-                    self._record_cycle_outcome(
-                        think_result_for_record, execute_result, reflect_result,
-                        verify_report_dict=verify_report.to_dict() if verify_report else None
-                    )
-                    self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
-                    self._gc.run()  # Phase 2: deterministic GC
-                    self._save_cycle_counter()
-                    continue
-
                 # ── GATE PIPELINE (v12.4): ordered priority ──
                 # Gate 1 (PRE-VERIFY):  critical preconditions (synthetic data, missing data, broken imports)
                 # Gate 2 (CODE REVIEW): architectural / code defects
@@ -452,17 +402,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
                     think_result = {
                         "action": "experiment",
-                        "agent": "code",
-                        "task": (
-                            f"⛔ PRE-VERIFY BLOCKED EXPERIMENT\n\n"
-                            f"The following CRITICAL issues must be fixed BEFORE any training:\n\n"
-                            + "\n".join(f"- {c.detail}" for c in critical_pre_issues)
-                            + "\n\n## Mandatory Actions:\n"
-                            "1. Fix ALL issues listed above\n"
-                            "2. Ensure training scripts use the project's real dataset class (NOT synthetic/random data)\n"
-                            "3. Run a 2-step dry-run to verify data loads correctly\n"
-                            "4. Do NOT launch real training until pre-verify passes\n"
-                        ),
+                        "task": f"Fix these issues before training: {'; '.join(c.detail for c in critical_pre_issues)}",
                     }
                     _gate_blocked = True
 
@@ -678,355 +618,90 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         logger.info("AutoResearcher stopped.")
 
-    def _think(self, directive: Optional[str] = None) -> dict:
-        """THINK phase: analyze current state and plan next experiment."""
-        logger.info("THINK phase starting...")
+    def _think(self, directive: str = "") -> dict:
+        """THINK phase: Leader decides what to do next based on context."""
+        context = {}
+        context["brief"] = self.memory.get_brief()
+        context["memory_log"] = self.memory.get_log()
+        context["cycle"] = self.cycle_count
+        context["workspace_dir"] = str(self.workspace)
 
-        context = {
-            "brief": self.memory.get_brief(),
-            "memory_log": self.memory.get_log(),
-            "cycle": self.cycle_count,
-            "directive": directive,
-            "workspace_dir": str(self.workspace),
-        }
-
-        # ── v16.1: PERSISTENT CONSTRAINTS ──
-        # Load project-level hard constraints (read-only, agent cannot modify)
-        persistent_constraints_path = self.project_dir / "PERSISTENT_CONSTRAINTS.md"
-        if persistent_constraints_path.exists():
-            try:
-                constraints_text = persistent_constraints_path.read_text().strip()
-                if constraints_text:
-                    context["persistent_constraints"] = (
-                        "PROJECT-LEVEL PERSISTENT CONSTRAINTS (HARD RULES):\n"
-                        + constraints_text
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to load PERSISTENT_CONSTRAINTS.md: {e}")
-
-        # Inject current best metrics vs targets so the LLM always knows how
-        # close it is to the goal. Previously there was no goal-tracking —
-        # the agent achieved val_MAE=0.184 (target < 0.20) in cycle 1 but
-        # had no idea it was already close.
-
-
-        # Inject dataset manifest (if available) so Leader knows data quality issues
-        manifest_path = self.workspace / "DATASET_MANIFEST.json"
-        if manifest_path.exists():
-            try:
-                manifest_data = json.loads(manifest_path.read_text())
-                # Only inject the summary parts — not the full 4000-line manifest
-                summary = {}
-                if "training_recommendations" in manifest_data:
-                    summary["training_recommendations"] = manifest_data["training_recommendations"]
-                if "data_quality_issues" in manifest_data:
-                    summary["data_quality_issues"] = manifest_data["data_quality_issues"]
-                if "total_trainable" in manifest_data:
-                    summary["total_trainable"] = manifest_data["total_trainable"]
-                # Per-dataset scene counts
-                ds_counts = {}
-                for ds_name, ds_info in manifest_data.get("datasets", {}).items():
-                    ds_counts[ds_name] = {
-                        "type": ds_info.get("type", "unknown"),
-                        "train": ds_info.get("train_scenes", 0),
-                        "val": ds_info.get("val_scenes", 0),
-                        "native_resolution": ds_info.get("native_resolution"),
-                    }
-                summary["datasets"] = ds_counts
-                context["dataset_manifest_summary"] = summary
-            except Exception as e:
-                logger.warning(f"Failed to inject dataset manifest: {e}")
-
-        # Inject session statistics from SQLite
+        # Session stats from SQLite
         try:
             stats = self.memory.get_summary_stats()
-            if stats.get("total_cycles", 0) > 0:
+            if stats and stats.get("total_cycles", 0) > 0:
                 context["session_stats"] = stats
-                context["recent_failures"] = self.memory.get_recent_failures(count=3)
-        except Exception as e:
-            logger.warning(f"Failed to inject session stats: {e}")
-
-        # ── DOMAIN KNOWLEDGE INJECTION ──
-        # Extract method-hypothesis mappings from PROJECT_BRIEF + dead ends
-        # This gives the Leader the PHYSICAL PRINCIPLES behind each method
-        domain_kb = self._build_domain_knowledge()
-        if domain_kb:
-            context["domain_knowledge"] = domain_kb
-            # Inject data constraints as top-level prompt
-            if domain_kb.get("data_constraints"):
-                context["data_constraints"] = domain_kb["data_constraints"]
-                scarce_domains = [
-                    c for c in domain_kb["data_constraints"]
-                    if c.get("type") == "data_scarcity"
-                ]
-                if scarce_domains:
-                    context["data_scarcity_warning"] = (
-                        "DATA SCARCITY WARNING:\n"
-                        + "\n".join(f"- {c['detail']}\n  Fix: {c['recommendation']}" for c in scarce_domains)
-                        + "\n\nYou MUST NOT propose architecture changes for data-scarce domains. "
-                        + "Focus on data augmentation, transfer learning, or accepting the limitation."
-                    )
-
-        # ── IDEA GUARDIAN CHECK (every 5 cycles) ──
-
-
-        # ── DIRECTION CIRCUIT BREAKER ──
-        # Force direction re-evaluation when stagnation is detected
-        # v15: ROADMAP has priority — if ROADMAP says we're still verifying theory,
-        # "direction change" is irrelevant; the agent should verify the current module's assumptions.
-        _roadmap_active = (
-            self._roadmap_initialized
-            and self.roadmap.is_theory_verification_phase
-        )
-
-        # ── v14: ARCHITECTURE CIRCUIT BREAKER ──
-        # When the same architecture has been patched for too many cycles without
-        # improvement, force the agent to SWITCH to a completely different architecture.
-        # v15: During theory_verification, architecture switching is premature.
-        # ── v14: ARCHITECTURE SURVEY GATE ──
-        # In early cycles (1-2), force an architecture survey before committing to any model.
-        # This prevents the agent from blindly using PROJECT_BRIEF's suggested baseline.
-        if not self._architecture_survey_done and self.cycle_count <= 2:
+        except Exception:
             pass
 
-
-        # ── CROSS-EXPERIMENT KNOWLEDGE INTEGRATION ──
-        # Connect dead ends across experiments to identify meta-patterns
-        cross_exp = self._build_cross_experiment_insights()
-        if cross_exp:
-            context["cross_experiment_insights"] = cross_exp
-
-        # ── v12: METHOD INADEQUACY RE-AWAKENING ──
-        # If previous dead ends were categorized as 'method_inadequacy' (the analysis
-        # method was too narrow, not the hypothesis being wrong), inject a prompt
-        # encouraging the Leader to retry with broader analysis instead of abandoning.
+        # Recent failures
         try:
-            mi_count = self.memory.get_method_inadequacy_count()
-            if mi_count > 0:
-                mi_entries = self.memory.get_dead_ends_by_category("method_inadequacy")
-                mi_summaries = [e.get("content", "")[:120] for e in mi_entries[-3:]]
-                context["method_inadequacy_retry_prompt"] = (
-                    f"METHOD INADEQUACY RE-AWAKENING (v12):\n"
-                    f"You have {mi_count} dead_end(s) categorized as 'method_inadequacy'.\n"
-                    f"These are NOT hypothesis failures — the analysis method was too narrow.\n"
-                    f"Recent entries:\n"
-                    + "\n".join(f"  - {s}" for s in mi_summaries)
-                    + "\n\n"
-                    f"Consider RETRYING these directions with broader analysis:\n"
-                    f"- Use at least 3 independent feature families\n"
-                    f"- Include non-frequency methods (gradients, symmetry, entropy, view consistency)\n"
-                    f"- Check DC-dominance before relying on frequency-domain results\n"
-                    f"Only abandon a direction after ≥3 independent methods ALL show no signal."
-                )
-        except Exception as e:
-            logger.debug(f"Method inadequacy check skipped: {e}")
+            failures = self.memory.get_recent_failures(count=3)
+            if failures:
+                context["recent_failures"] = failures
+        except Exception:
+            pass
 
-        # ── ARCHITECTURE PLAN INJECTION (Phase 2+) ──
-        # When transitioning from analysis to model building, provide the Leader
-        # with a pre-computed architecture plan so they can dispatch informed tasks.
-        # Also re-generate when a new model file appears (detected by mtime).
-        brief_path = self.workspace / "PROJECT_BRIEF.md"
-        should_plan = False
-        if brief_path.exists():
-            if self.cycle_count <= 1:
-                should_plan = True
-            elif not getattr(self, '_last_architecture_plan', None):
-                # No plan yet — generate one
-                should_plan = True
-            else:
-                # Re-generate if a model file was modified after last plan
-                last_plan_time = getattr(self, '_last_plan_time', 0)
-                models_dir = self.project_dir / "models"
-                if models_dir.exists():
-                    newest_model = max(
-                        (f.stat().st_mtime for f in models_dir.glob("*.py")),
-                        default=0,
-                    )
-                    if newest_model > last_plan_time:
-                        should_plan = True
-
-        if should_plan:
-            try:
-                from .idea_planner import IdeaPlanner
-                planner = IdeaPlanner(self.workspace)
-                arch_plan = planner.plan()
-                if "error" not in arch_plan:
-                    self._last_architecture_plan = arch_plan
-                    self._last_plan_time = time.time()
-                    context["architecture_plan"] = arch_plan
-                    score = arch_plan.get("alignment_score", 0)
-                    context["architecture_plan_summary"] = (
-                        f"Pre-computed architecture plan available (alignment={score}/10). "
-                        f"Use `plan_model` tool for detailed view. "
-                        f"Plan has {len(arch_plan.get('modules', []))} modules, "
-                        f"fusion={arch_plan.get('fusion_strategy', {}).get('method', 'N/A')}, "
-                        f"{len(arch_plan.get('risks', []))} risks identified."
-                    )
-                    # v16.1: ImplementationTracker removed
-            except Exception as e:
-                logger.warning(f"Architecture plan generation failed: {e}")
-
-        # ── PARETO FRONTIER INJECTION ──
-        # Show which methods are Pareto-optimal for which domains
+        # Causal history (what design decisions led to what effects)
         try:
-            pareto = self.memory.get_pareto_frontier()
-            if pareto.get("matrix"):
-                context["pareto_frontier"] = pareto
-        except Exception as e:
-            logger.warning(f"Failed to inject pareto frontier: {e}")
-
-        # ── CAUSAL CHAIN HISTORY ──
-        # Show past design decisions and their actual effects.
-        # Phase 1 fix: inject ALL causal links (not just verified), marking
-        # which are verified. Previously the verified filter made this always
-        # empty (0/102 links verified), leaving the LLM blind to history.
-        try:
-            causal_history = self.memory.get_causal_history(limit=10)
-            if causal_history:
-                # Format with verification status so LLM can judge confidence
+            causal = self.memory.get_causal_history(limit=10)
+            if causal:
                 lines = []
-                for c in causal_history:
+                for c in causal:
+                    verified = "✓" if c.get("verified") else "?"
                     decision = c.get("design_decision", "?")
                     expected = c.get("expected_effect", "?")
                     actual = c.get("actual_effect")
-                    verified = "✓ verified" if c.get("verified") else "? unverified"
-                    actual_str = f" → actual: {actual}" if actual else ""
+                    actual_str = f" → {actual}" if actual else ""
                     lines.append(f"- [{verified}] {decision}: expected {expected}{actual_str}")
                 context["causal_history"] = "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"Failed to inject causal history: {e}")
-
-        # ── CODE REVIEW LESSONS INJECTION ──
-        # Inject past mistakes into THINK context so the agent learns from them.
-        # This is the key mechanism that makes the knowledge base actually used.
-        try:
-            # Get all HIGH/MEDIUM lessons, format for context
-            all_lessons = self.memory.get_code_review_lessons(severity="MEDIUM", limit=20)
-            if all_lessons:
-                lesson_text = self.memory.format_lessons_for_context(all_lessons, max_chars=1500)
-                if lesson_text:
-                    context["code_review_lessons"] = lesson_text
-
-            # Also search for lessons relevant to the current project code.
-            # Phase 1 fix: when models/ doesn't exist, fall back to searching
-            # using the current task text instead of skipping entirely.
-            # Previously: no models/ dir → 0 relevant lessons injected.
-            search_text = None
-            model_dir = self.project_dir / "models"
-            if model_dir.exists():
-                try:
-                    model_files = sorted(model_dir.glob("*.py"), key=lambda f: f.stat().st_mtime, reverse=True)
-                    if model_files:
-                        latest = model_files[0]
-                        mtime = latest.stat().st_mtime
-                        if (not hasattr(self, '_cached_model_mtime') or
-                                self._cached_model_mtime != mtime):
-                            self._cached_model_content = latest.read_text()
-                            self._cached_model_mtime = mtime
-                        search_text = self._cached_model_content
-                except Exception:
-                    pass
-            # Fallback: use the most recent memory log entries (last cycle's
-            # decisions) for keyword matching. This gives the lessons context
-            # about what the agent is currently working on.
-            if search_text is None:
-                mem_log = self.memory.get_log()
-                # Use last 500 chars of memory log as search context
-                search_text = mem_log[-500:] if mem_log else ""
-            if search_text:
-                relevant = self.memory.search_relevant_lessons(search_text, limit=5)
-                if relevant:
-                    context["relevant_code_review_lessons"] = (
-                        self.memory.format_lessons_for_context(relevant, max_chars=1000)
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to inject code review lessons: {e}")
-
-        # ── EXPERIMENT CALIBRATION ──
-        # Help the agent learn from past hypothesis accuracy
-        try:
-            calibration = self.memory.get_experiment_calibration()
-            if calibration.get("total_hypotheses", 0) >= 3:
-                context["hypothesis_calibration"] = calibration
-        except Exception as e:
-            logger.warning(f"Failed to inject hypothesis calibration: {e}")
-
-        # ── EXPERIMENT VALUE: warn about low-value directions ──
-        # Phase 1: inject previously-assessed low-VOI directions so the LLM
-        # knows which paths have already been evaluated as unlikely to help.
-        try:
-            low_voi = self.memory.get_low_value_experiments(limit=5) if hasattr(self.memory, 'get_low_value_experiments') else []
-            if low_voi:
-                lines = [f"- {v.get('hypothesis','?')[:80]} (VOI={v.get('voi',0):.3f})"
-                         for v in low_voi]
-                context["experiment_value_warn"] = (
-                    "Previously assessed as low-value:\n" + "\n".join(lines)
-                )
-        except Exception as e:
-            logger.warning(f"Failed to inject experiment value: {e}")
-
-        # v16.1: ImplementationTracker and AdaptiveThresholds removed
-        # (dead modules, context keys removed)
-
-        # v16.1: sandbox_design_guidance removed from context (context key reduction)
-
-        # ── RESEARCH ROADMAP (v15): Inject phase constraints ──
-        # This is the PRIMARY control mechanism: tells Leader what phase and module to work on.
-
-
-        # ── CONTEXT PRUNING (v10) ──
-        # Limit context to most relevant keys to prevent LLM confusion
-        context = self.context_pruner.prune(context, "think")
-
-        result = self.dispatcher.dispatch_leader(
-            task="think",
-            context=context,
-        )
-
-        # ── STRATEGY CONSTRAINT CHECK (v10 → v16 hard gate) ──
-        # Check proposed action against learned constraints.
-        # FORBIDDEN violations → hard block (redirect to data_analysis).
-        # Non-FORBIDDEN violations → silently logged (no context bloat).
-        if result.get("action") == "experiment":
-            violations = self.strategy_engine.check_constraints(result, self.memory)
-            if violations:
-                if self.strategy_engine.has_forbidden_violation(violations):
-                    # HARD GATE: FORBIDDEN constraint → block experiment
-                    blocked_msg = self.strategy_engine.get_constraint_prompt(violations)
-                    logger.warning(f"⛔ FORBIDDEN constraint blocked experiment")
-                    result["action"] = "paper_research"
-                    result["agent"] = "researcher"
-                    result["task"] = (
-                        f"⛔ BLOCKED: Proposed experiment violates FORBIDDEN constraint(s).\n"
-                        f"{blocked_msg}\n\n"
-                        f"Research alternative approaches that avoid the forbidden methods. "
-                        f"Focus on approaches compatible with the current research phase."
-                    )
-                    self.memory.log_decision(
-                        f"[BLOCKED v16] Experiment blocked by FORBIDDEN constraint"
-                    )
-                else:
-                    # Non-FORBIDDEN: just log, don't inject into context (reduces bloat)
-                    logger.info(f"Strategy: {len(violations)} non-FORBIDDEN constraint(s) noted")
-                    self.memory.log_decision(
-                        f"[CONSTRAINT] {len(violations)} non-FORBIDDEN constraint(s) noted"
-                    )
-
-        # ── EXPERIMENT VALUE OF INFORMATION (VOI) ──
-        # Estimate the value of the proposed experiment before running it.
-        # This helps the agent learn to prioritize high-value experiments.
-        # ── CAUSAL CHAIN RECORDING ──
-        # Record the design decision → architectural property → expected metric link
-        logger.info(f"THINK result: action={result.get('action', 'unknown')}")
-
-        # Validate context keys against registry
-        try:
-            from .context_keys import validate_context
-            key_warnings = validate_context(context, "think")
-            for w in key_warnings:
-                logger.debug(f"Context key: {w}")
         except Exception:
             pass
+
+        # Domain knowledge
+        try:
+            domain_kb = self._build_domain_knowledge()
+            if domain_kb:
+                context["domain_knowledge"] = domain_kb
+                if isinstance(domain_kb, dict) and domain_kb.get("data_constraints"):
+                    context["data_constraints"] = domain_kb["data_constraints"]
+        except Exception:
+            pass
+
+        # Code review lessons
+        try:
+            lessons = self.memory.get_code_review_lessons(limit=5)
+            if lessons:
+                context["code_review_lessons"] = self.memory.format_lessons_for_context(lessons)
+        except Exception:
+            pass
+
+        # Persistent constraints
+        constraints_path = self.project_dir / "PERSISTENT_CONSTRAINTS.md"
+        if constraints_path.exists():
+            try:
+                text = constraints_path.read_text().strip()
+                if text:
+                    context["persistent_constraints"] = text
+            except Exception:
+                pass
+
+        # Context pruning
+        context = self.context_pruner.prune(context, "think")
+
+        result = self.dispatcher.dispatch_leader(task="think", context=context)
+
+        # Constraint check (FORBIDDEN only)
+        try:
+            violations = self.strategy_engine.check_constraints(result, self.memory)
+            if self.strategy_engine.has_forbidden_violation(violations):
+                logger.warning(f"FORBIDDEN constraint violation — redirecting to paper_research")
+                result["action"] = "paper_research"
+                result["task"] = "Constraint violation. Research alternative approaches."
+        except Exception:
+            pass
+
+        logger.info(f"THINK result: action={result.get('action', 'unknown')}")
         return result
 
     def _execute(self, plan: dict) -> dict:
@@ -1217,527 +892,54 @@ class ResearchLoop(DomainKnowledgeMixin):
                 return f"models/{files[0].name}"
         return ""
 
-    def _reflect(self, execute_result: dict, verify_report=None, visual_analysis_result=None) -> dict:
-        """REFLECT phase: evaluate results and update memory.
+    def _reflect(self, execute_result: dict, verify_report) -> dict:
+        """REFLECT phase: Leader evaluates results and records learnings."""
+        context = {}
+        context["brief"] = self.memory.get_brief()
+        context["memory_log"] = self.memory.get_log()
+        context["cycle"] = self.cycle_count
+        context["workspace_dir"] = str(self.workspace)
+        context["experiment_result"] = execute_result
 
-        Now receives VERIFY report with module-level diagnosis. The Leader
-        MUST address verify failures before drawing conclusions about the
-        experiment's success or failure.
-
-        Also receives VisualAnalysisResult when training is stuck — the Leader
-        can use multimodal image-based diagnosis to understand WHY the model fails.
-        """
-        logger.info("REFLECT phase starting...")
-
-        context = {
-            "brief": self.memory.get_brief(),
-            "memory_log": self.memory.get_log(),
-            "experiment_result": execute_result,
-            "cycle": self.cycle_count,
-            "workspace_dir": str(self.workspace),
-        }
-
-        # ── v16: Gap-closing reflection ──
-        # Inject phase gap context so REFLECT compares results against targets
-
-
-        # Inject VERIFY diagnosis so Leader knows what actually worked/failed
+        # VERIFY report
         if verify_report:
             context["verify_report"] = verify_report.to_dict()
-            if verify_report.has_failures:
+            if verify_report.diagnosis:
                 context["verify_diagnosis"] = verify_report.diagnosis
+            if verify_report.failed_modules:
                 context["verify_failed_modules"] = verify_report.failed_modules
 
-            # ── ANTI-DECEPTION: Flag LLM fabrication if detected ──
-            fabrication_checks = [
-                c for c in verify_report.checks
-                if c.name in ("llm_fabrication", "pid_trace_mismatch")
-                and c.status == "fail"
-            ]
-            if fabrication_checks:
-                context["llm_fabrication_detected"] = True
-                context["fabrication_details"] = [
-                    f"[{c.severity.upper()}] {c.name}: {c.detail}"
-                    for c in fabrication_checks
-                ]
-                logger.error(
-                    f"ANTI-DECEPTION: LLM fabrication detected in cycle "
-                    f"{self.cycle_count}: {[c.detail for c in fabrication_checks]}"
-                )
-                # Auto-log as active problem so it persists across cycles
-                self.memory.log_active_problem(
-                    f"LLM fabrication detected: {[c.detail[:100] for c in fabrication_checks]}. "
-                    f"The Code agent claimed actions it did not perform. "
-                    f"Previous cycle results are UNRELIABLE."
-                )
+        # Anti-deception
+        if execute_result.get("deception_detected"):
+            context["llm_fabrication_detected"] = True
+            context["fabrication_details"] = execute_result.get("deception_detail", [])
 
-        # ── Inject DATASET QUALITY diagnosis ──
-        # Let the Leader know when metrics are statistically unreliable
-        if verify_report and verify_report.dataset_issues:
-            ds_issues = verify_report.dataset_issues
-            context["dataset_quality_issues"] = ds_issues.get("issues", [])
-            context["dataset_val_counts"] = ds_issues.get("val_counts", {})
-            context["dataset_train_counts"] = ds_issues.get("train_counts", {})
-            context["dataset_quality_prompt"] = (
-                "DATASET QUALITY WARNING:\n"
-                f"Validation scene counts: {ds_issues.get('val_counts', {})}\n"
-                f"Training scene counts: {ds_issues.get('train_counts', {})}\n"
-                f"Issues: {'; '.join(ds_issues.get('issues', []))}\n\n"
-                "YOU MUST:\n"
-                "1. If any domain has < 3 validation scenes, the MAE for that domain "
-                "is STATISTICALLY UNRELIABLE — do NOT treat it as a real signal.\n"
-                "2. If a metric is based on 1 scene, any change < 0.1 is noise — "
-                "do NOT celebrate 'improvements' or panic about 'degradation'.\n"
-                "3. Consider whether the dataset split needs to be fixed before "
-                "continuing experiments — fixing data is often more important "
-                "than tuning models.\n"
-                "4. If you find a dataset problem, log it as an active problem "
-                "and suggest a fix."
-            )
-            logger.warning(
-                f"Injecting dataset quality issues into REFLECT: "
-                f"{len(ds_issues.get('issues', []))} issues found"
-            )
-
-        # Inject VISUAL ANALYSIS diagnosis (when available)
-        if visual_analysis_result and visual_analysis_result.triggered:
-            context["visual_analysis"] = visual_analysis_result.to_dict()
-            if visual_analysis_result.diagnosis:
-                va_diags = []
-                for d in visual_analysis_result.diagnosis:
-                    if isinstance(d, dict):
-                        va_diags.append(f"[{d.get('category','?')}/{d.get('confidence','?')}] {d.get('description', '')[:300]}")
-                    else:
-                        va_diags.append(str(d)[:300])
-                context["visual_analysis_diagnosis"] = va_diags
-                logger.info(
-                    f"Injecting visual analysis into REFLECT: "
-                    f"{len(va_diags)} findings, severity={visual_analysis_result.severity}"
-                )
-            if visual_analysis_result.recommended_actions:
-                context["visual_analysis_actions"] = visual_analysis_result.recommended_actions
-
-        # ── Fix 3 (结果分析): Inject cross-domain analysis prompt ──
-        # Force the Leader to analyze WHY different domains perform differently.
-        # This prevents the agent from only reporting "MAE went up/down" without
-        # understanding the structural reasons.
-        final_metrics = execute_result.get("final_metrics") or {}
-        domain_maes = {}
-        # Dynamically discover per-domain metrics (MAE_{Domain}, val_MAE_{Domain}, etc.)
-        domain_keys = getattr(self.memory, 'domain_keys', [])
-        all_metric_keys = set(domain_keys)
-        # Also scan final_metrics for any key matching MAE_* or *_MAE pattern
-        for key in final_metrics:
-            if re.match(r"(MAE_|.*_MAE)", key):
-                all_metric_keys.add(key)
-        for key in all_metric_keys:
-            if key in final_metrics:
-                try:
-                    domain_maes[key] = float(final_metrics[key])
-                except (TypeError, ValueError):
-                    pass
-
-        if domain_maes:
-            # Detect worst domain and its gap from best (generic, no hardcoded names)
-            mae_values = {k: v for k, v in domain_maes.items()
-                          if v is not None and math.isfinite(v)}
-            if mae_values:
-                best_domain = min(mae_values, key=mae_values.get)
-                worst_domain = max(mae_values, key=mae_values.get)
-                domain_gap = mae_values[worst_domain] - mae_values[best_domain]
-
-                context["domain_analysis_prompt"] = (
-                    "CROSS-DOMAIN ANALYSIS REQUIRED:\n"
-                    f"Current results: {domain_maes}\n"
-                    f"Best overall MAE: {self._best_metric_ever:.4f}\n"
-                    f"Domain breakdown: {mae_values}\n"
-                    f"Worst domain: {worst_domain} (MAE={mae_values[worst_domain]:.4f}), "
-                    f"Best domain: {best_domain} (MAE={mae_values[best_domain]:.4f})\n"
-                    f"Domain gap: {domain_gap:.4f}\n\n"
-                    "You MUST answer these questions:\n"
-                    "1. WHY does the model perform differently across domains? What is the ROOT CAUSE?\n"
-                    "2. Is there a domain where performance is severely degraded? "
-                    "If yes, what does this tell you about the METHOD'S fundamental assumptions?\n"
-                    "3. Could the method's core assumption be VIOLATED in the "
-                    "worst-performing domain? If so, incremental tuning will NOT help — you need a "
-                    "fundamentally different approach.\n"
-                    "4. What is the estimated CEILING of the current approach? If you've been iterating "
-                    "for 3+ cycles without improvement in a domain, the method may have reached its limit.\n"
-                    "5. Should you STOP pursuing the current direction and search for a fundamentally "
-                    "different method? Justify your answer."
-                )
-
-                # ── RESULT-TO-ARCHITECTURE FEEDBACK ──
-                # When domain gap is large (> 0.10), force structural analysis
-                if domain_gap > 0.10:
-                    context["architecture_feedback_prompt"] = (
-                        "RESULT-TO-ARCHITECTURE FEEDBACK (MANDATORY):\n"
-                        f"The domain gap is {domain_gap:.4f} — this is LARGE and indicates a "
-                        f"STRUCTURAL problem, not a tuning problem.\n\n"
-                        f"Worst domain: {worst_domain} = {mae_values[worst_domain]:.4f}\n"
-                        f"Best domain: {best_domain} = {mae_values[best_domain]:.4f}\n\n"
-                        "You MUST follow this reasoning chain:\n"
-                        "1. IDENTIFY: What architectural component processes the input for the worst domain?\n"
-                        "2. ASSUMPTION: What physical assumption does that component encode?\n"
-                        "3. VERIFY: Is that assumption valid for the worst domain's data characteristics?\n"
-                        "   - Example: a component assuming smooth input, violated by noisy data.\n"
-                        "   - FFT → assumes frequency patterns are stable. Violated by noise/aliasing.\n"
-                        "   - Mean pool → assumes all views equally informative. Violated when some views are occluded.\n"
-                        "   - Conv3D → assumes regular input structure. Violated when patterns are irregular.\n"
-                        "4. DIAGNOSE: If the assumption is violated, the component is fundamentally unsuitable.\n"
-                        "5. FIX: Design an alternative that does NOT rely on the violated assumption.\n\n"
-                        "CRITICAL: Do NOT propose incremental changes (loss weights, data augmentation, "
-                        "learning rate) for a structural problem. These will NOT fix the root cause.\n"
-                        "Instead, use the Code agent's analyze_model or probe_model tool to inspect "
-                        "the architecture before proposing changes."
-                    )
-
-        # ── Fix 1 (实验设计): Inject hypothesis validation prompt ──
-        # When a domain is severely degraded, force the agent to verify
-        # whether the method's core assumptions hold in that domain.
-
-        # ── EXPERIMENT EVALUATOR INJECTION ──
-        # Post-experiment evaluation: plan vs result, failure diagnosis, iteration guidance
-        try:
-            from .experiment_evaluator import ExperimentEvaluator
-            evaluator = ExperimentEvaluator(
-                self.project_dir, self.workspace,
-                thresholds={"severe_degradation": 0.35, "improvement_threshold": 0.005},
-            )
-
-            # Get the architecture plan (from previous think or cached)
-            arch_plan = getattr(self, '_last_architecture_plan', None)
-            if not arch_plan:
-                # Try to get from the plan file or re-generate
-                plan_path = self.workspace / "ARCHITECTURE_PLAN.json"
-                if plan_path.exists():
-                    arch_plan = json.loads(plan_path.read_text())
-                else:
-                    from .idea_planner import IdeaPlanner
-                    planner = IdeaPlanner(self.workspace)
-                    brief_path = self.workspace / "PROJECT_BRIEF.md"
-                    if brief_path.exists():
-                        arch_plan = planner.plan()
-
-            if arch_plan:
-                eval_result = evaluator.evaluate(
-                    experiment_results=execute_result,
-                    architecture_plan=arch_plan,
-                    model_path=execute_result.get("model_path", ""),
-                )
-                context["experiment_evaluation"] = eval_result
-
-                # If there are critical/high diagnoses, inject them prominently
-                critical_guidance = [
-                    g for g in eval_result.get("iteration_guidance", [])
-                    if g.get("priority") in ("critical", "high")
-                ]
-                if critical_guidance:
-                    context["iteration_guidance_prompt"] = (
-                        "EXPERIMENT EVALUATION — MANDATORY NEXT STEPS:\n"
-                        + "\n".join(
-                            f"[{g['priority'].upper()}] {g['action']}: {g['expected_improvement']}"
-                            for g in critical_guidance[:3]
-                        )
-                        + "\n\nYou MUST address these issues before launching the next experiment. "
-                        + "Do NOT repeat the same training configuration."
-                    )
-        except Exception as e:
-            logger.warning(f"Experiment evaluator failed: {e}")
-
-        # ── INDEPENDENT ASSESSMENT INJECTION ──
-        # If the independent probe found anomalies during VERIFY, inject them
-        if verify_report and verify_report.independent_assessment:
-            ind_assess = verify_report.independent_assessment
-            if ind_assess.get("anomaly_detected"):
-                context["independent_assessment_warning"] = (
-                    f"INDEPENDENT THIRD-PARTY ASSESSMENT WARNING:\n"
-                    f"An independent probe (separate from your model's evaluation code) "
-                    f"detected: {ind_assess.get('detail', 'unknown')}\n"
-                    f"Agreement score: {ind_assess.get('agreement_score', 0):.2f}/1.0\n"
-                    f"Confidence: {ind_assess.get('confidence', 'low')}\n\n"
-                    f"Your reported metrics may be UNRELIABLE. The probe suggests the model's "
-                    f"outputs are not what the metrics claim. Investigate the output quality "
-                    f"before trusting the metrics."
-                )
-
-        # v16.1: PlannerChecker and QuickBenchmark removed (dead modules, scores 2/10 and 1/10)
-
-        # ── v11: SIMULATION SANDBOX — full model evaluation ──
-        # Run A/B comparison + internal behavior + scaling guidance
-        if execute_result.get("experiment_launched") or execute_result.get("final_metrics"):
-            try:
-                model_path = execute_result.get("model_path", "") or self._extract_model_path_from_task(
-                    {"task": str(execute_result.get("tool_trace", ""))}
-                )
-                if model_path:
-                    # Find snapshot from before this cycle
-                    snapshot_before = self.sandbox.find_previous_snapshot(self.cycle_count)
-                    model_before = str(snapshot_before) if snapshot_before else ""
-
-                    # Find checkpoint
-                    ckpt_path = ""
-                    for candidate in [
-                        self.project_dir / "checkpoints" / "best_model.pth",
-                        self.project_dir / "outputs",
-                    ]:
-                        if candidate.is_file():
-                            ckpt_path = str(candidate.relative_to(self.project_dir))
-                            break
-                        elif candidate.is_dir():
-                            pths = list(candidate.glob("**/best_model.pth"))
-                            if pths:
-                                ckpt_path = str(pths[0].relative_to(self.project_dir))
-                                break
-
-                    # Run full evaluation (all 5 layers)
-                    sandbox_report = self.sandbox.full_evaluation(
-                        cycle=self.cycle_count,
-                        model_path=model_path,
-                        model_path_before=model_before,
-                        checkpoint_path=ckpt_path,
-                        target_gpu_mb=self.sandbox.target_gpu_mb,
-                        project_brief_path="PROJECT_BRIEF.md",
-                    )
-
-                    # Format and inject sandbox report into context
-                    sandbox_prompt = self.sandbox.format_report_prompt(sandbox_report)
-                    if sandbox_prompt:
-                        context["sandbox_evaluation"] = sandbox_prompt
-
-                    logger.info(
-                        f"Sandbox: feasible={sandbox_report.feasible}, "
-                        f"judgment={sandbox_report.judgment.get('modification_verdict', 'N/A')}, "
-                        f"dead={sandbox_report.internal_behavior.get('dead_modules', [])}"
-                    )
-
-                    # Cache verdict for next THINK phase
-                    try:
-                        verdict_cache = self.workspace / "_sandbox_last_verdict.json"
-                        cache_data = {
-                            "modification_verdict": sandbox_report.judgment.get("modification_verdict", ""),
-                            "effective_modules": sandbox_report.judgment.get("effective_modules", []),
-                            "ineffective_modules": sandbox_report.judgment.get("ineffective_modules", []),
-                            "scalable_modules": [m["name"] for m in sandbox_report.scaling.get("scalable_modules", [])],
-                            "bottleneck_modules": [b.get("location", "") for b in sandbox_report.scaling.get("bottlenecks", [])],
-                            "recommended_actions": [
-                                sandbox_report.judgment.get("recommendation", ""),
-                                sandbox_report.scaling.get("recommendation", ""),
-                            ],
-                        }
-                        verdict_cache.write_text(json.dumps(cache_data, ensure_ascii=False))
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.debug(f"Sandbox evaluation skipped: {e}")
-
-        # v16.1: ImplementationTracker removed (dead module)
-
-        # ── v12: ANALYSIS EXPERIMENT REFLECTION ──
-        # When the experiment was a data analysis (no training), inject specialized
-        # reflection prompts that force the Leader to evaluate method coverage.
-        is_analysis = (
-            not execute_result.get("experiment_launched", False)
-            and not execute_result.get("is_paper_research", False)
-            and execute_result.get("response", "")  # has output
-        )
-        if is_analysis:
-            # Count feature families from output (heuristic: check for known patterns)
-            response_text = execute_result.get("response", "") or ""
-            analysis_output = str(execute_result.get("output", "")) or response_text
-
-            # Inject analysis-specific reflection prompt
-            context["analysis_reflection_prompt"] = (
-                "ANALYSIS EXPERIMENT REFLECTION (v12):\n"
-                "This was a DATA ANALYSIS experiment, not model training. You MUST evaluate:\n\n"
-                "1. METHOD COVERAGE: How many INDEPENDENT analysis methods were used?\n"
-                "   - 1 method → INSUFFICIENT (cannot conclude direction is infeasible)\n"
-                "   - 2 methods → WEAK (need at least 1 more)\n"
-                "   - 3+ methods → ADEQUATE (can draw conclusions)\n\n"
-                "2. FEATURE DIVERSITY: Are the features measuring DIFFERENT physical properties?\n"
-                "   - Example: FFT energy ratios at 3 frequency bands = 1 family, not 3\n"
-                "   - Example: FFT shape + spatial gradient + view consistency = 3 families\n\n"
-                "3. DC-DOMINANCE: If using frequency-domain methods, what fraction of energy is DC?\n"
-                "   - DC > 90% → frequency energy ratios are degenerate (useless for discrimination)\n"
-                "   - In this case, you MUST try non-frequency methods before concluding\n\n"
-                "4. CORRECT FAILURE CATEGORY:\n"
-                "   - If < 3 independent methods tried and all show no signal → method_inadequacy\n"
-                "   - If ≥ 3 independent methods tried and ALL show no signal → hypothesis_wrong\n"
-                "   - If ANY method shows Cohen's d > 0.8 → direction HAS potential\n\n"
-                "5. CRITICAL: Do NOT extrapolate 'method X doesn't work' to 'the entire direction doesn't work'.\n"
-                "   Example: 'FFT energy ratios cannot discriminate materials' ≠ 'no angular feature can discriminate materials'"
-            )
-
-            # Check for method-inadequacy dead ends in recent history
-            method_inadequacy_count = self.memory.get_method_inadequacy_count()
-            if method_inadequacy_count > 0:
-                context["method_inadequacy_history"] = (
-                    f"WARNING: {method_inadequacy_count} previous dead_end(s) were categorized as "
-                    f"'method_inadequacy'. This means the ANALYSIS METHOD was too narrow, "
-                    f"not the hypothesis being wrong. Consider retrying with broader analysis "
-                    f"before abandoning this direction."
-                )
-
-        # ── v12.2: TRAINING EXPERIMENT ARCHITECTURE REFLECTION ──
-        # When the experiment was a training run (not analysis), inject
-        # specialized reflection prompts for architecture-level issues.
-        is_training = (
-            execute_result.get("experiment_launched", False)
-            and not execute_result.get("is_paper_research", False)
-        )
-        if is_training:
-            # Check for routing-related VERIFY issues from Layer 12
-            verify_report_dict = verify_report.to_dict() if verify_report else {}
-            routing_issues = [
-                c for c in verify_report_dict.get("checks", [])
-                if c.get("name") in ("routing_differentiation", "aux_loss_convergence",
-                                     "domain_regression")
-                and c.get("status") in ("fail", "warn")
-            ]
-
-            if routing_issues:
-                context["training_architecture_reflection_prompt"] = (
-                    "TRAINING ARCHITECTURE REFLECTION (v12.2):\n"
-                    "VERIFY detected architectural convergence issues. You MUST evaluate:\n\n"
-                    "1. ROUTING/FUSION CONVERGENCE:\n"
-                    "   - Did routing weights differentiate across domains?\n"
-                    "   - If all domains have ~50/50 weights, the router is NOT learning.\n"
-                    "   - Possible causes: aux_weight too low, routing target [0.5,0.5]\n"
-                    "     for majority class, router input lacks discriminative info.\n\n"
-                    "2. AUX LOSS CONVERGENCE:\n"
-                    "   - Is aux_loss actually decreasing across epochs?\n"
-                    "   - If aux_loss is flat, the auxiliary module receives no useful gradient.\n"
-                    "   - Consider: higher aux_weight, separate optimizer for router,\n"
-                    "     or pre-training the router with material classification GT.\n\n"
-                    "3. PER-DOMAIN REGRESSION:\n"
-                    "   - Did ANY domain get WORSE compared to the baseline?\n"
-                    "   - A domain regressing >20% means the new mechanism is HARMFUL for it.\n"
-                    "   - The new component may need a domain-specific on/off switch.\n\n"
-                    "4. CORRECT FAILURE CATEGORY:\n"
-                    "   - If routing weights did not differentiate → implementation_bug\n"
-                    "     (the architecture cannot learn what it's supposed to)\n"
-                    "   - If overall MAE improved but specific domains regressed →\n"
-                    "     method_inadequacy (the approach helps some domains but hurts others)\n"
-                    "   - Do NOT classify as hypothesis_wrong unless ≥3 independent\n"
-                    "     architecture variants all fail the same way.\n\n"
-                    f"VERIFY issues:\n"
-                    + "\n".join(
-                        f"  - [{c.get('severity','?')}] {c.get('detail', '')[:200]}"
-                        for c in routing_issues[:5]
-                    )
-                )
-                logger.info(
-                    f"Injecting training architecture reflection: "
-                    f"{len(routing_issues)} VERIFY issues"
-                )
-
-        # ── v10: STRATEGY CONSTRAINT ENGINE — generate rules from history ──
-        try:
-            self.strategy_engine.generate_rules_from_history(self.memory)
-        except Exception as e:
-            logger.debug(f"Strategy rule generation skipped: {e}")
-
-        # ── v10: CONTEXT PRUNING ──
+        # Context pruning
         context = self.context_pruner.prune(context, "reflect")
 
-        # ── v12.1: REFLECT with quota-exhaustion fallback ──
-        # If the LLM call fails (e.g. insufficient_quota, all providers down),
-        # use a rule-based degraded reflect instead of losing the entire cycle's
-        # EXECUTE + VERIFY results.
         try:
-            result = self.dispatcher.dispatch_leader(
-                task="reflect",
-                context=context,
-            )
-        except (RuntimeError, Exception) as reflect_err:
-            err_msg = str(reflect_err)
-            is_quota_error = (
-                "insufficient_quota" in err_msg
-                or "All providers failed" in err_msg
-                or "429" in err_msg
-                or "quota" in err_msg.lower()
-            )
-            logger.warning(f"REFLECT LLM call failed: {err_msg[:200]}")
-            raise  # Let run() handle backoff
+            result = self.dispatcher.dispatch_leader(task="reflect", context=context)
+        except Exception as e:
+            logger.warning(f"REFLECT LLM call failed: {e}")
+            result = {"milestone": "", "decision": "Reflect failed", "dead_end": None,
+                      "active_problem": None}
 
-        # Update memory based on reflection
+        # Record to memory
         if result.get("milestone"):
-            self.memory.log_milestone(result["milestone"])
+            self.memory.log_milestone(result["milestone"], cycle=self.cycle_count)
         if result.get("decision"):
             self.memory.log_decision(result["decision"])
         if result.get("dead_end"):
-            failure_cat = result.get("failure_category", "")
-            self.memory.log_dead_end(result["dead_end"], failure_category=failure_cat)
+            self.memory.log_dead_end(result["dead_end"])
         if result.get("active_problem"):
             self.memory.log_active_problem(result["active_problem"])
 
-        # Paper research: always log as major event
-        if execute_result.get("is_paper_research") and result.get("milestone"):
-            self.memory.log_major_event(result["milestone"])
-
-        # Validate context keys against registry
-        try:
-            from .context_keys import validate_context
-            key_warnings = validate_context(context, "reflect")
-            for w in key_warnings:
-                logger.debug(f"Context key: {w}")
-        except Exception:
-            pass
-
+        logger.info(f"REFLECT result: milestone={'yes' if result.get('milestone') else 'no'}")
         return result
 
-    def _refresh_obsidian(self, reflect_result: dict, directive: Optional[str]):
-        if not self.obsidian.is_enabled():
-            return
-        self.obsidian.refresh_dashboard(memory=self.memory, cycle_count=self.cycle_count)
-        self.obsidian.append_daily_entry(
-            memory=self.memory,
-            cycle_count=self.cycle_count,
-            event_type="cycle_complete",
-            reflection=reflect_result,
-            directive=directive,
-        )
-
-    def _plan_signature(self, plan: dict) -> str:
-        """Build a stable signature for repeated-plan detection."""
-        normalized = {
-            "action": plan.get("action", ""),
-            "agent": plan.get("agent", ""),
-            "task": " ".join(plan.get("task", "").split())[:300],
-            "hypothesis": " ".join(plan.get("hypothesis", "").split())[:200],
-        }
-        return json.dumps(normalized, sort_keys=True, ensure_ascii=True)
-
-    # v18 Phase 3: __extract_direction_signature removed (0 triggers in production, research decision)
-    # ── Known architecture names for architecture-level detection (v14) ──
-    _ARCHITECTURE_PATTERNS = {
-        "epi": ["epi", "epinet", "epipolar", "epi_net", "epi slope", "epi branch"],
-        "unet": ["unet", "u-net", "u_net", "unet_decoder", "unet_encoder"],
-        "transformer": ["transformer", "vit", "attention_is_all", "self_attention"],
-        "cnn": ["resnet", "vgg", "mobilenet", "efficientnet", "densenet", "inception"],
-        "graph": ["gnn", "graph", "gcn", "gat", "message_passing"],
-        "lfnet": ["lfnet", "lf_net", "lfanet", "lf_network"],
-        "oacc": ["oacc", "occlusion_aware", "occlusion-aware"],
-        "mvsnet": ["mvsnet", "mvs_net", "multi_view_stereo"],
-        "dpt": ["dpt", "dense_prediction_transformer"],
-        "adaspike": ["adaspike", "spike", "spiking"],
-    }
-
-    # v18 Phase 3: __extract_architecture_name removed (0 triggers in production, research decision)
-    # v18 Phase 3: __analyze_architecture_dead_ends removed (0 triggers in production, research decision)
-    # ── v16: Phase-Gated State-Driven Architecture ──
-
-    # v16.1: _build_scope_prefix removed (pure text injection ineffective against LLM)
 
     def _update_launch_counter(self, execute_result: dict):
-        """Update the consecutive-failed-launch counter after EXECUTE.
-
-        A genuine launch (experiment_launched=True) resets the counter to 0.
-        A failed launch (convergence_failed or experiment_launched=False on an
-        experiment plan, absent a tool error) increments it. The counter is
-        monotonic — it never self-resets on firing, only on a real launch.
-        """
+        """Update the consecutive-failed-launch counter after EXECUTE."""
         if execute_result.get("experiment_launched"):
             self._consecutive_failed_launches = 0
         elif execute_result.get("convergence_failed") or \
@@ -1747,67 +949,18 @@ class ResearchLoop(DomainKnowledgeMixin):
             self._consecutive_failed_launches += 1
 
     def _enforce_launch_after_failure(self, think_result: dict) -> dict:
-        """Force action when consecutive failed launches stack up.
-
-        Returns the (possibly rewritten) think_result:
-          - < 2 failures: no change (the cycle proceeds normally).
-          - 2 failures: rewrite the action/task to a forced 'fix + launch'
-            dispatch, carrying the specific failure reason so the code agent
-            knows what went wrong.
-          - ≥ 3 failures: rewrite to pause_human — stop burning quota and
-            surface the problem for human intervention.
-        """
+        """Force action when consecutive failed launches stack up."""
         n = self._consecutive_failed_launches
         if n < 2:
             return think_result
-
         if n >= 3:
-            logger.error(
-                f"⚠️  PAUSE-HUMAN: {n} consecutive cycles planned an experiment "
-                f"but EXECUTE never launched one. Stopping to avoid burning "
-                f"more quota. Last task: {str(think_result.get('task',''))[:100]}"
-            )
-            return {
-                "action": "pause_human",
-                "reason": (
-                    f"{n} consecutive failed launches. The agent repeatedly "
-                    f"plans an experiment but never calls launch_experiment. "
-                    f"This is likely an infrastructure or prompt issue requiring "
-                    f"human inspection."
-                ),
-                "task": think_result.get("task", ""),
-            }
-
-        # 2 failures: force a targeted 'fix + launch' re-dispatch.
-        logger.warning(
-            f"🔄 FORCED RE-DISPATCH: {n} consecutive failed launches. "
-            f"Forcing a 'fix + launch' task this cycle."
-        )
-        original_task = think_result.get("task", "")
-        return {
-            "action": "experiment",
-            "reason": (
-                f"Forced re-dispatch after {n} failed launches. The previous "
-                f"cycle(s) planned training but launch_experiment was never called."
-            ),
-            "task": (
-                f"CRITICAL — PREVIOUS LAUNCH FAILED.\n\n"
-                f"Last cycle you were asked to run an experiment but you did NOT "
-                f"call launch_experiment. This is your final chance before the "
-                f"system pauses for human intervention.\n\n"
-                f"Original task: {original_task[:300]}\n\n"
-                f"MANDATORY STEPS (do NOT deviate):\n"
-                f"1. Verify the training script exists and is correct (one read_file).\n"
-                f"2. Run a 2-step dry-run to confirm it works (one run_shell).\n"
-                f"3. Call launch_experiment(command=..., log_file=...) IMMEDIATELY.\n"
-                f"4. Do NOT explore further. Do NOT call read_file/list_files more "
-                f"than once each. CONVERGE NOW.\n\n"
-                f"If you cannot launch, explicitly report why in your response — "
-                f"do NOT silently skip the launch."
-            ),
-            "_forced_redispatch": True,
-        }
-
+            logger.error(f"PAUSE-HUMAN: {n} consecutive failed launches.")
+            return {"action": "pause_human", "task": think_result.get("task", ""),
+                    "reason": f"{n} consecutive failed launches."}
+        logger.warning(f"FORCED RE-DISPATCH: {n} failed launches.")
+        return {"action": "experiment",
+                "task": f"CRITICAL — {n} failed launches. Call launch_experiment NOW.\nOriginal: {think_result.get('task', '')[:200]}",
+                "_forced_redispatch": True}
 
     def _record_cycle_outcome(self, think_result: dict, execute_result: dict, reflect_result: dict,
                               verify_report_dict: dict = None):
