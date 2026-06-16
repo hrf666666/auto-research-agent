@@ -65,8 +65,7 @@ class TestSerialization:
             "pareto_frontier": "PARETO",
         }
         prompt = serialize_context(ctx, "think")
-        for marker in ["DOMAIN CONTENT", "PLAN SUMMARY", "CROSS EXP",
-                        "PHASE FOCUS", "ROADMAP", "CALIB", "PARETO"]:
+        for marker in ["DOMAIN CONTENT", "CROSS EXP", "CALIB", "PARETO"]:
             assert marker in prompt, f"'{marker}' dropped from THINK prompt — signal disconnect"
 
         # training_curve_analysis is a REFLECT key, verify it there

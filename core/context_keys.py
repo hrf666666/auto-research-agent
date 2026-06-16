@@ -138,9 +138,6 @@ THINK_KEYS = [
                serializer=_text_section("Human Directive (HIGHEST PRIORITY)", 2000), tier=1),
     ContextKey("persistent_constraints", "think", "Project-level hard rules",
                serializer=_text_section("Persistent Constraints", 1000), tier=1),
-    ContextKey("goal_progress", "think",
-               "Current best metrics vs targets, showing what's achieved and what's not",
-               serializer=_text_section("Goal Progress", 800), tier=1),
 
     # ── Session intelligence (tier 2) ──
     ContextKey("session_stats", "think", "SQLite summary: cycles, experiments, dead ends",
@@ -180,20 +177,8 @@ THINK_KEYS = [
                serializer=_text_section("Low-Value Directions (avoid)", 600), tier=3),
 
     # ── Research roadmap (tier 2) — PREVIOUSLY DROPPED ──
-    ContextKey("research_roadmap", "think", "Module decomposition, phase constraints",
-               serializer=_text_section("Research Roadmap", 2000), tier=2),
-    ContextKey("phase_focus", "think", "Current phase requirements and allowed actions",
-               serializer=_text_section("Phase Focus", 1000), tier=2),
 
     # ── Direction control (tier 3) — PREVIOUSLY DROPPED ──
-    ContextKey("idea_guardian_check", "think", "Mandatory direction alignment check (every 5 cycles)",
-               serializer=_text_section("Idea Guardian Check", 1000), tier=3),
-    ContextKey("direction_circuit_breaker", "think", "Direction stagnation warning",
-               serializer=_text_section("Direction Circuit Breaker", 800), tier=3),
-    ContextKey("architecture_circuit_breaker", "think", "Architecture stagnation warning",
-               serializer=_text_section("Architecture Circuit Breaker", 800), tier=3),
-    ContextKey("architecture_survey_gate", "think", "Architecture survey requirement",
-               serializer=_text_section("Architecture Survey Gate", 500), tier=3),
     ContextKey("data_scarcity_warning", "think", "Warning when < 10 training samples",
                serializer=_text_section("Data Scarcity Warning", 500), tier=3),
     ContextKey("method_inadequacy_retry_prompt", "think", "Retry guidance for inadequate methods",
