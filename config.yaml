@@ -110,7 +110,6 @@ multimodal_mcp:
 # Provides specialized visual understanding tools via MCP protocol.
 # No manual configuration needed — endpoints are resolved by provider detection.
 
-# IdeaScout — Cross-domain research idea discovery (research-idea-scout)
 # When enabled, the paper_research phase uses IdeaScout's profile-guided
 # pipeline (gather → rule-filter → LLM transferability score) instead of the
 # default researcher agent. A Profile is auto-generated from PROJECT_BRIEF.md;

@@ -167,15 +167,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Fix B: Audit enforcement counters ──
         self._audit_enforcement: dict[str, int] = {}
 
-        # ── v18: Signal Arbitration System ──
-        # The single decision arbiter that collects enforcement signals from
-        # all subsystems (audit, constraint, launch, stagnation) and produces
-        # a CycleDirective: either a forced_action (bypassing the LLM) or a
-        # budgeted context for normal THINK. Replaces the scattered advisory
-        # directive files and the positional enforcement chain.
-        from .signal_arbiter import SignalArbiter
-        arbiter_budget = self.config.get("context_budget", 12000)
-        self.arbiter = SignalArbiter(budget_chars=arbiter_budget)
 
         # Phase 2: deterministic garbage collector
         from .garbage_collector import GarbageCollector
@@ -235,12 +226,6 @@ class ResearchLoop(DomainKnowledgeMixin):
     def run(self):
         """Main entry point. Runs the THINK → EXECUTE → VERIFY → REFLECT loop."""
         logger.info(f"AutoResearcher starting | project={self.project_dir} | cycle={self.cycle_count}")
-
-        # v18: Restore deferred signals from the previous run's state.json
-        restored_state = self._load_state()
-        if restored_state.get("signal_backlog"):
-            self.arbiter.load_backlog(restored_state["signal_backlog"])
-            logger.info(f"Restored {len(self.arbiter._backlog)} deferred signals from state.json")
 
         while self._running:
             # Phase 1: Stop when all goals are achieved
@@ -306,41 +291,9 @@ class ResearchLoop(DomainKnowledgeMixin):
                     # THINK: Analyze and plan
                     think_result = self._think(directive)
 
-                    # ── v18: Signal Arbitration (THE single enforcement layer) ──
-                    # Replaces the former 7-layer chain:
-                    #   _check_phase_blocked → _enforce_roadmap_alignment →
-                    #   _apply_no_progress_fallback → _enforce_launch_after_failure →
-                    #   _enforce_audit_findings → _arbitrate_cycle
-                    # Now: arbiter collects all enforcement signals (launch
-                    # failures, audit escalations, forbidden constraints) and
-                    # produces one CycleDirective. Code-scan gates (phase,
-                    # roadmap) still run independently because they inspect
-                    # source files, not counters.
-                    directive_v18 = self._arbitrate_cycle(think_result)
-                    if directive_v18.forced_action:
-                        think_result = {
-                            "action": directive_v18.forced_action,
-                            "task": directive_v18.forced_task or think_result.get("task", ""),
-                            "reason": directive_v18.forced_reason or "",
-                        }
-                        logger.info(
-                            f"SIGNAL ARBITER override: action={directive_v18.forced_action}"
-                        )
-                    elif think_result.get("action") == "experiment":
-                        # Code-scan gates (kept — they inspect files, not counters)
-                        blocked, block_reason = self._check_phase_blocked(think_result)
-                        if blocked:
-                            logger.warning(f"PHASE GATE BLOCKED: {block_reason[:200]}")
-                            ps = self._load_phase_status()
-                            current_phase = ps.get("phases", {}).get(ps.get("current_phase", ""), {})
-                            focus = current_phase.get("focus_methods", ["data_analysis"])
-                            think_result["action"] = "paper_research"
-                            think_result["task"] = (
-                                f"{block_reason}\n\n"
-                                f"Research alternative approaches using these methods: {', '.join(focus)}.\n"
-                            )
-                            self.memory.log_decision(f"[PHASE GATE] Blocked: {block_reason[:150]}")
-                        think_result = self._enforce_roadmap_alignment(think_result)
+                    if think_result.get("action") == "experiment":
+                        think_result = self._enforce_launch_after_failure(think_result)
+                    think_result = self._enforce_roadmap_alignment(think_result)
 
                 # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
                 # Triggered by _enforce_launch_after_failure after 3 consecutive
@@ -1320,104 +1273,9 @@ class ResearchLoop(DomainKnowledgeMixin):
           - Otherwise, dispatch to the 'researcher' agent (web search + paper
             tools) as before — unchanged behavior.
         """
-        scout_cfg = self.config.get("idea_scout", {})
-        if scout_cfg.get("enabled", False):
-            try:
-                from core.idea_scout_bridge import is_available as scout_available
-                if scout_available():
-                    return self._execute_idea_scout(plan, scout_cfg)
-                logger.warning(
-                    "idea_scout.enabled=True but research-idea-scout library not "
-                    "found. Falling back to researcher agent."
-                )
-            except Exception as e:
-                logger.warning(
-                    f"IdeaScout pipeline failed ({e}). Falling back to researcher agent."
-                )
-
-        logger.info("PAPER RESEARCH EXECUTE phase starting (researcher agent)...")
-
-        task_description = plan.get(
-            "task",
-            "Execute the /paper-research skill. Read skills/paper-research/SKILL.md for instructions.",
-        )
-
-        result = self.dispatcher.dispatch_worker(
-            agent_type="researcher",
-            task=task_description,
-            tools=self.tools.get_tools_for("researcher"),
-        )
-
-        # Mark as paper_research so REFLECT knows how to handle it
         result["is_paper_research"] = True
         return result
 
-    def _execute_idea_scout(self, plan: dict, scout_cfg: dict) -> dict:
-        """Run the IdeaScout cross-domain idea-discovery pipeline.
-
-        1. Build a Profile from PROJECT_BRIEF (+ memory dead-ends).
-        2. Gather papers via this agent's search_papers tool.
-        3. Rule-filter candidates (fast keyword pruning).
-        4. LLM-score survivors for transferability (via ProviderRouter).
-        5. Write a ranked Markdown report to the workspace.
-        Returns a result dict with ``idea_scout_ranked`` for VERIFY/REFLECT.
-        """
-        from core.idea_scout_bridge import (
-            build_profile_from_brief, run_pipeline, format_results_markdown,
-        )
-
-        task = plan.get("task", "")
-        logger.info(f"IDEA SCOUT pipeline starting for: {task[:100]}")
-
-        # 1. Profile
-        brief_path = self.project_dir / "PROJECT_BRIEF.md"
-        profile_path = scout_cfg.get("profile_path", "")
-        profile = build_profile_from_brief(
-            brief_path, memory=self.memory,
-            profile_path=profile_path or None,
-        )
-
-        # 2-4. Pipeline (gather → filter → score)
-        pipeline_result = run_pipeline(
-            tools_registry=self.tools,
-            dispatcher=self.dispatcher,
-            profile=profile,
-            query=task,
-            max_papers=scout_cfg.get("max_papers", 50),
-            filter_top_k=scout_cfg.get("filter_top_k", 20),
-            score_top_k=scout_cfg.get("score_top_k", 10),
-            abstract_max_chars=scout_cfg.get("abstract_max_chars", 3000),
-        )
-
-        # 5. Write report
-        report = format_results_markdown(pipeline_result, task)
-        date_str = time.strftime("%Y-%m-%d")
-        report_path = self.workspace / f"idea_scout_results_{date_str}.md"
-        report_path.write_text(report, encoding="utf-8")
-        logger.info(f"IdeaScout report written to {report_path}")
-
-        # Build the execute_result dict (consumed by VERIFY/REFLECT)
-        ranked = pipeline_result.get("ranked", [])
-        top_ideas = [
-            {
-                "title": p.get("title", ""),
-                "rank_score": p.get("rank_score", 0),
-                "priority": p.get("priority", ""),
-                "idea_core": p.get("idea_core", ""),
-                "transferable_mechanism": p.get("transferable_mechanism", ""),
-                "url": p.get("url", ""),
-            }
-            for p in ranked[:5]  # top-5 for the summary
-        ]
-        return {
-            "agent": "idea_scout",
-            "is_paper_research": True,
-            "response": report[:2000],  # truncated for context
-            "idea_scout_ranked": pipeline_result,
-            "top_ideas": top_ideas,
-            "report_path": str(report_path),
-            "papers_scored": pipeline_result.get("papers_scored", 0),
-        }
 
     def _monitor_experiment(self, execute_result: dict) -> dict:
         """Monitor running experiment with ZERO LLM calls."""
@@ -3511,58 +3369,6 @@ class ResearchLoop(DomainKnowledgeMixin):
     # ─────────────────────────────────────────────────────────────
     # Phase 4: Failed-launch forced re-dispatch
     # ─────────────────────────────────────────────────────────────
-    def _arbitrate_cycle(self, think_result: dict):
-        """v18: Collect enforcement signals from all subsystems and let the
-        SignalArbiter produce a unified CycleDirective.
-
-        This is the SINGLE enforcement decision point. It replaces the
-        scattered positional enforcement chain (Phase 4 + Fix B) with one
-        priority-ordered arbitration. Signals are collected from:
-        - Launch failures (_consecutive_failed_launches)
-        - Audit escalations (_audit_enforcement)
-        - Constraint engine (forbidden violations)
-        - Human directives
-        """
-        self.arbiter.begin_cycle()
-
-        # Signal: launch failures → CRITICAL if >= 2
-        if self._consecutive_failed_launches >= 2:
-            action = "pause_human" if self._consecutive_failed_launches >= 3 else "forced_fix"
-            self.arbiter.add_signal(
-                source="launch", key="research_roadmap",
-                content="Launch enforcement active",
-                severity="CRITICAL", forced_action=action,
-                forced_task=self._enforce_launch_after_failure(think_result).get("task"),
-                forced_reason=f"{self._consecutive_failed_launches} consecutive failed launches")
-
-        # Signal: audit escalations → CRITICAL if >= 2
-        for sig, count in self._audit_enforcement.items():
-            if count >= 2:
-                action = "pause_human" if count >= 3 else "forced_fix"
-                self.arbiter.add_signal(
-                    source="audit", key="phase_focus",
-                    content=f"Audit issue: {sig}",
-                    severity="CRITICAL", forced_action=action,
-                    forced_task=self._enforce_audit_findings(think_result).get("task"),
-                    forced_reason=f"Audit '{sig}' escalated {count} times")
-
-        # Signal: constraint violations → CRITICAL if forbidden
-        try:
-            violations = self.strategy_engine.check_constraints(think_result, self.memory)
-            if self.strategy_engine.has_forbidden_violation(violations):
-                self.arbiter.add_signal(
-                    source="constraint", key="persistent_constraints",
-                    content="; ".join(violations),
-                    severity="CRITICAL", forced_action="forced_fix",
-                    forced_task=think_result.get("task", ""),
-                    forced_reason="FORBIDDEN constraint violation")
-        except Exception:
-            pass
-
-        # Signal: human directive (highest priority, always WARNING at minimum)
-        directive = self._consume_directive if hasattr(self, '_last_directive') else None
-
-        return self.arbiter.arbitrate("think")
 
     def _update_launch_counter(self, execute_result: dict):
         """Update the consecutive-failed-launch counter after EXECUTE.
@@ -3641,64 +3447,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             ),
             "_forced_redispatch": True,
         }
-
-    def _enforce_audit_findings(self, think_result: dict) -> dict:
-        """Fix B: Force action when repeated audit issues go uncorrected.
-
-        Same enforcement model as _enforce_launch_after_failure: per-signature
-        monotonic counter. If an audit issue has been escalated (DIRECTIVE
-        written) but the agent still hasn't fixed it after 2 cycles, force
-        the action to a targeted fix task. After 3, pause for human
-        intervention. This replaces the old "advisory-only DIRECTIVE.md that
-        the LLM ignores forever" pattern.
-
-        Resets a signature's counter only when the issue stops recurring for
-        2 consecutive cycles (grace period), not on fire.
-        """
-        if not self._audit_enforcement:
-            return think_result
-
-        for sig, n in sorted(self._audit_enforcement.items(), key=lambda x: -x[1]):
-            if n >= 3:
-                logger.error(
-                    f"⛔ PAUSE-HUMAN: audit issue '{sig}' escalated {n} times "
-                    f"without resolution. Stopping for human inspection."
-                )
-                self._audit_enforcement[sig] = 0  # reset on pause
-                return {
-                    "action": "pause_human",
-                    "reason": (
-                        f"Audit issue '{sig}' has been escalated {n} times. "
-                        f"The agent cannot resolve this automatically — likely "
-                        f"an infrastructure or prompt-level issue. Human "
-                        f"inspection required."
-                    ),
-                    "task": think_result.get("task", ""),
-                }
-            if n >= 2:
-                logger.warning(
-                    f"🔄 FORCED FIX: audit issue '{sig}' escalated {n} times. "
-                    f"Forcing a targeted fix task."
-                )
-                self._audit_enforcement[sig] = 0  # give the forced fix a clean slate
-                return {
-                    "action": think_result.get("action", "paper_research"),
-                    "reason": f"Forced fix for recurring audit issue '{sig}'.",
-                    "task": (
-                        f"CRITICAL — RECURRING AUDIT ISSUE (escalated {n} times).\n\n"
-                        f"Issue signature: {sig}\n"
-                        f"This issue has persisted across multiple cycles despite "
-                        f"directives. You MUST diagnose and fix it NOW:\n"
-                        f"1. Identify the root cause (not the symptom)\n"
-                        f"2. Apply the minimal fix\n"
-                        f"3. Verify the fix resolves the issue\n"
-                        f"4. Report what was wrong and what you changed\n\n"
-                        f"Original task: {think_result.get('task', '')[:200]}\n"
-                    ),
-                    "_forced_audit_fix": True,
-                }
-        return think_result
-
 
 
     def _parse_goals_from_brief(self) -> list[dict]:
@@ -4452,9 +4200,6 @@ class ResearchLoop(DomainKnowledgeMixin):
     def _update_state(self, updates: dict):
         state = self._load_state()
         state.update(updates)
-        # v18: persist the signal arbiter's backlog so deferred signals
-        # survive process restarts (previously they were in-memory only).
-        state["signal_backlog"] = self.arbiter.get_backlog()
         # Atomic write: write to temp file first, then rename
         # This prevents state.json corruption if the process crashes mid-write
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -4506,7 +4251,11 @@ class ResearchLoop(DomainKnowledgeMixin):
         Low-VOI experiments get a warning injected into the task.
         """
         hypothesis = think_result.get("hypothesis", "")
+        if not isinstance(hypothesis, str):
+            hypothesis = str(hypothesis)
         success_criteria = think_result.get("success_criteria", "")
+        if not isinstance(success_criteria, str):
+            success_criteria = str(success_criteria)
 
         # Estimate expected improvement from success criteria or hypothesis
         import re
