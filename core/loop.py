@@ -183,8 +183,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Research Roadmap (v15): Structured research methodology ──
         from .research_roadmap import ResearchRoadmap
         self.roadmap = ResearchRoadmap(self.workspace)
-        self._roadmap_initialized = False  # Set True after first generate_from_brief()
-        self._phase_violation_count = 0    # Consecutive phase violations in THINK
+        self._roadmap_initialized = False  # Set True after first generate_from_brief()    # Consecutive phase violations in THINK
 
         # Graceful shutdown
         try:
@@ -841,11 +840,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # close it is to the goal. Previously there was no goal-tracking —
         # the agent achieved val_MAE=0.184 (target < 0.20) in cycle 1 but
         # had no idea it was already close.
-        try:
-            goal_text = self._build_goal_progress()
-            if goal_text:
-                context["goal_progress"] = goal_text
-        except Exception as e:
+
             logger.warning(f"Failed to inject goal progress: {e}")
 
         # Inject dataset manifest (if available) so Leader knows data quality issues
@@ -906,17 +901,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
 
         # ── IDEA GUARDIAN CHECK (every 5 cycles) ──
-        if self.cycle_count > 0 and self.cycle_count % 5 == 0:
-            context["idea_guardian_check"] = (
-                f"IDEA GUARDIAN CHECK (Cycle {self.cycle_count}):\n"
-                "This is a MANDATORY direction alignment check. You MUST:\n"
-                "1. Re-read PROJECT_BRIEF phase goals — which phase should we be in?\n"
-                "2. List how many cycles contributed to the CORE IDEA (not incremental tuning)\n"
-                "3. Rate: Core idea implementation (0-10), Phase completion (0-10), Data-first verification (0-10)\n"
-                "4. If ANY score < 5, propose a COURSE CORRECTION — not another training run\n"
-                "5. Have you verified the data supports the core idea BEFORE building models?\n"
-                "If not, the next experiment MUST be a DATA ANALYSIS experiment, not model training."
-            )
+
 
         # ── DIRECTION CIRCUIT BREAKER ──
         # Force direction re-evaluation when stagnation is detected
@@ -935,22 +920,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         # In early cycles (1-2), force an architecture survey before committing to any model.
         # This prevents the agent from blindly using PROJECT_BRIEF's suggested baseline.
         if not self._architecture_survey_done and self.cycle_count <= 2:
-            if not self._architecture_survey_path.exists():
-                context["architecture_survey_gate"] = (
-                    "ARCHITECTURE SURVEY GATE (v14): This is an early cycle and no architecture "
-                    "survey has been completed yet.\n\n"
-                    "BEFORE committing to any baseline architecture, you MUST:\n"
-                    "1. Search for at least 3 different architectures/methods for this task\n"
-                    "2. For each candidate, analyze:\n"
-                    "   - Core ASSUMPTION (e.g., Lambertian, smooth, regular grid)\n"
-                    "   - Data requirements vs. what's actually available\n"
-                    "   - Computational feasibility given available resources\n"
-                    "   - Published performance on similar tasks\n"
-                    "3. Write the survey to workspace/ARCHITECTURE_SURVEY.md\n"
-                    "4. ONLY THEN select the best architecture based on evidence\n\n"
-                    "Do NOT use any architecture just because it's mentioned in PROJECT_BRIEF.\n"
-                    "PROJECT_BRIEF provides context, NOT architectural decisions."
-                )
+            pass
+
 
         # ── CROSS-EXPERIMENT KNOWLEDGE INTEGRATION ──
         # Connect dead ends across experiments to identify meta-patterns
@@ -982,30 +953,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 )
         except Exception as e:
             logger.debug(f"Method inadequacy check skipped: {e}")
-
-        # ── v12.1: PENDING DEGRADED REFLECT ──
-        # If the previous cycle's REFLECT was degraded (API quota exhausted),
-        # inject a reminder so the Leader can revisit those results.
-        degraded_note_path = self.workspace / ".degraded_reflect_pending"
-        if degraded_note_path.exists():
-            try:
-                degraded_info = json.loads(degraded_note_path.read_text())
-                context["degraded_reflect_pending"] = (
-                    f"PRIOR CYCLE INCOMPLETE REFLECT (v12.1):\n"
-                    f"Cycle {degraded_info.get('cycle', '?')} REFLECT was degraded "
-                    f"(API quota exhausted). Results were preserved but NOT fully analyzed.\n"
-                    f"Metrics: {degraded_info.get('metrics_summary', 'N/A')}\n"
-                    f"VERIFY: {degraded_info.get('verify_status', 'N/A')}\n"
-                    f"{'Milestone recorded (partial).' if degraded_info.get('has_milestone') else ''}"
-                    f"{'Dead end recorded (partial).' if degraded_info.get('has_dead_end') else ''}\n"
-                    f"→ You SHOULD briefly review the last cycle's results before planning new work.\n"
-                    f"→ If the last cycle was successful, continue from there.\n"
-                    f"→ If it failed, diagnose and fix before proceeding."
-                )
-                # Consume the note after one injection
-                degraded_note_path.unlink()
-            except Exception:
-                pass
 
         # ── ARCHITECTURE PLAN INJECTION (Phase 2+) ──
         # When transitioning from analysis to model building, provide the Leader
@@ -1158,19 +1105,8 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── RESEARCH ROADMAP (v15): Inject phase constraints ──
         # This is the PRIMARY control mechanism: tells Leader what phase and module to work on.
-        try:
-            roadmap_ctx = self.roadmap.get_phase_context(self.cycle_count)
-            if roadmap_ctx:
-                context["research_roadmap"] = roadmap_ctx
-        except Exception as e:
-            logger.warning(f"ROADMAP context injection failed: {e}")
 
-        # ── PHASE FOCUS (v16): State-driven structured thinking ──
-        # Replace open-ended "what should we do next?" with structured
-        # "here's the gap, propose how to close it" — constrains the answer space.
-        phase_focus = self._build_phase_focus()
-        if phase_focus:
-            context["phase_focus"] = phase_focus
+            logger.warning(f"ROADMAP context injection failed: {e}")
 
         # ── CONTEXT PRUNING (v10) ──
         # Limit context to most relevant keys to prevent LLM confusion
@@ -1440,9 +1376,7 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── v16: Gap-closing reflection ──
         # Inject phase gap context so REFLECT compares results against targets
-        phase_focus = self._build_phase_focus()
-        if phase_focus:
-            context["phase_focus"] = phase_focus
+
 
         # Inject VERIFY diagnosis so Leader knows what actually worked/failed
         if verify_report:
