@@ -3939,15 +3939,17 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Metric-based progress tracking (Fix 1: visual analysis trigger) ──
         final_metrics = execute_result.get("final_metrics") or {}
         current_metric = None
-        for key in ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae"):
+        # v18 Phase 4: metric keys from config goals, fallback to defaults
+        goal_metrics = self.config.get("goals", {}).get("metrics", [])
+        metric_keys = tuple(g.get("key", "val_MAE") for g in goal_metrics) if goal_metrics else \
+                      ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae")
+        for key in metric_keys:
             if key in final_metrics:
                 try:
                     current_metric = float(final_metrics[key])
                 except (TypeError, ValueError):
                     pass
                 break
-
-        # ── Phase 1: Structured metric record ──
         # System deterministically writes a quantitative result line to
         # MEMORY_LOG.md. Previously, quantitative results (val_MAE=0.184)
         # only existed in SQLite but never reached MEMORY_LOG (the LLM's

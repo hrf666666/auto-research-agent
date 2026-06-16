@@ -6,6 +6,14 @@ project:
   brief: "PROJECT_BRIEF.md"
   workspace: "/home/bigboss/code"
 
+# v18 Phase 4: goal definitions (config-driven, replaces hardcoded val_MAE)
+goals:
+  metrics:
+    - key: "val_MAE"
+      target: 0.20
+      direction: "lower"
+  stop_on_achieved: true
+
 agent:
   # Provider: "anthropic" | "openai" | "qwen" | "ali_token_plan" | "glm_token_plan"
   #   anthropic:      Anthropic Claude (requires ANTHROPIC_API_KEY)

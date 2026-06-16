@@ -540,34 +540,19 @@ If `independent_assessment_warning` appears in REFLECT context:
 4. Run `probe_model` with a checkpoint to get runtime evidence
 5. Only proceed with evaluation after confirming outputs are valid
 
-## Idea Guardian Check (MANDATORY — every 5 cycles)
+## Research Direction Self-Assessment
 
-Every 5 cycles (or whenever you feel "stuck"), you MUST perform an Idea Guardian check:
+Whenever you feel "stuck" or experiments aren't improving, ask yourself:
 
-### Step 1: Re-read PROJECT_BRIEF Phase Goals
-Read the phased research plan in PROJECT_BRIEF.md. Answer:
-1. Which phase are we supposed to be in? (Phase 1: data analysis, Phase 2: validation, Phase 3: integration)
-2. What was the SUCCESS CRITERIA for the current phase?
-3. Have we MET that criteria? If not, we should NOT proceed to the next phase.
-
-### Step 2: Progress Audit
-1. How many cycles have we spent? Is this disproportionate to the expected phase duration?
-2. List ALL experiments that contributed to the core idea (not incremental tuning).
-3. What fraction of cycles were spent on the core idea vs. incremental optimization?
-
-### Step 3: Direction Alignment Score
-Rate the current research direction against PROJECT_BRIEF goals:
-- **Core idea implementation**: Have we implemented the KEY INNOVATION described in the brief? (0-10)
-- **Phase completion**: Are we in the correct phase? Have we completed prerequisite phases? (0-10)
-- **Data-first verification**: Have we verified our assumptions on the data BEFORE building models? (0-10)
-
-If ANY score is < 5, you MUST propose a course correction — not another training run.
-
-### Step 4: Data Analysis Experiments
-Before building complex models, you MUST verify that the data supports the core idea:
-1. Does the data actually exhibit the patterns the idea relies on? (e.g., "Do feature distributions differ between domains as predicted?")
-2. Can you design a SIMPLE analysis experiment (no training) to verify this?
-3. If the data doesn't support the idea, STOP and re-evaluate the idea before wasting more GPU hours.
+1. **Am I working on the core idea?** Re-read PROJECT_BRIEF — are you implementing
+   the KEY INNOVATION, or just incrementally tuning?
+2. **Have I verified the data supports my idea?** Before complex models, verify
+   the data exhibits the patterns your approach relies on. Design a simple
+   analysis experiment (no training) to confirm.
+3. **What does my experiment history say?** Check the Causal History and Goal
+   Progress in your context — avoid repeating directions that already failed.
+4. **Should I switch direction?** If multiple experiments on the same approach
+   show no improvement, consider surveying fundamentally different methods.
 
 **Example data analysis experiment:**
 ```json
@@ -580,7 +565,7 @@ Before building complex models, you MUST verify that the data supports the core 
 }
 ```
 
-## Data Scarcity Awareness (MANDATORY)
+## Data Scarcity Awareness
 
 When `data_constraints` appears in your context, you MUST:
 1. **Count the training samples** for the domain you're trying to improve

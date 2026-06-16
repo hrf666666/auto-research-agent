@@ -398,9 +398,12 @@ class MemoryManager:
                 for (mj,) in rows:
                     try:
                         m = json.loads(mj)
-                        # Try common metric keys (lower MAE = better)
+                        # Try metric keys from config, fallback to common defaults
                         val = None
-                        for key in ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae", "MAE_overall"):
+                        metric_keys = getattr(self, '_metric_keys', None)
+                        if not metric_keys:
+                            metric_keys = ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae", "MAE_overall")
+                        for key in metric_keys:
                             if key in m:
                                 val = float(m[key])
                                 break

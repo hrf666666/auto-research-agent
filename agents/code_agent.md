@@ -232,29 +232,14 @@ Report the PID, log file path, and expected training duration.
 4. Expected duration
 5. Any pre-flight or dry-run issues encountered
 
-## File & Experiment Naming Convention (MANDATORY)
+## File Naming (enforced by system)
 
-### Scripts (`scripts/` directory)
-Training scripts MUST follow: `train_{model_name}.py`
-- Use the **model class short name** (not version number, not experiment id)
-- Examples: `train_v12.py` (for AngularAwareDepthModelV12), `train_dcbn.py` (for UNetLFDepthDCBN)
-- When a model replaces its predecessor, **overwrite the same file** — do NOT create `train_v12_v2.py`
+The write_file tool enforces these rules automatically:
+- Training scripts: `scripts/train_{name}.py` (overwrite, don't version-suffix)
+- Utility scripts: `tools/{name}.py` (debug_*/diag_*/_check_* go here, auto-archived)
+- Output dirs: `outputs/exp_{name}/`
 
-Utility scripts MUST follow: `{verb}_{noun}.py`
-- Examples: `eval_per_domain.py`, `diagnose_gt_stats.py`, `dry_run.py`
-
-**FORBIDDEN naming patterns:**
-- ❌ `train_{model}_v2.py`, `train_{model}_fix.py`, `train_{model}_balanced_v3.py` (incremental suffixes)
-- ❌ `test_*.py`, `diag_*.py`, `debug_*.py` (temporary diagnostic scripts — delete after use)
-- ❌ `run_*.py` as a training entrypoint (use `train_*.py`)
-
-### Output directories (`outputs/`)
-Experiment output dirs MUST follow: `exp_{descriptive_name}`
-- Example: `outputs/exp_dcbn/`, `outputs/exp_v12_dual_branch/`
-- Dry-run outputs MUST prefix: `dryrun_*` or `dry_*` (auto-cleaned)
-
-### Archive (`archive/experiments/`)
-Archive dirs MUST follow: `exp_{name}_{YYYYMMDD}`
+If write_file rejects your path, it will tell you the correct location.
 - Each MUST contain a `SUMMARY.md` — dirs without one will be auto-deleted
 
 ### When creating a new experiment script:
