@@ -1820,70 +1820,26 @@ class ExperimentVerifier:
         self._check_model_fusion_balance(tree, model_file, report)
 
     def _check_model_dead_branches(self, tree, model_file, report):
-        """Check for modules declared in __init__ but never used in forward()."""
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            is_module = False
-            for base in node.bases:
-                if isinstance(base, ast.Attribute) and base.attr == "Module":
-                    is_module = True
-                    break
-            if not is_module:
-                continue
+        """Check for modules declared in __init__ but never used in forward().
 
-            # Collect self.xxx = ... assignments in __init__
-            init_attrs = set()
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "__init__":
-                    for stmt in ast.walk(item):
-                        if isinstance(stmt, ast.Assign):
-                            for target in stmt.targets:
-                                if isinstance(target, ast.Attribute):
-                                    if isinstance(target.value, ast.Name) and target.value.id == "self":
-                                        init_attrs.add(target.attr)
-
-            # Collect self.xxx references in forward()
-            forward_refs = set()
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "forward":
-                    for stmt in ast.walk(item):
-                        if isinstance(stmt, ast.Attribute):
-                            if isinstance(stmt.value, ast.Name) and stmt.value.id == "self":
-                                forward_refs.add(stmt.attr)
-
-            # Find modules declared in __init__ but never referenced in forward()
-            dead_modules = init_attrs - forward_refs
-            # Filter to likely nn.Module instances (lowercase with underscores, not plain attrs)
-            likely_dead = []
-            for attr in dead_modules:
-                # Skip non-module attributes (like self.ang_size, self.num_classes)
-                if attr.startswith("_") or attr[0].isupper():
-                    continue
-                # Check if it was assigned to a Call (likely a module instantiation)
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == "__init__":
-                        for stmt in ast.walk(item):
-                            if isinstance(stmt, ast.Assign):
-                                for target in stmt.targets:
-                                    if isinstance(target, ast.Attribute) and target.attr == attr:
-                                        if isinstance(stmt.value, ast.Call):
-                                            likely_dead.append(attr)
-
-            if likely_dead:
+        v18: Uses model_structure_scanner instead of inline AST walk (67→15 lines).
+        """
+        from .model_structure_scanner import scan_model_file, find_dead_branches
+        try:
+            content = model_file.read_text()
+            structure = scan_model_file(content)
+            dead = find_dead_branches(structure)
+            if dead:
                 report.checks.append(VerifyCheck(
                     name="dead_modules",
                     category="integrity",
                     status="warn",
-                    detail=(
-                        f"Model {node.name} declares modules {likely_dead} in __init__ "
-                        f"but never uses them in forward(). These are wasted parameters."
-                    ),
+                    detail=f"Dead branches detected: {dead}. These modules are allocated but never used in forward().",
                     severity="medium",
                     module_path=model_file.stem,
                 ))
-
-            break  # Only check first nn.Module
+        except Exception:
+            pass
 
     def _check_model_fusion_balance(self, tree, model_file, report):
         """Check fusion point for branch channel imbalance."""

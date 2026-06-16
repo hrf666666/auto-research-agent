@@ -430,90 +430,7 @@ class SimulationSandbox:
 
     # ── Layer 2a: Reference Evaluation ──
 
-    def evaluate_vs_reference(
-        self,
-        model_path_before: str,
-        model_path_after: str,
-        checkpoint_path: str,
-        val_data_dir: str = "",
-        gt_dir: str = "",
-        max_samples: int = 10,
-    ) -> ReferenceEvaluation:
-        """Reference-based evaluation: compare before/after on val samples vs GT."""
-        report = ReferenceEvaluation()
-
-        # Find validation samples
-        val_samples = self._find_val_samples(val_data_dir, max_samples)
-        if not val_samples:
-            report.verdict = "no_val_samples"
-            return report
-
-        model_after = self._resolve_model(model_path_after)
-        model_before = self._resolve_model(model_path_before)
-
-        if not model_after:
-            report.verdict = "model_not_found"
-            return report
-
-        # Run inference on both models
-        after_result = self._run_inference(
-            model_after, checkpoint_path, val_samples, gt_dir
-        )
-        before_result = None
-        if model_before and model_before.exists():
-            before_result = self._run_inference(
-                model_before, "", val_samples, gt_dir
-            )
-
-        if not after_result:
-            report.verdict = "inference_failed"
-            return report
-
-        # Aggregate results
-        mae_before_list = []
-        mae_after_list = []
-
-        for sample_id in after_result.get("per_sample", {}):
-            after_mae = after_result["per_sample"][sample_id].get("mae")
-            if after_mae is not None:
-                mae_after_list.append(after_mae)
-
-            if before_result:
-                before_mae = before_result.get("per_sample", {}).get(sample_id, {}).get("mae")
-                if before_mae is not None:
-                    mae_before_list.append(before_mae)
-
-        if mae_after_list:
-            report.mae_after_avg = sum(mae_after_list) / len(mae_after_list)
-        if mae_before_list:
-            report.mae_before_avg = sum(mae_before_list) / len(mae_before_list)
-
-        if report.mae_before_avg is not None and report.mae_after_avg is not None:
-            report.mae_delta = report.mae_after_avg - report.mae_before_avg
-
-            # Parameter efficiency
-            info_after = self._extract_model_info(model_path_after)
-            info_before = self._extract_model_info(model_path_before)
-            params_after = info_after.get("total_params", 1)
-            params_before = info_before.get("total_params", 1)
-            report.param_efficiency_after = report.mae_after_avg / (params_after / 1000)
-            report.param_efficiency_before = report.mae_before_avg / (params_before / 1000)
-
-            # Verdict
-            improvement_pct = abs(report.mae_delta) / report.mae_before_avg * 100 if report.mae_before_avg > 0 else 0
-            if report.mae_delta < -0.02:
-                report.verdict = "significant_improvement"
-            elif report.mae_delta < 0:
-                report.verdict = "marginal_improvement"
-            elif report.mae_delta < 0.01:
-                report.verdict = "marginal"
-            else:
-                report.verdict = "degradation"
-
-        return report
-
-    # ── Layer 3: Synthesis ──
-
+    # v18: evaluate_vs_reference removed (Layer 2a dead chain)
     def synthesize_judgment(
         self,
         design: DesignComparison,
@@ -737,13 +654,9 @@ class SimulationSandbox:
         )
         report.internal_behavior = behavior.to_dict()
 
-        # Layer 2a: Reference evaluation (if val data exists)
+        # v18: Layer 2a reference evaluation removed (val_data_dir never passed).
+        # synthesize_judgment receives an empty ReferenceEvaluation.
         ref_eval = ReferenceEvaluation()
-        if val_data_dir:
-            ref_eval = self.evaluate_vs_reference(
-                model_path_before or "", model_path,
-                checkpoint_path, val_data_dir, gt_dir,
-            )
         report.reference_evaluation = ref_eval.to_dict()
 
         # Layer 3: Synthesis
@@ -918,34 +831,7 @@ class SimulationSandbox:
             return {"error": str(e)[:300]}
         return None
 
-    def _find_val_samples(self, val_data_dir: str, max_samples: int) -> list[Path]:
-        """Find validation sample files."""
-        val_dir = self.project_dir / val_data_dir if val_data_dir else None
-        if not val_dir or not val_dir.exists():
-            # Try common locations
-            for candidate in [
-                self.project_dir / "data" / "val",
-                self.project_dir / "data" / "validation",
-            ]:
-                if candidate.exists():
-                    val_dir = candidate
-                    break
-        if not val_dir:
-            return []
-
-        samples = []
-        for ext in ("*.png", "*.jpg", "*.npy", "*.pt", "*.pth", "*.pfm"):
-            samples.extend(val_dir.rglob(ext))
-            if len(samples) >= max_samples:
-                break
-        return samples[:max_samples]
-
-    def _run_inference(self, model_path: Path, checkpoint_path: str,
-                       val_samples: list, gt_dir: str) -> Optional[dict]:
-        """Run inference on val samples. Returns per-sample metrics."""
-        script = self._build_inference_script(model_path, checkpoint_path, val_samples, gt_dir)
-        return self._run_subprocess(script, timeout=self.inference_timeout)
-
+    # v18: _find_val_samples + _run_inference removed (Layer 2a dead chain)
     def _extract_model_info(self, model_path: str) -> dict:
         """Extract structural info from model file (AST-based, no subprocess)."""
         info = {"total_params": 0, "module_params": {}, "max_bottleneck": "unknown", "max_compress_ratio": 0}
@@ -1364,155 +1250,4 @@ except Exception as e:
 print(json.dumps(result))
 '''
 
-    def _build_inference_script(self, model_file: Path, checkpoint_path: str,
-                                 val_samples: list, gt_dir: str) -> str:
-        """Build inference script for Layer 2a reference evaluation."""
-        model_rel = model_file.relative_to(self.project_dir)
-        parent_pkg = str(model_rel.parent).replace("/", ".").replace("\\", ".") if model_rel.parent != Path(".") else ""
-        import_stmt = f"from {parent_pkg}.{model_rel.stem} import *" if parent_pkg else f"import {model_rel.stem}"
-
-        sample_paths = [str(s) for s in val_samples[:10]]
-
-        ckpt_code = ""
-        if checkpoint_path:
-            ckpt_path = self.project_dir / checkpoint_path
-            if ckpt_path.exists():
-                ckpt_code = f"""
-ckpt = torch.load('{ckpt_path}', map_location='cpu', weights_only=False)
-if isinstance(ckpt, dict):
-    if 'model_state_dict' in ckpt: model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    elif 'state_dict' in ckpt: model.load_state_dict(ckpt['state_dict'], strict=False)
-"""
-
-        gt_dir_str = str(self.project_dir / gt_dir) if gt_dir else ""
-
-        return f'''
-import sys, json, os
-from pathlib import Path
-sys.path.insert(0, '{self.project_dir}')
-import torch
-import numpy as np
-
-result = {{"per_sample": {{}}}}
-GT_DIR = '{gt_dir_str}'
-
-def _find_gt_for(sample_path):
-    """Try to find GT file corresponding to a sample."""
-    sp = Path(sample_path)
-    stem = sp.stem
-    if not GT_DIR:
-        return None
-    gt_base = Path(GT_DIR)
-    if not gt_base.exists():
-        return None
-    # Try exact name match with common GT extensions
-    for ext in ['.npy', '.pt', '.pth', '.pfm', '.png', '.jpg']:
-        candidate = gt_base / (stem + ext)
-        if candidate.exists():
-            return str(candidate)
-    # Try in subdirectories
-    for candidate in gt_base.rglob(stem + '.*'):
-        if candidate.suffix in ('.npy', '.pt', '.pth', '.pfm', '.png', '.jpg'):
-            return str(candidate)
-    return None
-
-def _load_array(path):
-    """Load an array from various file formats."""
-    if path.endswith('.npy'):
-        return np.load(path).astype(np.float32)
-    elif path.endswith('.pt') or path.endswith('.pth'):
-        return torch.load(path, map_location='cpu', weights_only=True).numpy().astype(np.float32)
-    elif path.endswith('.pfm'):
-        # PFM loader
-        with open(path, 'rb') as f:
-            header = f.readline().decode().strip()
-            dims = f.readline().decode().strip()
-            scale = float(f.readline().decode().strip())
-            if header == 'PF':
-                raise ValueError("Color PFM not supported")
-            w, h = map(int, dims.split())
-            data = np.frombuffer(f.read(), dtype=np.float32 if scale > 0 else np.float32)
-            return data.reshape(h, w).astype(np.float32)
-    elif path.endswith('.png') or path.endswith('.jpg'):
-        from PIL import Image
-        return np.array(Image.open(path)).astype(np.float32) / 255.0
-    return None
-
-try:
-    {import_stmt}
-    spec = __import__('importlib').util.spec_from_file_location('mod', '{model_file}')
-    m = __import__('importlib').util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-
-    model_cls = None
-    for a in dir(m):
-        attr = getattr(m, a)
-        if isinstance(attr, type) and issubclass(attr, torch.nn.Module) and attr is not torch.nn.Module:
-            model_cls = attr
-            break
-    if not model_cls:
-        result["error"] = "No model class"
-        print(json.dumps(result))
-        sys.exit(0)
-
-    model = model_cls()
-    {ckpt_code}
-    model.eval()
-
-    # Run on each sample
-    for sp in {sample_paths}:
-        try:
-            data = _load_array(sp)
-            if data is None:
-                continue
-            x = torch.from_numpy(data).float()
-            if x.dim() == 2:
-                x = x.unsqueeze(0).unsqueeze(0)  # H,W -> 1,1,H,W
-            elif x.dim() == 3:
-                x = x.unsqueeze(0)  # C,H,W -> 1,C,H,W
-            # else already 4D+
-
-            with torch.no_grad():
-                out = model(x)
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            if isinstance(out, dict):
-                out = list(out.values())[0]
-
-            sample_result = {{
-                "output_mean": float(out.mean()),
-                "output_std": float(out.std()),
-                "output_min": float(out.min()),
-                "output_max": float(out.max()),
-            }}
-
-            # Try to compute MAE vs GT
-            gt_path = _find_gt_for(sp)
-            if gt_path:
-                gt = _load_array(gt_path)
-                if gt is not None:
-                    pred = out.detach().cpu().numpy().squeeze()
-                    gt = gt.squeeze()
-                    # Resize prediction to GT shape if needed
-                    if pred.shape != gt.shape:
-                        try:
-                            from PIL import Image as PILImage
-                            pred_resized = np.array(PILImage.fromarray(pred).resize(
-                                (gt.shape[1], gt.shape[0]), PILImage.BILINEAR
-                            ))
-                            mae = float(np.abs(pred_resized - gt).mean())
-                        except Exception:
-                            mae = float(np.abs(pred.flatten()[:gt.size] - gt.flatten()[:pred.size]).mean())
-                    else:
-                        mae = float(np.abs(pred - gt).mean())
-                    sample_result["mae"] = round(mae, 6)
-
-            result["per_sample"][sp] = sample_result
-        except Exception as e:
-            result["per_sample"][sp] = {{"error": str(e)[:100]}}
-
-except Exception as e:
-    result["error"] = str(e)[:300]
-
-print(json.dumps(result))
-'''
+    # v18: _build_inference_script removed (Layer 2a dead chain)
