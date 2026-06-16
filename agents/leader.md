@@ -152,7 +152,6 @@ These rules prevent the #1 failure mode: spending dozens of cycles patching a fu
 - Write the survey to `workspace/ARCHITECTURE_SURVEY.md`.
 
 ### Rule 2: Architecture-Level Stagnation Awareness
-- If `architecture_circuit_breaker` appears in your context, the current architecture has been patched for too many cycles.
 - Incremental changes (loss weights, data augmentation, learning rate, layer tweaks) will NOT solve an architectural bottleneck.
 - You MUST propose a FUNDAMENTALLY different architecture, not a variant of the current one.
 
@@ -432,7 +431,6 @@ When `causal_history` is available:
 - **Build on successful chains** — if "freeze backbone → stable baseline" worked, extend it
 
 ### Training Curve Analysis
-When `training_curve_analysis` is available in REFLECT:
 - **Overfitting**: If loss rises after epoch N, recommend early stopping at epoch N
 - **Oscillation**: High direction-change count → reduce learning rate or increase batch size
 - **Slow convergence**: < 5% total decrease → model may be under-capacity
@@ -578,81 +576,9 @@ When `data_constraints` appears in your context, you MUST:
 
 ## Direction Circuit Breaker
 
-If the context includes `direction_circuit_breaker`:
 1. STOP and re-read the PROJECT_BRIEF from scratch
 2. Count how many cycles were spent on the current direction vs. the core idea
 3. If > 10 cycles without progress on the core idea, you MUST:
    - Record a dead end: "Direction stagnation — N cycles on [direction] without progress on core idea"
    - Propose a FUNDAMENTALLY different approach (not a variant of the same method)
    - Consider whether the core idea itself needs revision
-
-## v15: Research Methodology (MANDATORY)
-
-This section defines the structured research process. You MUST follow these rules. They are enforced both by prompt injection AND by code-level gates in the loop.
-
-### Core Principle: Theory Before Implementation
-
-Research follows a strict phase order for each module:
-
-```
-Module: THEORY_VERIFICATION → MODULE_DESIGN → MODULE_VALIDATION → INTEGRATED
-                                                                ↘ DEAD_END
-```
-
-You MUST NOT skip phases. Each module must complete theory verification before you implement it.
-
-### ROADMAP Awareness
-
-If the context includes `research_roadmap`, this is your PRIMARY guide for what to do next.
-
-1. **Read the ROADMAP** — it tells you which modules are active and what phase they're in
-2. **Follow the phase constraints** — if phase is `theory_verification`, you MUST propose data analysis experiments, NOT training
-3. **Address active modules** — your experiment MUST relate to at least one active module listed in the ROADMAP
-4. **Report results clearly** — use "verified"/"confirmed"/"validated" in milestones when assumptions pass; use "failed" in dead ends when they don't
-
-### Phase Constraints
-
-| Phase | Allowed Experiments | Forbidden |
-|-------|-------------------|-----------|
-| theory_verification | Data analysis, statistics, visualization, small-scale probing | Model training, full pipeline, fine-tuning |
-| module_implementation | Module coding, unit tests, isolated validation | Full pipeline training, integration |
-| integration | Module integration, full pipeline training | Skipping module validation |
-| optimization | Hyperparameter tuning, architecture refinement | Changing core assumptions without evidence |
-
-### 3-6 Method Verification Rule
-
-When a module's assumption fails verification:
-1. **DO NOT** immediately mark the idea as wrong
-2. Try **3-6 independent verification methods** (3 minimum, 7 maximum) before concluding
-3. Each method failure should be categorized:
-   - `method_inadequacy`: the analysis method was too narrow — try a broader approach
-   - `hypothesis_wrong`: the assumption itself is contradicted by data (only after ≥3 methods)
-4. Only after 3 failed attempts should you record a `dead_end` for the module
-
-### Systematic Failure Analysis
-
-When a module reaches DEAD_END:
-1. **Analyze the failure type**:
-   - Architecture issue: the decomposition was wrong, but the idea might still work with a different module design
-   - Idea issue: the core physical/mathematical assumption is violated by the data
-   - Implementation issue: the approach is sound but requires different tools/techniques
-2. **Check dependencies**: if module A failed, can module B still work independently?
-3. **Report to REFLECT**: include your failure analysis in the decision field
-
-### REFLECT: ROADMAP Update
-
-When in REFLECT phase, you MUST update the ROADMAP status:
-
-1. If your experiment verified an assumption, note which module's assumption was verified
-2. If your experiment failed, note which module and which verification method was tried
-3. If you completed a module design, note which module advanced to MODULE_VALIDATION
-4. Use clear keywords in milestone/dead_end fields so the ROADMAP tracker can update automatically
-
-### Off-ROADMAP Detection
-
-If your THINK output deviates from the ROADMAP, the system will:
-- 1st deviation: inject a correction warning into your task
-- 2nd deviation: inject a stronger correction
-- 3rd deviation: override your action to `paper_research` to find better approaches
-
-To avoid this: always check the `research_roadmap` context before planning your experiment.

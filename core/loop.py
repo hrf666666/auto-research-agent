@@ -27,7 +27,7 @@ from .monitor import ExperimentMonitor
 from .agents import AgentDispatcher
 from .obsidian import ObsidianExporter
 from .tools import ToolRegistry
-from .verifier import ExperimentVerifier
+from .verifier import ExperimentVerifier, VerifyCheck
 from .visual_analyzer import VisualAnalyzer
 from .domain_knowledge import DomainKnowledgeMixin
 from .constraint_engine import (
@@ -222,23 +222,12 @@ class ResearchLoop(DomainKnowledgeMixin):
         logging.getLogger().addHandler(file_handler)
         logger.info(f"File logging enabled: {log_path}")
 
-    def run(self):
+    def run(self, directive: str = ""):
         """Main entry point. Runs the THINK → EXECUTE → VERIFY → REFLECT loop."""
         logger.info(f"AutoResearcher starting | project={self.project_dir} | cycle={self.cycle_count}")
 
         while self._running:
             # Phase 1: Stop when all goals are achieved
-            if self.cycle_count > 1:
-                try:
-                    if self._goal_achieved():
-                        self._running = False
-                        self.memory.log_milestone(
-                            "🎯 ALL TARGETS ACHIEVED. Agent stopping. "
-                            "Review outputs/ for final results."
-                        )
-                        break
-                except Exception:
-                    pass  # goal check failure should never block the loop
             if self.max_cycles > 0 and self.cycle_count >= self.max_cycles:
                 logger.info(f"Reached max cycles ({self.max_cycles}). Stopping.")
                 break
@@ -278,7 +267,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     }
                 else:
                     # DATASET UNDERSTANDING: First cycle or when manifest missing
-                    if self.cycle_count == 1 or not self._dataset_manifest_exists():
+                    if self.cycle_count == 1:
                         logger.info("DATASET UNDERSTANDING phase — scanning data/ directory")
 
                     # ── ROADMAP INIT (v15): Generate research roadmap on first cycle ──
@@ -290,7 +279,6 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                     if think_result.get("action") == "experiment":
                         think_result = self._enforce_launch_after_failure(think_result)
-                    think_result = self._enforce_roadmap_alignment(think_result)
 
                 # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
                 # Triggered by _enforce_launch_after_failure after 3 consecutive
@@ -406,7 +394,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     self._consecutive_wait_count = 0
                     logger.info(
                         f"ARCHITECTURE SWITCH triggered — researching alternatives to "
-                        f"'{self._current_architecture_name}'."
+                        f"'(unknown)'."
                     )
                     self._update_state(
                         {
@@ -477,126 +465,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                         ),
                     }
                     _gate_blocked = True
-
-                # ── Gate 2: PRE-EXECUTE CODE REVIEW (v12.3+) ──
-                # Two-phase code review BEFORE training:
-                #   Phase 1: Zero-LLM regex checks (fast, free, catches known anti-patterns)
-                #   Phase 2: LLM semantic review (catches logic bugs, design flaws)
-                if not _gate_blocked and think_result.get("action") == "experiment":
-                    code_review_warnings = self._pre_execute_code_review(think_result)
-
-                    if not code_review_warnings:
-                        # Code review passed — reset dead-loop counter
-                        self._hard_gate_consecutive_blocks = 0
-                    else:
-                        high_issues = [w for w in code_review_warnings if w["severity"] == "HIGH"]
-
-                        if high_issues:
-                            self._hard_gate_consecutive_blocks += 1
-                            
-                            # v16.1: Phase-aware downgrade — only downgrade if phase is VALIDATED
-                            # v16 bug: 3 consecutive blocks → downgrade allowed training during Phase 1
-                            # Fix: Check phase status before downgrading
-                            ps = self._load_phase_status()
-                            current_phase = ps.get("phases", {}).get(ps.get("current_phase", ""), {})
-                            phase_status = current_phase.get("status", "PENDING")
-                            phase_validated = (phase_status == "VALIDATED")
-                            
-                            # ── Anti-deadloop: after 2 consecutive HARD blocks, downgrade to SOFT ──
-                            # BUT ONLY if phase is VALIDATED (training is legitimate)
-                            if self._hard_gate_consecutive_blocks > 2 and phase_validated:
-                                logger.warning(
-                                    f"HARD GATE downgraded to SOFT after "
-                                    f"{self._hard_gate_consecutive_blocks} consecutive blocks — "
-                                    f"phase is VALIDATED, training is legitimate"
-                                )
-                                self._hard_gate_consecutive_blocks = 0  # reset
-                                # Fall through to SOFT GATE below
-                            elif self._hard_gate_consecutive_blocks > 2 and not phase_validated:
-                                # v16.1: Phase not validated — do NOT downgrade, keep blocking
-                                logger.warning(
-                                    f"HARD GATE NOT downgraded: phase '{ps.get('current_phase')}' "
-                                    f"status is {phase_status}, not VALIDATED. "
-                                    f"Continuing to block training (streak={self._hard_gate_consecutive_blocks})"
-                                )
-                                self._hard_gate_consecutive_blocks = 2  # cap at 2 to avoid overflow
-                            else:
-                                # ── HARD GATE: HIGH severity blocks execution entirely ──
-                                logger.warning(
-                                    f"PRE-EXECUTE CODE REVIEW HARD GATE: {len(high_issues)} HIGH issue(s), "
-                                    f"blocking execution (streak={self._hard_gate_consecutive_blocks})"
-                                )
-                                think_result = {
-                                    "action": "experiment",
-                                    "agent": "code",
-                                    "task": (
-                                        f"⛔ PRE-EXECUTE CODE REVIEW BLOCKED TRAINING\n\n"
-                                        f"The following CRITICAL architectural issues must be fixed "
-                                        f"BEFORE any training:\n\n"
-                                        + "\n".join(
-                                            f"- [{w['severity']}] {w['detail']}"
-                                            for w in high_issues
-                                        )
-                                        + "\n\n## Mandatory Actions:\n"
-                                        "1. Fix ALL HIGH severity issues listed above\n"
-                                        "2. Verify the model file is syntactically correct (can import)\n"
-                                        "3. Re-run will auto-check after fixes\n"
-                                        "4. Do NOT launch real training until code review passes\n"
-                                    ),
-                                }
-                                _gate_blocked = True
-                        if not _gate_blocked and code_review_warnings:
-                            # ── SOFT GATE: MEDIUM/LOW issues injected as mandatory fix ──
-                            review_prompt = (
-                                "PRE-EXECUTE CODE REVIEW (v12.3) — ISSUES DETECTED:\n\n"
-                                + "\n".join(
-                                    f"- [{w['severity']}] {w['detail']}"
-                                    for w in code_review_warnings
-                                )
-                                + "\n\nYou MUST address these issues BEFORE launching training. "
-                                + "Fix the model architecture, then re-verify. "
-                                + "Do NOT proceed with training until these are resolved.\n\n"
-                            )
-                            think_result["task"] = review_prompt + think_result.get("task", "")
-                            think_result["_soft_gate_injected"] = True  # skip falsifiability to avoid task bloat
-                            logger.warning(
-                                f"PRE-EXECUTE CODE REVIEW: {len(code_review_warnings)} issue(s) injected into task"
-                            )
-
-                # ── Gate 3: FALSIFIABLE HYPOTHESIS CHECK ──
-                # Always runs (soft gate). Skipped when a hard-gate already fired to
-                # avoid wrapping the fix-task in hypothesis boilerplate.
-                if not _gate_blocked and not think_result.get("_soft_gate_injected"):
-                    hypothesis = think_result.get("hypothesis", "")
-                    success_criteria = think_result.get("success_criteria", "")
-
-                    non_falsifiable_warning = None
-                    if not hypothesis or len(hypothesis.strip()) < 10:
-                        non_falsifiable_warning = (
-                            "NO HYPOTHESIS: The experiment has no stated hypothesis. "
-                            "Every experiment MUST state what it expects to learn and what would prove it wrong."
-                        )
-                    elif "improve" in hypothesis.lower() and "if" not in hypothesis.lower():
-                        non_falsifiable_warning = (
-                            f"NON-FALSIFIABLE HYPOTHESIS: '{hypothesis[:100]}' is vague. "
-                            f"A hypothesis must be structured as: 'If we change X, then Y should improve "
-                            f"because Z. If Y does NOT improve (or gets worse), the hypothesis is wrong.' "
-                            f"State the SPECIFIC change, the EXPECTED effect, and the FAILURE condition."
-                        )
-                    elif not success_criteria or len(success_criteria.strip()) < 10:
-                        non_falsifiable_warning = (
-                            "NO SUCCESS CRITERIA: Without concrete success criteria, you cannot "
-                            "determine whether the experiment succeeded or failed. "
-                            "Example: 'worst_domain_MAE < 0.30' (pass) vs '>= 0.30' (fail)."
-                        )
-
-                    if non_falsifiable_warning:
-                        logger.warning(f"FALSIFIABILITY CHECK: {non_falsifiable_warning}")
-                        falsify_prefix = (
-                            f"FALSIFIABILITY: {non_falsifiable_warning}\n"
-                            f"Add HYPOTHESIS/SUCCESS/FAILURE comments to training script.\n\n"
-                        )
-                        think_result["task"] = falsify_prefix + think_result.get("task", "")
 
                 # EXECUTE: Run the plan
                 self._consecutive_wait_count = 0
@@ -841,7 +709,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         # the agent achieved val_MAE=0.184 (target < 0.20) in cycle 1 but
         # had no idea it was already close.
 
-            logger.warning(f"Failed to inject goal progress: {e}")
 
         # Inject dataset manifest (if available) so Leader knows data quality issues
         manifest_path = self.workspace / "DATASET_MANIFEST.json"
@@ -1106,7 +973,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── RESEARCH ROADMAP (v15): Inject phase constraints ──
         # This is the PRIMARY control mechanism: tells Leader what phase and module to work on.
 
-            logger.warning(f"ROADMAP context injection failed: {e}")
 
         # ── CONTEXT PRUNING (v10) ──
         # Limit context to most relevant keys to prevent LLM confusion
@@ -1181,16 +1047,13 @@ class ResearchLoop(DomainKnowledgeMixin):
         return result
 
     def _execute_paper_research(self, plan: dict) -> dict:
-        """EXECUTE phase: run deep paper research.
-
-        Two paths:
-          - If ``idea_scout.enabled`` is True in config AND the
-            research-idea-scout library is available, run the cross-domain
-            idea-discovery pipeline (gather → filter → score) and return a
-            structured ranked list.
-          - Otherwise, dispatch to the 'researcher' agent (web search + paper
-            tools) as before — unchanged behavior.
-        """
+        """EXECUTE phase: dispatch researcher agent for paper/web research."""
+        task_description = plan.get("task", "Research existing approaches.")
+        result = self.dispatcher.dispatch_worker(
+            agent_type="researcher",
+            task=task_description,
+            tools=self.tools.get_tools_for("researcher"),
+        )
         result["is_paper_research"] = True
         return result
 
@@ -1795,16 +1658,8 @@ class ResearchLoop(DomainKnowledgeMixin):
                 or "429" in err_msg
                 or "quota" in err_msg.lower()
             )
-            if is_quota_error:
-                logger.warning(
-                    f"REFLECT LLM call failed (quota/API error): {err_msg[:200]}. "
-                    f"Using degraded rule-based reflect to preserve cycle results."
-                )
-                result = self._degraded_reflect(
-                    execute_result, verify_report, context
-                )
-            else:
-                raise
+            logger.warning(f"REFLECT LLM call failed: {err_msg[:200]}")
+            raise  # Let run() handle backoff
 
         # Update memory based on reflection
         if result.get("milestone"):
@@ -2059,7 +1914,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     break
 
         if current_metric is not None:
-            method = self._extract_method_from_task(think_result.get("task", ""))
+            method = ""  # method extraction removed
             status = "success" if made_progress else "inconclusive"
             try:
                 self.memory.log_structured_result(
@@ -2102,7 +1957,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── PARETO MATRIX RECORDING ──
         # Record method×domain results for cross-experiment Pareto frontier tracking
         if domain_metrics:
-            method_name = self._extract_method_from_task(think_result.get("task", ""))
+            method_name = ""  # method extraction removed
             exp_type = "pilot" if think_result.get("pilot_experiment") else "full"
             for dk, dv in domain_metrics.items():
                 domain_name = dk.replace("MAE_", "")

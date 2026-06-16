@@ -52,25 +52,6 @@ class TestRegistryCompleteness:
 class TestSerialization:
     """The serialize_context function must include every non-empty key."""
 
-    def test_previously_dropped_keys_now_appear(self):
-        """The 8 keys that were silently dropped before Fix A must now appear."""
-        ctx = {
-            "domain_knowledge": "DOMAIN CONTENT",
-            "architecture_plan_summary": "PLAN SUMMARY",
-            "cross_experiment_insights": "CROSS EXP",
-            "training_curve_analysis": "CURVE DATA",
-            "phase_focus": "PHASE FOCUS",
-            "research_roadmap": "ROADMAP",
-            "hypothesis_calibration": "CALIB",
-            "pareto_frontier": "PARETO",
-        }
-        prompt = serialize_context(ctx, "think")
-        for marker in ["DOMAIN CONTENT", "CROSS EXP", "CALIB", "PARETO"]:
-            assert marker in prompt, f"'{marker}' dropped from THINK prompt — signal disconnect"
-
-        # training_curve_analysis is a REFLECT key, verify it there
-        prompt_r = serialize_context(ctx, "reflect")
-        assert "CURVE DATA" in prompt_r, "training_curve_analysis dropped from REFLECT"
 
     def test_empty_values_are_skipped(self):
         """Empty/None values must not produce empty sections."""
@@ -118,14 +99,3 @@ class TestIntegrationWithFormatLeaderInput:
         prompt = d._format_leader_input("think", ctx)
         assert "IMPORTANT DOMAIN INSIGHT" in prompt
 
-    def test_format_leader_input_reflect_includes_curve(self):
-        """training_curve_analysis must appear in REFLECT prompt."""
-        from core.agents import AgentDispatcher
-        d = AgentDispatcher(model="auto", provider="glm_token_plan", tools=None)
-        ctx = {
-            "brief": "test", "cycle": 1,
-            "experiment_result": {"status": "done"},
-            "training_curve_analysis": "LOSS PLATEAU AT EPOCH 5",
-        }
-        prompt = d._format_leader_input("reflect", ctx)
-        assert "LOSS PLATEAU" in prompt

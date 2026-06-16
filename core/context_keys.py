@@ -228,13 +228,6 @@ REFLECT_KEYS = [
                serializer=_list_section("Fabrication Evidence", 5), tier=2),
 
     # ── Training analysis (tier 2) — PREVIOUSLY DROPPED ──
-    ContextKey("training_curve_analysis", "reflect",
-               "Training curve diagnostics: overfitting, oscillation, plateau",
-               serializer=_text_section("Training Curve Analysis", 2000), tier=2),
-    ContextKey("aux_loss_trend", "reflect", "Auxiliary loss trend analysis",
-               serializer=_text_section("Aux Loss Trend", 500), tier=3),
-    ContextKey("per_domain_mae_trend", "reflect", "Per-domain MAE trend",
-               serializer=_text_section("Per-Domain MAE Trend", 800), tier=3),
 
     # ── Evaluation (tier 2) — PREVIOUSLY DROPPED ──
     ContextKey("iteration_guidance_prompt", "reflect", "Priority-sorted next steps",
