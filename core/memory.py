@@ -593,6 +593,76 @@ class MemoryManager:
             except Exception:
                 return {"total_hypotheses": 0}
 
+    def get_low_value_experiments(self, limit: int = 5) -> list[dict]:
+        """Get experiments previously assessed as low value (VOI < 0.01).
+
+        Phase 1: surfaces directions the agent already evaluated as unlikely
+        to help, so it doesn't waste cycles repeating them.
+        """
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """SELECT hypothesis, information_value as voi,
+                              prior_probability as prior, expected_improvement, cycle
+                       FROM experiment_value
+                       WHERE information_value < 0.01
+                       ORDER BY cycle DESC LIMIT ?""",
+                    (limit,)
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def get_best_metric(self, metric_key: str) -> float | None:
+        """Phase 1: Get the best (lowest) value for a metric key from history.
+
+        Used by goal progress tracking to compare current best vs target.
+        Returns None if no experiments recorded this metric.
+
+        Fallback: if the exact key (e.g. val_MAE_Lambertian) isn't found,
+        tries val_MAE (the overall metric) as a conservative approximation.
+        """
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                best = self._query_best(conn, metric_key)
+                if best is None and metric_key != "val_MAE":
+                    # Fallback: sub-domain metrics (val_MAE_Lambertian etc.)
+                    # aren't stored separately — approximate with overall val_MAE
+                    best = self._query_best(conn, "val_MAE")
+                return best
+        except Exception:
+            return None
+
+    def _query_best(self, conn, metric_key: str) -> float | None:
+        """Query best metric value for a specific key from metrics_json."""
+        best = None
+        rows = conn.execute(
+            "SELECT metrics_json FROM experiments WHERE metrics_json IS NOT NULL"
+        ).fetchall()
+        for (mj,) in rows:
+            try:
+                d = json.loads(mj) if isinstance(mj, str) else mj
+                if isinstance(d, dict) and metric_key in d:
+                    try:
+                        v = float(d[metric_key])
+                        if best is None or v < best:
+                            best = v
+                    except (ValueError, TypeError):
+                        continue
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return best
+
+    def _query_best_raw(self, metric_key: str) -> float | None:
+        """Query best metric WITHOUT fallback. Used by _goal_achieved to
+        avoid false-negatives from sub-domain→overall approximation."""
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                return self._query_best(conn, metric_key)
+        except Exception:
+            return None
+
     # ── Structured Meta-Pattern Queries ──
     # NOTE: These methods contain PROJECT-SPECIFIC hardcoded keywords (depth estimation domain).
     # If adapting this framework for a different research domain, override these methods
@@ -721,6 +791,25 @@ class MemoryManager:
         if self.log_path.exists():
             return self.log_path.read_text()
         return ""
+
+    def log_structured_result(self, cycle: int, metric_key: str,
+                              metric_value: float, method: str = "",
+                              status: str = "success"):
+        """Phase 1: Write a structured quantitative result line to MEMORY_LOG.
+
+        This is the SYSTEM-written anchor that guarantees quantitative results
+        reach the LLM's text memory channel. Previously, val_MAE=0.184 existed
+        only in SQLite but never in MEMORY_LOG unless the LLM happened to write
+        it in a free-text milestone. Now the system writes it deterministically.
+
+        Format: [Cycle N] metric=val method=X status=Y
+        Compatible with _parse_log (starts with '[').
+        """
+        sections = self._parse_log()
+        method_str = f" method={method}" if method else ""
+        line = f"[Cycle {cycle}] {metric_key}={metric_value:.6f}{method_str} status={status}"
+        sections["milestones"].append(line)
+        self._write_log(sections)
 
     def log_milestone(self, entry: str, cycle: int = None):
         """Add a key result milestone. Auto-compacts if over budget."""

@@ -166,15 +166,14 @@ TOKEN_PLAN_PROVIDERS = {
     "glm_token_plan": {
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
         "env_key": "GLM_CODING_PLAN_API_KEY",
-        # NOTE: glm-5.2 returns 403 (code 1220) on standard Coding Plan tiers
-        # (verified 2026-06). glm-5.1 is the strongest accessible model and has
-        # thinking (reasoning_content) enabled by default. Switch strong_model
-        # to glm-5.2 once the plan is authorized for it.
-        "strong_model": "glm-5.1",            # Strongest accessible GLM (thinking auto-enabled)
+        # glm-5.2 works on coding/paas/v4 endpoint (verified 2026-06-15)
+        # Thinking (reasoning_content) auto-enabled via base_url.
+        "strong_model": "glm-5.2",            # Best GLM (thinking auto-enabled)
         "fast_model": "glm-5",              # Fast GLM for routine tasks
         # Model-level failover chains: if primary model fails, try next in list
         "strong_model_chain": [
-            "glm-5.1",              # GLM 5.1 (strongest accessible, thinking)
+            "glm-5.2",              # GLM 5.2 (strongest, thinking auto-enabled)
+            "glm-5.1",              # GLM 5.1 (thinking)
             "glm-5",                # GLM 5
             "glm-5-turbo",          # GLM 5 Turbo (fast)
             "glm-4.7",              # GLM 4.7
@@ -192,8 +191,8 @@ TOKEN_PLAN_PROVIDERS = {
             "glm-4.7",              # GLM 4.7
             "glm-5",                # GLM 5
             "glm-5-turbo",          # GLM 5 Turbo (fast)
-            "glm-5.1",              # GLM 5.1 (thinking) — current strong default
-            "glm-5.2",              # GLM 5.2 (thinking) — 403 on standard plan, reserved for future
+            "glm-5.1",              # GLM 5.1 (thinking)
+            "glm-5.2",              # GLM 5.2 (thinking) — strongest, coding plan
         ],
     },
     "ali_token_plan": {

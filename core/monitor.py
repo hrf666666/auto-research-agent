@@ -267,26 +267,28 @@ class ExperimentMonitor:
     def _extract_metrics(self, log_lines: list[str]) -> dict:
         """Try to extract common metrics from training logs.
 
-        v16.1: Extended to support project-specific metrics (auc, MAE, val_MAE, etc.)
-        that are needed for PHASE_STATUS auto-update.
-
-        Looks for patterns like:
-        - loss: 0.123
-        - accuracy: 95.2% or accuracy: 0.952
-        - auc: 0.85
-        - MAE: 0.15 or val_MAE: 0.12
-        - FGD: 0.582
-        - epoch 100/200
+        Phase 1: Uses training_log_parser for metric extraction (single source
+        of truth), replacing the duplicated regex patterns that were inline
+        here. Keeps monitor-specific handling (epoch/step/percentage) that
+        the shared parser doesn't cover.
         """
         import re
+        from .training_log_parser import extract_metrics
+
+        log_text = "\n".join(log_lines)
+
+        # Use shared parser for val_MAE / rmse / accuracy etc.
         metrics = {}
+        parsed = extract_metrics(log_text)
+        # extract_metrics returns lowercase keys; keep original-case values
+        for k, v in parsed.items():
+            metrics[k] = str(v)
+
+        # Monitor-specific patterns not in the shared parser
         for line in reversed(log_lines):
-            # Common metric patterns (extended for v16.1)
             for pattern, key in [
                 (r"loss[:\s]+([0-9.]+)", "loss"),
                 (r"acc(?:uracy)?[:\s]+([0-9.]+%?)", "accuracy"),
-                (r"auc[:\s]+([0-9.]+)", "auc"),
-                (r"(?:val_)?MAE[:\s]+([0-9.]+)", "val_MAE"),
                 (r"FGD[:\s]+([0-9.]+)", "FGD"),
                 (r"FID[:\s]+([0-9.]+)", "FID"),
                 (r"epoch[:\s]+(\d+)", "epoch"),
@@ -296,22 +298,21 @@ class ExperimentMonitor:
                     match = re.search(pattern, line, re.IGNORECASE)
                     if match:
                         value = match.group(1)
-                        # Handle percentage format (e.g., "95.2%" → "0.952")
                         if value.endswith('%'):
                             try:
                                 value = str(float(value[:-1]) / 100.0)
                             except ValueError:
                                 pass
                         metrics[key] = value
-        
+
         # Fallback: generic key=value pattern for any numeric metric
         if not metrics or len(metrics) < 2:
-            for line in reversed(log_lines[-20:]):  # Check last 20 lines
+            for line in reversed(log_lines[-20:]):
                 generic_matches = re.findall(r'(\w+)[:\s=]+([0-9.]+)', line)
                 for key, value in generic_matches:
                     if key not in metrics and key.lower() not in ('time', 'pid', 'count'):
                         metrics[key] = value
-        
+
         return metrics
 
     def _notify_completion(self, result: dict):

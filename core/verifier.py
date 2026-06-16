@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import logging
+from .training_log_parser import parse_loss_series, has_nan_loss, classify_loss_trend
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -817,7 +818,7 @@ class ExperimentVerifier:
                 unique_epochs = set(epoch_values)
                 if len(unique_epochs) == 1 and list(unique_epochs)[0] in ("0", "1"):
                     # Check if loss values are repeating (sign of infinite loop over same data)
-                    loss_values = re.findall(r"loss[=:\s]+([0-9.]+)", log_text, re.IGNORECASE)
+                    loss_values = [str(v) for v in parse_loss_series(log_text)]
                     if len(loss_values) > 50:
                         # Check last 50 loss values for repetition
                         recent_losses = [float(l) for l in loss_values[-50:]]
@@ -1005,15 +1006,15 @@ class ExperimentVerifier:
             return
 
         # If loss values exist, forward pass worked
-        if re.search(r"loss[=:\s]+[0-9.]+", log_text, re.IGNORECASE):
+        if parse_loss_series(log_text):
             # Check for NaN/Inf loss — model forward pass produces garbage
-            nan_loss = re.findall(r"loss[=:\s]+(nan|inf)", log_text, re.IGNORECASE)
-            if nan_loss:
+            if has_nan_loss(log_text):
+                nan_count = len(re.findall(r"loss[=:\s]+(nan|inf)", log_text, re.IGNORECASE))
                 report.checks.append(VerifyCheck(
                     name="model_forward",
                     category="integrity",
                     status="fail",
-                    detail=f"NaN/Inf loss detected ({len(nan_loss)} times) — model forward pass produces invalid values",
+                    detail=f"NaN/Inf loss detected ({nan_count} times) — model forward pass produces invalid values",
                     evidence=f"First NaN loss occurrence: check {log_file}",
                     severity="critical",
                     module_path="model_forward",
@@ -1056,9 +1057,9 @@ class ExperimentVerifier:
         # ── TRAINING CURVE ANALYSIS ──
         # Parse full loss sequence for rich curve diagnostics:
         # overfitting, oscillation, convergence speed, plateau detection
-        loss_values = re.findall(r"loss[=:\s]+([0-9.]+)", log_text, re.IGNORECASE)
+        loss_values = parse_loss_series(log_text)
         if len(loss_values) >= 3:
-            floats = [fv for v in loss_values if (fv := float(v)) > 0]
+            floats = [fv for fv in loss_values if fv > 0]
             if len(floats) >= 3:
                 # Basic decrease check (kept for backward compatibility)
                 first_third = sum(floats[:len(floats)//3]) / (len(floats)//3)

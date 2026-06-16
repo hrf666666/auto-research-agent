@@ -64,6 +64,24 @@ class TestLossParsing:
         assert metrics["val_mae"] == 0.25
         assert "mae_overall" in metrics
 
+    def test_parser_matches_verifier_regex(self):
+        """Phase 1 change 6: training_log_parser must produce the same loss
+        values as verifier's inline regex (the one being replaced)."""
+        log = "epoch 1 loss=0.50\nepoch 2 loss=0.35\nepoch 3 loss=nan"
+        # Old verifier regex
+        import re
+        old_result = [float(x) for x in re.findall(r"loss[=:\s]+([0-9.]+)", log, re.IGNORECASE)]
+        # New shared parser
+        new_result = parse_loss_series(log)
+        assert old_result == new_result, f"Mismatch: old={old_result} new={new_result}"
+
+    def test_parser_nan_detection_matches_verifier(self):
+        """has_nan_loss must match verifier's inline nan/inf regex."""
+        log = "epoch 5 loss=nan\nepoch 6 loss=inf"
+        assert has_nan_loss(log) is True
+        log2 = "epoch 5 loss=0.5"
+        assert has_nan_loss(log2) is False
+
 
 # ── Model structure scanner (the kwargs fix) ──
 

@@ -340,86 +340,92 @@ class StrategyConstraintEngine:
 class ContextPruner:
     """Limit context injection to most relevant keys per cycle.
 
-    Prevents information overload that causes LLM confusion and
-    increases both latency and cost.
+    v18: Now register-driven — tier sets are derived from context_keys.py
+    (the single source of truth) instead of maintaining a divergent copy.
+    Also enforces a character budget (not just a key-count limit), so a
+    few large keys can't starve out important small ones.
 
-    Strategy: Based on current cycle situation, select 10-15 most
-    relevant context keys to inject, dropping low-priority ones.
+    The tier system here mirrors context_keys.py's `tier` field:
+    tier=1 (always) → tier=2 (situational) → tier=3 (conditional) → tier=4 (rare)
     """
 
-    # Priority tiers: higher = more important
-    TIER_1_ALWAYS = {
-        "brief", "memory_log", "cycle", "workspace_dir",
-        "persistent_constraints",  # v16.1: project-level hard rules
-    }
+    MAX_KEYS = 18  # v18: raised slightly since budget is now character-based
+    MAX_CHARS = 12000  # v18: hard character budget on serialized context
 
-    TIER_2_SITUATIONAL = {
-        # Think phase
-        "architecture_plan", "architecture_plan_summary",
-        "dataset_manifest_summary", "session_stats",
-        "domain_knowledge", "hypothesis_calibration",
-        # v16.1: sandbox_design_guidance removed (context reduction)
-        # Reflect phase
-        "experiment_result", "verify_report", "verify_diagnosis",
-        "training_curve_analysis", "experiment_evaluation",
-        "sandbox_evaluation",
-    }
+    def __init__(self):
+        # Derive tier sets from the registry (single source of truth).
+        # This eliminates the dual-tier-system bug where ContextPruner's
+        # hardcoded sets disagreed with context_keys.py.
+        from .context_keys import THINK_KEYS, REFLECT_KEYS
+        self._tier_sets = {1: set(), 2: set(), 3: set(), 4: set()}
+        for ck in THINK_KEYS + REFLECT_KEYS:
+            self._tier_sets.setdefault(ck.tier, set()).add(ck.name)
 
-    TIER_3_CONDITIONAL = {
-        "directive", "recent_failures", "data_constraints",
-        "cross_experiment_insights", "causal_history",
-        "pareto_frontier", "iteration_guidance_prompt",
-        "dataset_quality_prompt", "domain_analysis_prompt",
-        "visual_analysis", "visual_analysis_diagnosis",
-        "independent_assessment_warning",
-        # v16.1: adaptive_thresholds, implementation_progress,
-        #         plan_compliance_warning, quick_benchmark_warning removed
-    }
+    @property
+    def TIER_1_ALWAYS(self):
+        return self._tier_sets.get(1, set())
 
-    TIER_4_RARE = {
-        "idea_guardian_check", "direction_circuit_breaker",
-        "data_scarcity_warning", "architecture_feedback_prompt",
-        "hypothesis_validation_prompt", "llm_fabrication_detected",
-        "fabrication_details", "verify_failed_modules",
-    }
+    @property
+    def TIER_2_SITUATIONAL(self):
+        return self._tier_sets.get(2, set())
 
-    MAX_KEYS = 14  # v16.1: reduced from 20 to minimize information dilution
+    @property
+    def TIER_3_CONDITIONAL(self):
+        return self._tier_sets.get(3, set())
+
+    @property
+    def TIER_4_RARE(self):
+        return self._tier_sets.get(4, set())
 
     def prune(self, context: dict, phase: str) -> dict:
-        """Select most relevant context keys, dropping low-priority ones."""
+        """Select most relevant context keys, dropping low-priority ones.
+
+        v18: Now uses both a key-count limit AND a character budget.
+        Tier-1 keys are always included regardless of budget. Remaining keys
+        are included by tier until either MAX_KEYS or MAX_CHARS is reached.
+        """
         if len(context) <= self.MAX_KEYS:
-            return context
+            # Still check character budget
+            pruned = dict(context)
+        else:
+            pruned = {}
+            # Tier 1: Always include
+            for key in self.TIER_1_ALWAYS:
+                if key in context:
+                    pruned[key] = context[key]
+            # Tier 2-4: Include if present and under key budget
+            for tier in (2, 3, 4):
+                for key in self._tier_sets.get(tier, set()):
+                    if key in context and len(pruned) < self.MAX_KEYS:
+                        pruned[key] = context[key]
+            # Catch-all: remaining non-empty keys
+            for key, value in context.items():
+                if key not in pruned and len(pruned) < self.MAX_KEYS:
+                    if value is not None and value != "" and value != {} and value != []:
+                        pruned[key] = value
 
-        pruned = {}
-
-        # Tier 1: Always include
-        for key in self.TIER_1_ALWAYS:
-            if key in context:
-                pruned[key] = context[key]
-
-        # Tier 2: Include if present
-        for key in self.TIER_2_SITUATIONAL:
-            if key in context and len(pruned) < self.MAX_KEYS:
-                pruned[key] = context[key]
-
-        # Tier 3: Include if remaining budget allows
-        for key in self.TIER_3_CONDITIONAL:
-            if key in context and len(pruned) < self.MAX_KEYS:
-                pruned[key] = context[key]
-
-        # Tier 4: Only if still under budget
-        for key in self.TIER_4_RARE:
-            if key in context and len(pruned) < self.MAX_KEYS:
-                pruned[key] = context[key]
-
-        # Catch any remaining keys that have non-empty values
-        for key, value in context.items():
-            if key not in pruned and len(pruned) < self.MAX_KEYS:
-                if value is not None and value != "" and value != {} and value != []:
-                    pruned[key] = value
+        # v18: Character budget enforcement — drop lowest-tier keys if over
+        from .context_keys import serialize_context, get_keys_for_phase
+        registry = {k.name: k for k in get_keys_for_phase(phase)}
+        total_chars = len(serialize_context(pruned, phase))
+        if total_chars > self.MAX_CHARS:
+            # Drop keys in reverse tier order (tier 4 first, then 3...)
+            for tier in (4, 3, 2):
+                for key in list(pruned.keys()):
+                    ck = registry.get(key)
+                    if ck and ck.tier == tier:
+                        del pruned[key]
+                        total_chars = len(serialize_context(pruned, phase))
+                        if total_chars <= self.MAX_CHARS:
+                            break
+                if total_chars <= self.MAX_CHARS:
+                    break
 
         dropped = len(context) - len(pruned)
         if dropped > 0:
-            logger.debug(f"ContextPruner: {len(context)} → {len(pruned)} keys ({dropped} dropped)")
+            logger.debug(
+                f"ContextPruner: {len(context)} -> {len(pruned)} keys "
+                f"({dropped} dropped, {total_chars} chars)"
+            )
 
         return pruned

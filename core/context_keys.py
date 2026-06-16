@@ -138,6 +138,9 @@ THINK_KEYS = [
                serializer=_text_section("Human Directive (HIGHEST PRIORITY)", 2000), tier=1),
     ContextKey("persistent_constraints", "think", "Project-level hard rules",
                serializer=_text_section("Persistent Constraints", 1000), tier=1),
+    ContextKey("goal_progress", "think",
+               "Current best metrics vs targets, showing what's achieved and what's not",
+               serializer=_text_section("Goal Progress", 800), tier=1),
 
     # ── Session intelligence (tier 2) ──
     ContextKey("session_stats", "think", "SQLite summary: cycles, experiments, dead ends",
@@ -172,6 +175,9 @@ THINK_KEYS = [
                serializer=_text_section("Causal History", 1500), tier=2),
     ContextKey("hypothesis_calibration", "think", "Historical hypothesis accuracy",
                serializer=_text_section("Hypothesis Calibration", 800), tier=2),
+    ContextKey("experiment_value_warn", "think",
+               "Previously assessed low-value directions (VOI < 0.01)",
+               serializer=_text_section("Low-Value Directions (avoid)", 600), tier=3),
 
     # ── Research roadmap (tier 2) — PREVIOUSLY DROPPED ──
     ContextKey("research_roadmap", "think", "Module decomposition, phase constraints",

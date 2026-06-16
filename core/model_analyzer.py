@@ -55,7 +55,20 @@ class ModelAnalyzerMixin:
                         break
 
         # Estimate total parameters
-        result["total_params_estimate"] = self._estimate_params_from_ast(tree)
+        # Phase 1 change 7: use model_structure_scanner (fixes kwargs bug where
+        # Conv2d(in_channels=3, out_channels=64) returned 0 because the old
+        # estimator only read positional args).
+        from .model_structure_scanner import scan_model_file
+        try:
+            structure = scan_model_file(content)
+            result["total_params_estimate"] = structure.total_estimated_params
+            if not structure.param_estimation_reliable:
+                result["warnings"].append(
+                    "Parameter estimate returned 0 — model may use custom modules "
+                    "or kwargs-only instantiation that AST cannot resolve."
+                )
+        except Exception:
+            result["total_params_estimate"] = self._estimate_params_from_ast(tree)
 
         # Check branch balance
         if result["branch_analysis"]:
