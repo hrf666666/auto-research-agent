@@ -994,7 +994,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             and self.roadmap.is_theory_verification_phase
         )
 
-        if self._direction_stagnation_count >= self._direction_change_threshold:
+        if False and self._direction_stagnation_count >= self._direction_change_threshold:  # v18: disabled
             if _roadmap_active:
                 # Override: don't suggest changing direction, suggest verifying current module
                 active_names = self.roadmap.active_module_names[:3]
@@ -1018,7 +1018,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # When the same architecture has been patched for too many cycles without
         # improvement, force the agent to SWITCH to a completely different architecture.
         # v15: During theory_verification, architecture switching is premature.
-        if self._architecture_stagnation_count >= self._architecture_stagnation_threshold:
+        if False and self._architecture_stagnation_count >= self._architecture_stagnation_threshold:  # v18: disabled
             if _roadmap_active:
                 # Suppress architecture switch during theory verification
                 logger.info(
@@ -2643,7 +2643,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Fix 1 (实验设计): Inject hypothesis validation prompt ──
         # When a domain is severely degraded, force the agent to verify
         # whether the method's core assumptions hold in that domain.
-        if self._quality_alert_streak >= 2:
+        if False and self._quality_alert_streak >= 2:  # v18: disabled
             context["hypothesis_validation_prompt"] = (
                 "HYPOTHESIS VALIDATION REQUIRED:\n"
                 "Your method has been producing severely degraded results for multiple cycles. "
@@ -3166,35 +3166,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         }
         return json.dumps(normalized, sort_keys=True, ensure_ascii=True)
 
-    def _extract_direction_signature(self, task_text: str) -> str:
-        """Extract the research direction from a task description.
-
-        Unlike _plan_signature (which detects identical plans), this extracts
-        the high-level research direction to detect strategic stagnation.
-        E.g., 'add edge loss' and 'increase edge loss weight' are different
-        plans but the SAME direction (edge-aware training).
-        """
-        import hashlib
-        # Extract key methodological terms (heuristic: keywords related to approach)
-        direction_keywords = [
-            "edge", "loss", "pretrain", "backbone", "resnet", "epi",
-            "angular", "conv", "stride", "view", "direction", "stream",
-            "attention", "transformer", "gnn", "groupnorm", "batchnorm",
-            "lambertian", "non-lambertian", "mixed", "domain",
-            "augment", "crop", "flip", "rotate", "scale",
-            "lr", "scheduler", "adam", "sgd", "epoch", "batch",
-            "disparity", "depth", "pfm", "gt",
-        ]
-        # Normalize: replace hyphens with spaces so "edge-aware" → "edge aware"
-        normalized = task_text.lower().replace("-", " ").replace("_", " ")
-        words = normalized.split()
-        direction_words = [w for w in words if w in direction_keywords]
-        # Use first 5 direction keywords as signature
-        sig = " ".join(direction_words[:5])
-        if not sig:
-            sig = task_text[:100]
-        return hashlib.md5(sig.encode()).hexdigest()[:12]
-
+    # v18 Phase 3: __extract_direction_signature removed (0 triggers in production, research decision)
     # ── Known architecture names for architecture-level detection (v14) ──
     _ARCHITECTURE_PATTERNS = {
         "epi": ["epi", "epinet", "epipolar", "epi_net", "epi slope", "epi branch"],
@@ -3209,67 +3181,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         "adaspike": ["adaspike", "spike", "spiking"],
     }
 
-    def _extract_architecture_name(self, task_text: str) -> str:
-        """Extract the underlying architecture name from a task description (v14).
-
-        This operates at a coarser granularity than _extract_direction_signature.
-        'EPINet + edge loss' and 'EPINet + angular conv' are different directions
-        but the SAME architecture (epi). This detects the architecture-level pattern.
-
-        Returns:
-            Architecture key (e.g., "epi", "unet") or "" if no known architecture found.
-        """
-        normalized = task_text.lower().replace("-", " ").replace("_", " ")
-        for arch_key, patterns in self._ARCHITECTURE_PATTERNS.items():
-            for pat in patterns:
-                if pat in normalized:
-                    return arch_key
-        return ""
-
-    def _analyze_architecture_dead_ends(self) -> dict:
-        """Analyze dead ends to detect architecture-level bottlenecks (v14).
-
-        Groups dead ends by architecture and checks if a single architecture
-        has accumulated enough dead ends to indicate a fundamental problem.
-
-        Returns:
-            dict with keys:
-            - bottleneck: bool — whether an architecture bottleneck is detected
-            - architecture: str — the bottleneck architecture name (if any)
-            - dead_end_count: int — number of dead ends for this architecture
-            - evidence: list[str] — summary of dead end evidence
-        """
-        result = {"bottleneck": False, "architecture": "", "dead_end_count": 0, "evidence": []}
-        try:
-            all_dead_ends = self.memory.get_dead_ends_full()
-            if len(all_dead_ends) < 5:
-                return result
-
-            # Group dead ends by architecture
-            arch_dead_ends: dict[str, list[str]] = {}
-            for de_text in all_dead_ends:
-                de_lower = de_text.lower()
-                for arch_key, patterns in self._ARCHITECTURE_PATTERNS.items():
-                    for pat in patterns:
-                        if pat in de_lower:
-                            arch_dead_ends.setdefault(arch_key, []).append(de_text)
-                            break
-                    else:
-                        continue
-                    break
-
-            # Check if any architecture has ≥ 5 dead ends
-            for arch_key, des in arch_dead_ends.items():
-                if len(des) >= 5:
-                    result["bottleneck"] = True
-                    result["architecture"] = arch_key
-                    result["dead_end_count"] = len(des)
-                    result["evidence"] = [d[:120] for d in des[-5:]]
-                    break
-        except Exception as e:
-            logger.debug(f"Architecture dead end analysis failed: {e}")
-        return result
-
+    # v18 Phase 3: __extract_architecture_name removed (0 triggers in production, research decision)
+    # v18 Phase 3: __analyze_architecture_dead_ends removed (0 triggers in production, research decision)
     # ── v16: Phase-Gated State-Driven Architecture ──
 
     # v16.1: _build_scope_prefix removed (pure text injection ineffective against LLM)
@@ -3658,161 +3571,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             logger.warning(f"ROADMAP alignment check failed: {e}")
             return think_result  # Fail open — don't block on errors
 
-    def _apply_no_progress_fallback(self, think_result: dict, directive: Optional[str]) -> dict:
-        """Back off if the same experiment plan keeps repeating without progress.
-
-        When stuck, redirect to paper research instead of just waiting —
-        this forces the agent to seek new knowledge rather than idle.
-
-        Fix 1: Also force paper research when output quality degrades repeatedly.
-        Fix 3: Force paper research when direction stagnation is detected.
-        v14: Force architecture_switch when architecture stagnation is detected.
-        """
-        if directive or self.no_progress_fallback_threshold <= 0:
-            return think_result
-
-        if think_result.get("action") != "experiment":
-            return think_result
-
-        # v14: Architecture switch fallback (highest priority)
-        # When the same architecture has been patched for too many cycles, force a switch.
-        if self._architecture_stagnation_count >= self._architecture_stagnation_threshold:
-            # Check if dead end synthesis also flags this architecture
-            bottleneck_detected = False
-            try:
-                dead_end_analysis = self._analyze_architecture_dead_ends()
-                if dead_end_analysis.get("bottleneck"):
-                    bottleneck_detected = True
-            except Exception:
-                pass
-
-            arch_name = self._current_architecture_name or "current"
-            reason = (
-                f"ARCHITECTURE SWITCH (v14): '{arch_name}' architecture has been used for "
-                f"{self._architecture_stagnation_count} cycles without improvement."
-            )
-            if bottleneck_detected:
-                reason += f" Dead end synthesis confirms '{arch_name}' is a bottleneck."
-
-            logger.warning(reason)
-            self.memory.log_decision(reason)
-
-            # Build architecture switch task
-            survey_path = self._architecture_survey_path
-            survey_note = ""
-            if survey_path.exists():
-                survey_note = (
-                    f"Read {survey_path.name} for pre-analyzed candidate architectures.\n"
-                )
-            else:
-                survey_note = (
-                    "No ARCHITECTURE_SURVEY.md exists. You MUST:\n"
-                    "1. First do paper research to find 3+ alternative architectures\n"
-                    "2. Write the survey to workspace/ARCHITECTURE_SURVEY.md\n"
-                )
-
-            return {
-                "action": "architecture_switch",
-                "reason": reason,
-                "decision": reason,
-                "agent": "researcher",
-                "task": (
-                    f"ARCHITECTURE SWITCH — the '{arch_name}' architecture is a DEAD END.\n\n"
-                    f"You have spent {self._architecture_stagnation_count} cycles patching '{arch_name}' "
-                    f"without any metric improvement. This is NOT a tuning problem — "
-                    f"the architecture itself is unsuitable.\n\n"
-                    f"{survey_note}"
-                    f"MANDATORY STEPS:\n"
-                    f"1. Identify 3+ ALTERNATIVE architectures (NOT variants of '{arch_name}')\n"
-                    f"2. For each alternative, verify:\n"
-                    f"   - Core assumption matches the data characteristics\n"
-                    f"   - Feasible to implement with available resources\n"
-                    f"   - Published results suggest it can outperform '{arch_name}'\n"
-                    f"3. Select the BEST alternative with justification\n"
-                    f"4. Implement a PILOT version (minimal viable model, 2-5 epoch test)\n"
-                    f"5. Verify the forward pass works with real data before training\n"
-                    f"6. Write the selection rationale to workspace/ARCHITECTURE_SWITCH.md\n\n"
-                    f"Do NOT propose ANY modification to '{arch_name}'. "
-                    f"Do NOT suggest 'improved {arch_name}' or '{arch_name} v2'. "
-                    f"You MUST switch to a fundamentally different architecture."
-                ),
-            }
-
-        # Fix 1: Quality degradation fallback
-        if self._quality_alert_streak >= 2:
-            reason = (
-                f"QUALITY FALLBACK: {self._quality_alert_streak} consecutive cycles with "
-                f"degraded domain metrics. Agent must diagnose why results are getting worse."
-            )
-            logger.warning(reason)
-            self.memory.log_decision(reason)
-            return {
-                "action": "paper_research",
-                "reason": reason,
-                "decision": reason,
-                "agent": "researcher",
-                "task": (
-                    "QUALITY DIAGNOSIS — experiments are producing worse results.\n\n"
-                    "1. Read MEMORY_LOG.md for recent experiment results and failures\n"
-                    "2. Analyze WHY the agent's experiments are producing degraded metrics\n"
-                    "3. Search for papers that address the specific failure mode\n"
-                    "4. Write a diagnosis and recommended new direction to workspace/\n"
-                ),
-            }
-
-        # Fix 3: Direction stagnation fallback
-        if self._direction_stagnation_count >= self._direction_change_threshold:
-            reason = (
-                f"DIRECTION FALLBACK: Same research direction for "
-                f"{self._direction_stagnation_count} cycles without improvement. "
-                f"Agent must find a fundamentally different approach."
-            )
-            logger.warning(reason)
-            self.memory.log_decision(reason)
-            return {
-                "action": "paper_research",
-                "reason": reason,
-                "decision": reason,
-                "agent": "researcher",
-                "task": (
-                    "DIRECTION CHANGE — agent is stuck in a research rut.\n\n"
-                    "The agent has been trying the same approach for multiple cycles\n"
-                    "without any metric improvement. This suggests the direction itself\n"
-                    "may be fundamentally flawed.\n\n"
-                    "1. Read MEMORY_LOG.md to understand what has been tried\n"
-                    "2. Search for papers proposing FUNDAMENTALLY DIFFERENT methods\n"
-                    "3. Do NOT suggest incremental improvements to the current approach\n"
-                    "4. Propose a completely new research direction with specific implementation plan\n"
-                ),
-            }
-
-        signature = self._plan_signature(think_result)
-        if (
-            self._no_progress_streak >= self.no_progress_fallback_threshold
-            and signature == self._last_no_progress_signature
-        ):
-            reason = (
-                f"Fallback: {self._no_progress_streak} no-progress cycles on same plan. "
-                "Forcing paper research to seek breakthrough methods from literature."
-            )
-            logger.warning(reason)
-            self.memory.log_decision(reason)
-            return {
-                "action": "paper_research",
-                "reason": reason,
-                "decision": reason,
-                "agent": "researcher",
-                "task": (
-                    "EMERGENCY PAPER RESEARCH — agent is stuck repeating the same failed experiment.\n\n"
-                    "Execute the /paper-research skill immediately. The full instructions are in:\n"
-                    "skills/paper-research/SKILL.md\n\n"
-                    "Read that file and follow the Phase 1→2→3→4 workflow precisely.\n"
-                    "This is a MAJOR EVENT. Log results and update MEMORY_LOG.md accordingly."
-                ),
-            }
-
-        return think_result
-
+    # v18 Phase 3: __apply_no_progress_fallback removed (0 triggers in production, research decision)
     # ─────────────────────────────────────────────────────────────
     # Phase 4: Failed-launch forced re-dispatch
     # ─────────────────────────────────────────────────────────────
@@ -4309,7 +4068,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                 logger.debug(f"Experiment value update skipped: {e}")
             if quality_degraded:
                 self._quality_alert_streak += 1
-                if self._quality_alert_streak >= 2:
+                if False and self._quality_alert_streak >= 2:  # v18: disabled
                     logger.warning(
                         f"QUALITY ALERT: {self._quality_alert_streak} consecutive cycles with "
                         f"degraded domain metrics. Forcing visual analysis + paper research."
@@ -4323,73 +4082,11 @@ class ResearchLoop(DomainKnowledgeMixin):
         else:
             self._quality_alert_streak = 0
 
-        # ── Fix 3: Strategic abandonment (direction stagnation detection) ──
-        # Extract research direction from the experiment task/hypothesis
+        # v18 Phase 3: Direction/architecture stagnation tracking removed.
+        # These counters had 0 triggers in 23 cycles of production. The LLM
+        # should decide to change direction based on experiment history
+        # (Phase 1 knowledge loop), not system-enforced stagnation detection.
         task_text = think_result.get("task", "")[:200]
-        direction_sig = self._extract_direction_signature(task_text)
-        if direction_sig != self._current_direction_signature:
-            # New direction — reset counter
-            self._current_direction_signature = direction_sig
-            self._direction_stagnation_count = 0
-            logger.info(f"NEW DIRECTION: '{direction_sig[:80]}'")
-        else:
-            # Same direction — check if metrics improved
-            if current_metric is not None and current_metric < self._best_metric_ever:
-                self._direction_stagnation_count = 0  # Improvement in current direction
-            else:
-                self._direction_stagnation_count += 1
-
-        if self._direction_stagnation_count >= self._direction_change_threshold:
-            logger.warning(
-                f"DIRECTION STAGNATION: Same direction for {self._direction_stagnation_count} "
-                f"cycles without improvement. Forcing paper research for new direction."
-            )
-            self.memory.log_decision(
-                f"[DIRECTION] Stagnant for {self._direction_stagnation_count} cycles on: "
-                f"'{direction_sig[:120]}'. Agent must seek fundamentally different approaches."
-            )
-            # Reset to allow new direction after paper research
-            self._direction_stagnation_count = 0
-            self._current_direction_signature = ""
-
-        # ── v14: Architecture-level stagnation tracking ──
-        # Track at the ARCHITECTURE level (coarser than direction level).
-        # "EPINet + edge loss" and "EPINet + angular conv" are different directions
-        # but the SAME architecture. Architecture stagnation is NOT reset by
-        # paper_research — only by actually switching to a different architecture.
-        arch_name = self._extract_architecture_name(task_text)
-        if arch_name:
-            if arch_name != self._current_architecture_name:
-                # Switched to a different architecture — reset
-                old_arch = self._current_architecture_name or "(none)"
-                self._current_architecture_name = arch_name
-                self._architecture_stagnation_count = 0
-                logger.info(
-                    f"ARCHITECTURE SWITCH: '{old_arch}' → '{arch_name}'. "
-                    f"Architecture stagnation reset."
-                )
-                self.memory.log_decision(
-                    f"[ARCH] Architecture switched from '{old_arch}' to '{arch_name}' at cycle {self.cycle_count}."
-                )
-            else:
-                # Same architecture — check if metrics improved
-                if current_metric is not None and current_metric < self._best_metric_ever:
-                    self._architecture_stagnation_count = 0  # Real improvement
-                else:
-                    self._architecture_stagnation_count += 1
-                    if self._architecture_stagnation_count % 3 == 0:
-                        logger.warning(
-                            f"ARCHITECTURE STAGNATION: '{arch_name}' has shown no improvement "
-                            f"for {self._architecture_stagnation_count} cycles."
-                        )
-                        self.memory.log_decision(
-                            f"[ARCH] '{arch_name}' stagnant for {self._architecture_stagnation_count} cycles."
-                        )
-        elif self._current_architecture_name and think_result.get("action") == "experiment":
-            # Task doesn't explicitly mention architecture but is an experiment —
-            # check if the task implicitly targets the current architecture
-            # (e.g., "modify the model" without naming it)
-            self._architecture_stagnation_count += 1
 
         # Check architecture survey completion
         if not self._architecture_survey_done and self._architecture_survey_path.exists():
