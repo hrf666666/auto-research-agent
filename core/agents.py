@@ -1855,10 +1855,6 @@ class AgentDispatcher:
         if parsed is not None:
             return parsed
 
-        # Fallback: extract action from text
-        response_lower = response.lower()
-        if "wait" in response_lower or "no experiment" in response_lower:
-            return {"action": "wait", "reason": response[:200]}
 
         # Parse failure must NEVER auto-trigger an experiment. A confused,
         # truncated, or empty leader response used as a task description would
@@ -1934,10 +1930,6 @@ class AgentDispatcher:
                         start = None
         return None
 
-        # Fallback: extract action from text
-        response_lower = response.lower()
-        if "wait" in response_lower or "no experiment" in response_lower:
-            return {"action": "wait", "reason": response[:200]}
 
         # Parse failure must NEVER auto-trigger an experiment. A confused,
         # truncated, or empty leader response used as a task description would

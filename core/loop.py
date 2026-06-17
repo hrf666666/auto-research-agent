@@ -12,12 +12,10 @@ Pipeline:
 
 import os
 import re
-import sys
 import math
 import time
 import json
 import signal
-import argparse
 import logging
 from pathlib import Path
 from typing import Optional
@@ -111,19 +109,14 @@ class ResearchLoop(DomainKnowledgeMixin):
         # State
         self.cycle_count = self._load_cycle_counter()
         self.max_cycles = config.get("agent", {}).get("max_cycles", -1)
-        self.cooldown = config.get("agent", {}).get("cooldown_interval", 300)
         self.no_progress_fallback_threshold = config.get("agent", {}).get("no_progress_fallback_threshold", 3)
         self._running = True
         self._no_progress_streak = 0
         self._last_no_progress_signature = ""
         self._consecutive_wait_count = 0
-        self._hard_gate_consecutive_blocks = 0  # track HARD GATE dead loops
         self._max_consecutive_waits = config.get("agent", {}).get("max_consecutive_waits", 3)
         # Repeated issue tracking for error escalation
         # Uses sliding window: issue_signature → list of recent cycle numbers
-        self._audit_issue_history: dict[str, list[int]] = {}  # sig → [cycle_num, ...]
-        self._audit_escalation_threshold = config.get("agent", {}).get("audit_escalation_threshold", 3)
-        self._audit_sliding_window = 10  # How many recent cycles to consider
 
         # ── Metric-based progress tracking (for visual analysis trigger) ──
         # Visual analysis should fire when METRICS stop improving,
@@ -133,7 +126,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._visual_trigger_threshold: int = (config or {}).get(
             "visual_analysis", {}
         ).get("trigger_threshold", 5)  # Sync with VisualAnalyzer default
-        self._consecutive_audit_directives: int = 0     # Track audit death loop (Fix 5)
 
         # ── Fix 1: Output quality awareness ──
         # Track per-domain metrics to detect when agent produces "successful bad results"
@@ -141,13 +133,11 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── Fix 3: Strategic abandonment ──
         # Track whether the agent is stuck in a research direction
-        self._direction_change_threshold: int = 3     # Force paper research after N stagnations
 
         # ── v14: Architecture-level stagnation (independent of direction stagnation) ──
         # Tracks whether the agent is stuck patching the SAME architecture.
         # Unlike direction stagnation, this is NOT reset by paper_research —
         # only reset when a genuinely different architecture is detected.
-        self._architecture_stagnation_threshold: int = 5    # Trigger architecture switch after N cycles
         self._architecture_survey_done: bool = False        # Whether architecture survey has been completed
         self._architecture_survey_path = self.workspace / "ARCHITECTURE_SURVEY.md"
 
@@ -165,7 +155,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         self._consecutive_failed_launches: int = 0
 
         # ── Fix B: Audit enforcement counters ──
-        self._audit_enforcement: dict[str, int] = {}
 
 
         # Phase 2: deterministic garbage collector
@@ -271,8 +260,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                         logger.info("DATASET UNDERSTANDING phase — scanning data/ directory")
 
                     # ── ROADMAP INIT (v15): Generate research roadmap on first cycle ──
-                    if not self._roadmap_initialized:
-                        pass
 
                     # THINK: Analyze and plan
                     think_result = self._think(directive)
@@ -281,9 +268,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
                 # failed launches. Stops burning quota on a stuck pattern and
                 # requires human intervention to resume.
-                if think_result.get("action") == "pause_human":
-                    self._running = False
-                    break
 
                 if think_result.get("action") == "wait":
                     self._consecutive_wait_count += 1
@@ -491,8 +475,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # Auto-compare experiment results against phase targets
                 try:
                     final_metrics = execute_result.get("final_metrics") or {}
-                    if final_metrics:
-                        pass
                 except Exception as e:
                     logger.debug(f"Phase status update skipped: {e}")
                 self._record_cycle_outcome(think_result, execute_result, reflect_result,
@@ -1059,14 +1041,7 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # ── CAUSAL CHAIN UPDATE ──
         # Compare actual improvement with expected improvement
-        if current_metric is not None and self._best_metric_ever < float('inf'):
-            actual_improvement = self._best_metric_ever - current_metric
-        else:
-            # v18 Phase 3: Direction/architecture stagnation tracking removed.
-        # These counters had 0 triggers in 23 cycles of production. The LLM
-        # should decide to change direction based on experiment history
-        # (Phase 1 knowledge loop), not system-enforced stagnation detection.
-            task_text = think_result.get("task", "")[:200]
+                    # v18: improvement tracking simplified
 
         # Check architecture survey completion
         if not self._architecture_survey_done and self._architecture_survey_path.exists():
@@ -1087,7 +1062,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                         )
                     self._best_metric_ever = min(self._best_metric_ever, current_metric)
                     self._metric_no_progress_streak = 0
-                    self._consecutive_audit_directives = 0
                 else:
                     self._metric_no_progress_streak += 1
                     logger.info(
