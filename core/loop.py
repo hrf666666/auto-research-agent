@@ -277,8 +277,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                     # THINK: Analyze and plan
                     think_result = self._think(directive)
 
-                    if think_result.get("action") == "experiment":
-                        think_result = self._enforce_launch_after_failure(think_result)
 
                 # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
                 # Triggered by _enforce_launch_after_failure after 3 consecutive
@@ -362,20 +360,16 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
                 # This is triggered when the architecture stagnation threshold is reached.
                 # The agent researches alternative architectures AND starts implementing.
-                # Gate 1: PRE-VERIFY (safety check)
-                _gate_blocked = False
+                # Gate 1: PRE-VERIFY — referee only. Detect issues, tell LLM, let LLM decide.
                 pre_verify_report = self._pre_verify(self.cycle_count, think_result)
                 critical_pre_issues = pre_verify_report.critical_failures
                 if critical_pre_issues:
                     issues_text = "; ".join(c.detail for c in critical_pre_issues)
-                    logger.warning(
-                        f"PRE-VERIFY blocked execution: {issues_text}"
-                    )
-                    think_result = {
-                        "action": "experiment",
-                        "task": f"Fix these issues before training: {'; '.join(c.detail for c in critical_pre_issues)}",
-                    }
-                    _gate_blocked = True
+                    logger.warning(f"PRE-VERIFY found issues: {issues_text}")
+                    # Record as active problem — LLM will see it in next THINK's memory_log
+                    self.memory.log_active_problem(f"PRE-VERIFY: {issues_text}")
+                    # Inject into current context so LLM sees it immediately
+                    think_result["pre_verify_warning"] = issues_text
 
                 # EXECUTE: Run the plan
                 self._consecutive_wait_count = 0
@@ -635,6 +629,11 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         # Context pruning
         context = self.context_pruner.prune(context, "think")
+
+        # Inject any pre-verify warnings from previous cycle
+        # (referee tells player what's wrong, player decides what to do)
+        if directive and "PRE-VERIFY" in str(directive):
+            context["pre_verify_warning"] = directive
 
         result = self.dispatcher.dispatch_leader(task="think", context=context)
 
