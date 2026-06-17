@@ -402,7 +402,7 @@ class MemoryManager:
                         val = None
                         metric_keys = getattr(self, '_metric_keys', None)
                         if not metric_keys:
-                            metric_keys = ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae", "MAE_overall")
+                            metric_keys = self.domain_keys or ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae", "MAE_overall")
                         for key in metric_keys:
                             if key in m:
                                 val = float(m[key])

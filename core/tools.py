@@ -106,7 +106,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def get_tools_for(self, agent_type: str) -> list[dict]:
         """Get tool definitions for a specific agent type."""
         tool_map = {
-            "leader": [self._tool_log_memory, self._tool_write_file, self._tool_read_file, self._tool_analyze_model, self._tool_probe_model, self._tool_plan_model, self._tool_code_review],
+            "leader": [self._tool_log_memory, self._tool_query_memory, self._tool_write_file, self._tool_read_file, self._tool_list_files],
             "idea": [self._tool_search_papers, self._tool_get_paper, self._tool_write_file, self._tool_read_file],
             "researcher": [
                 self._tool_search_papers,
@@ -170,6 +170,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "web_search": self._exec_web_search,
             "web_fetch": self._exec_web_fetch,
             "log_memory": self._exec_log_memory,
+            "query_memory": self._exec_query_memory,
             "analyze_image": self._exec_analyze_image,
             "diagnose_error": self._exec_diagnose_error,
             "analyze_model": self._exec_analyze_model,
@@ -1592,6 +1593,56 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             return json.dumps(result, ensure_ascii=False, indent=2)
         except Exception as e:
             return json.dumps({"error": f"Web fetch failed: {str(e)}", "url": url})
+
+
+    def _tool_query_memory(self) -> dict:
+        """Schema for query_memory tool."""
+        return {
+            "name": "query_memory",
+            "description": "Query your experiment history. Use this to check past results, "
+                           "dead ends, causal relationships, and best metrics.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": ["best_metrics", "dead_ends", "causal_chain",
+                                 "experiment_history", "lessons"],
+                        "description": "Type of memory query"
+                    },
+                    "limit": {"type": "integer", "description": "Max results (default 5)"}
+                },
+                "required": ["query_type"]
+            }
+        }
+
+    def _exec_query_memory(self, query_type: str, limit: int = 5) -> str:
+        """Query experiment memory — lets LLM actively look up history."""
+        import json
+        if not self._memory:
+            return json.dumps({"error": "Memory not available"})
+        try:
+            if query_type == "best_metrics":
+                stats = self._memory.get_summary_stats()
+                return json.dumps(stats, default=str)
+            elif query_type == "dead_ends":
+                ends = self._memory.get_dead_ends_full(limit=limit)
+                return json.dumps(ends, default=str)
+            elif query_type == "causal_chain":
+                chain = self._memory.get_causal_history(limit=limit)
+                return json.dumps(chain, default=str)
+            elif query_type == "experiment_history":
+                rows = self._memory.get_experiment_history(limit=limit) \
+                    if hasattr(self._memory, 'get_experiment_history') else []
+                return json.dumps(rows, default=str)
+            elif query_type == "lessons":
+                lessons = self._memory.get_code_review_lessons(limit=limit) \
+                    if hasattr(self._memory, 'get_code_review_lessons') else []
+                return json.dumps(lessons, default=str)
+            else:
+                return json.dumps({"error": f"Unknown query_type: {query_type}"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     def _exec_log_memory(self, type: str, entry: str) -> str:
         """Log to memory (delegated to MemoryManager if available)."""
