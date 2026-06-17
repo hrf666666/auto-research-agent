@@ -1117,7 +1117,8 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         for word, locs in inv_index.items():
             for pos in locs:
                 positions.append((pos, word))
-        positions.sort()
+        # Stable sort by position only - preserves word order within a slot.
+        positions.sort(key=lambda x: x[0])
         return " ".join(w for _, w in positions)
 
     @classmethod
@@ -1134,7 +1135,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         ids = work.get("ids") or {}
         return {
             "openalex_id": (work.get("id") or "").split("/")[-1],
-            "doi": (work.get("doi") or "").replace("https://doi.org/", ""),
+            "doi": re.sub(r"^https?://(dx\.)?doi\.org/", "", (work.get("doi") or "")),
             "title": work.get("title") or work.get("display_name") or "",
             "year": work.get("publication_year"),
             "venue": source_obj.get("display_name") or "",
@@ -1197,6 +1198,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def _oa_fetch_id(cls, id_path: str) -> str | None:
         """Resolve a single OpenAlex ID-form (e.g. 'doi:10.xxx') to a W-ID via direct path."""
         import urllib.request
+        import urllib.error
         url = f"{cls._OPENALEX_BASE}/{id_path}?select=id"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0 (openalex-explore)"})
@@ -1256,7 +1258,10 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         """
         if not seed or not str(seed).strip():
             return json.dumps({"error": "seed is required"})
-        per = max(1, min(int(per_direction or 5), 10))
+        try:
+            per = max(1, min(int(per_direction or 5), 10))
+        except (TypeError, ValueError):
+            per = 5
 
         seed_id = self._oa_resolve_seed(str(seed).strip())
         if not seed_id:
@@ -1282,11 +1287,16 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         forward_raw = self._oa_fetch_forward(seed_id, per)
         forward = [self._oa_work_to_compact(w) for w in forward_raw]
 
+        backward_note = (
+            "seed has no referenced_works (OpenAlex may not index references for preprints)"
+            if not refs else ""
+        )
         return json.dumps({
             "seed": self._oa_work_to_compact(seed_work),
             "backward": backward,
             "forward": forward,
             "counts": {"backward": len(backward), "forward": len(forward)},
+            "backward_note": backward_note,
             "source": "openalex",
         }, ensure_ascii=False, indent=2)
 
@@ -1450,6 +1460,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             return json.dumps({"error": f"Web fetch failed: {str(e)}", "url": url})
 
 
+    @property
     def _tool_query_memory(self) -> dict:
         """Schema for query_memory tool."""
         return {
