@@ -63,7 +63,6 @@ monitor:
   notify_on_complete: true        # Log notification on experiment completion
 
 experiment:
-  mandatory_dry_run: true         # Always dry-run before real training
   max_parallel: 1                 # Max concurrent experiments
   log_tail_lines: 50              # Lines to capture from training log
 
@@ -109,21 +108,6 @@ multimodal_mcp:
 # Auto-detected at runtime. Only used when GLM key is available.
 # Provides specialized visual understanding tools via MCP protocol.
 # No manual configuration needed — endpoints are resolved by provider detection.
-
-# When enabled, the paper_research phase uses IdeaScout's profile-guided
-# pipeline (gather → rule-filter → LLM transferability score) instead of the
-# default researcher agent. A Profile is auto-generated from PROJECT_BRIEF.md;
-# set profile_path to use a hand-written YAML profile instead.
-# Requires the research-idea-scout package on sys.path (auto-detected at
-# ~/code/research-idea-scout or /home/bigboss/code/research-idea-scout).
-idea_scout:
-  enabled: false                # Set true to activate (default off, zero behavior change)
-  max_papers: 50                # Max papers to gather via search_papers
-  filter_top_k: 20              # Candidates kept after rule-based filtering
-  score_top_k: 10               # Candidates LLM-scored and ranked in the report
-  abstract_max_chars: 3000
-  # profile_path: ""            # Optional: path to a hand-written profile YAML
-  # lib_path: ""                # Optional: override research-idea-scout install path
 
 # Safety — Phase 2: tool-level safety contracts (P1)
 # These are enforced INSIDE the tools (write_file, launch_experiment),

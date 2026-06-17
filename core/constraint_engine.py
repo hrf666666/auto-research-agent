@@ -1,19 +1,13 @@
 """
-AutoResearcher Constraint Engine — LLM Behavior Control Layer (v16.1)
+AutoResearcher Constraint Engine — Tool-level safety + context pruning.
 
-Prevents LLM hallucination, lying, and corner-cutting through:
-1. StrategyConstraintEngine: Converts historical patterns into executable rules
-   - v16.1: Preserves human-written FORBIDDEN rules across REFLECT cycles
-2. ContextPruner: Limits context injection to most relevant keys per cycle
+1. StrategyConstraintEngine: Converts historical dead-end patterns into rules.
+   Used inside launch_experiment (tools.py) to block re-running known dead ends
+   before they waste GPU time.
+2. ContextPruner: Limits context injection per phase to keep prompts bounded.
 
-v16.1 cleanup: Removed 4 dead modules (~1023 lines):
-- PlannerChecker (2/10 score): AST compliance check, never useful
-- QuickBenchmark (1/10 score): Conditions too strict, never triggered
-- AdaptiveThresholds (3/10 score): 11 cycles insufficient for calibration
-- ImplementationTracker (2/10 score): Overlaps with research_roadmap
-
-Design principle: LLMs will take shortcuts when unconstrained. Every constraint
-must be CHECKABLE — it cannot rely on the LLM's self-reporting.
+P3 (referee-not-player): constraints fire inside tools as safety contracts,
+not as overrides on the LLM's decisions.
 """
 
 import ast
