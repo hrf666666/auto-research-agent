@@ -111,6 +111,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 self._tool_search_papers,
                 self._tool_web_search,
                 self._tool_web_fetch,
+                self._tool_explore_citations,
                 self._tool_analyze_image,
                 self._tool_write_file,
                 self._tool_read_file,
@@ -165,6 +166,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "list_files": self._exec_list_files,
             "search_papers": self._exec_search_papers,
             "get_paper": self._exec_get_paper,
+            "explore_citations": self._exec_explore_citations,
             "web_search": self._exec_web_search,
             "web_fetch": self._exec_web_fetch,
             "log_memory": self._exec_log_memory,
@@ -355,6 +357,27 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     "paper_id": {"type": "string", "description": "arXiv ID (e.g. '649def34f8be52c8b66281af98ae884c09aef38b') or arXiv ID (e.g. 'arXiv:2401.12345')"},
                 },
                 "required": ["paper_id"],
+            },
+        }
+
+    @property
+    def _tool_explore_citations(self) -> dict:
+        return {
+            "name": "explore_citations",
+            "description": (
+                "Walk the OpenAlex citation graph of a seed paper. Returns two lists: "
+                "'backward' (papers this work built on, from its references) and "
+                "'forward' (papers that cite this work, newest/most-cited first). "
+                "Use this to discover adjacent work and cross-domain transfer opportunities "
+                "that keyword search misses. Accepts an OpenAlex ID (W123456789), DOI, or arXiv ID."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "seed": {"type": "string", "description": "OpenAlex ID (W...), DOI (10.xxx/yyy), or arXiv ID (arXiv:2401.12345)"},
+                    "per_direction": {"type": "integer", "description": "Max papers per direction (default 5, max 10)", "default": 5},
+                },
+                "required": ["seed"],
             },
         }
 
@@ -1073,6 +1096,199 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             if result:
                 return result
         return json.dumps({"error": "Could not fetch paper. Use web_fetch with the URL."})
+
+
+    # ── OpenAlex citation graph exploration ──────────────────────────────
+    # Pattern extracted from paperseek's OpenAlexProvider (MIT). Uses stdlib
+    # urllib only (no `requests` dependency). The OpenAlex API is free and
+    # requires no key; a mailto improves the polite-pool rate limit.
+    _OPENALEX_BASE = "https://api.openalex.org/works"
+    _OPENALEX_SELECT = (
+        "id,doi,title,display_name,publication_year,authorships,"
+        "primary_location,cited_by_count,abstract_inverted_index,ids"
+    )
+
+    @staticmethod
+    def _invert_abstract(inv_index: dict | None) -> str:
+        """Reconstruct abstract from OpenAlex inverted index."""
+        if not inv_index or not isinstance(inv_index, dict):
+            return ""
+        positions = []
+        for word, locs in inv_index.items():
+            for pos in locs:
+                positions.append((pos, word))
+        positions.sort()
+        return " ".join(w for _, w in positions)
+
+    @classmethod
+    def _oa_work_to_compact(cls, work: dict) -> dict:
+        """Flatten an OpenAlex work into the compact shape we return to the LLM."""
+        primary = work.get("primary_location") or {}
+        source_obj = primary.get("source") or {}
+        authors = []
+        for a in (work.get("authorships") or [])[:8]:
+            ao = a.get("author") or {}
+            name = ao.get("display_name") or ""
+            if name:
+                authors.append(name)
+        ids = work.get("ids") or {}
+        return {
+            "openalex_id": (work.get("id") or "").split("/")[-1],
+            "doi": (work.get("doi") or "").replace("https://doi.org/", ""),
+            "title": work.get("title") or work.get("display_name") or "",
+            "year": work.get("publication_year"),
+            "venue": source_obj.get("display_name") or "",
+            "cited_by_count": int(work.get("cited_by_count") or 0),
+            "authors": authors,
+            "abstract": cls._invert_abstract(work.get("abstract_inverted_index"))[:1500],
+            "url": work.get("id") or "",
+        }
+
+    def _oa_resolve_seed(self, seed: str) -> str | None:
+        """Resolve any seed form to an OpenAlex work ID (W...).
+
+        Strategies, in order:
+        1. Bare OpenAlex ID (W123...) or openalex.org URL → direct.
+        2. DOI (10.xxx, with or without doi: prefix) → /works/doi:<doi> direct path.
+        3. arXiv ID → try arXiv DataCite DOI (10.48550/arXiv.<id>), then DOI-path.
+        Returns the W-ID or None.
+        """
+        import urllib.request
+        seed = (seed or "").strip()
+        if not seed:
+            return None
+
+        # 1) Already an OpenAlex work ID
+        if seed.startswith("https://openalex.org/"):
+            seed = seed.rstrip("/").split("/")[-1]
+        if re.match(r"^W\d+$", seed):
+            return seed
+
+        # 2) DOI (10.xxx or doi:10.xxx or https://doi.org/10.xxx)
+        doi = ""
+        if seed.lower().startswith("doi:"):
+            doi = seed[4:].strip()
+        elif seed.startswith("10."):
+            doi = seed
+        elif "doi.org/" in seed.lower():
+            doi = seed.split("doi.org/", 1)[-1]
+        if doi:
+            doi = doi.strip()
+            wid = self._oa_fetch_id(f"doi:{doi}")
+            if wid:
+                return wid
+
+        # 3) arXiv ID → arXiv DataCite DOI
+        arxiv_id = ""
+        if seed.lower().startswith("arxiv:"):
+            arxiv_id = seed[6:].strip()
+        elif "arxiv.org/abs/" in seed.lower():
+            arxiv_id = seed.split("/abs/", 1)[-1].strip()
+        elif "arxiv.org/pdf/" in seed.lower():
+            arxiv_id = seed.split("/pdf/", 1)[-1].replace(".pdf", "").strip()
+        if arxiv_id:
+            wid = self._oa_fetch_id(f"doi:10.48550/arXiv.{arxiv_id}")
+            if wid:
+                return wid
+
+        return None
+
+    @classmethod
+    def _oa_fetch_id(cls, id_path: str) -> str | None:
+        """Resolve a single OpenAlex ID-form (e.g. 'doi:10.xxx') to a W-ID via direct path."""
+        import urllib.request
+        url = f"{cls._OPENALEX_BASE}/{id_path}?select=id"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0 (openalex-explore)"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            logger.warning(f"explore_citations: fetch_id {id_path} HTTP {e.code}")
+            return None
+        except Exception as e:
+            logger.warning(f"explore_citations: fetch_id {id_path} failed: {e}")
+            return None
+        wid = ((payload.get("id") or "").split("/")[-1]) if isinstance(payload, dict) else ""
+        return wid if re.match(r"^W\d+$", wid) else None
+
+    def _oa_fetch_work(self, openalex_id: str) -> dict | None:
+        """Fetch a single OpenAlex work by ID."""
+        import urllib.request
+        wid = openalex_id.split("/")[-1]
+        url = f"{self._OPENALEX_BASE}/{wid}?select={self._OPENALEX_SELECT}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0 (openalex-explore)"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as e:
+            logger.warning(f"explore_citations: fetch work {wid} failed: {e}")
+            return None
+
+    def _oa_fetch_forward(self, seed_id: str, limit: int) -> list[dict]:
+        """Fetch papers that cite the seed (forward citations), most-cited first."""
+        import urllib.request
+        import urllib.parse
+        per = max(1, min(int(limit or 5), 10))
+        params = urllib.parse.urlencode({
+            "filter": f"cites:{seed_id}",
+            "sort": "cited_by_count:desc",
+            "per-page": per,
+            "select": self._OPENALEX_SELECT,
+        })
+        url = f"{self._OPENALEX_BASE}?{params}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0 (openalex-explore)"})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as e:
+            logger.warning(f"explore_citations: forward citations for {seed_id} failed: {e}")
+            return []
+        return [w for w in (payload.get("results") or []) if isinstance(w, dict)]
+
+    def _exec_explore_citations(self, seed: str, per_direction: int = 5) -> str:
+        """Walk the OpenAlex citation graph of a seed paper.
+
+        Returns JSON with 'backward' (the seed's references) and 'forward'
+        (papers citing the seed). Extracted from paperseek's
+        OpenAlexProvider.citation_neighbors_with_graph pattern (MIT).
+        """
+        if not seed or not str(seed).strip():
+            return json.dumps({"error": "seed is required"})
+        per = max(1, min(int(per_direction or 5), 10))
+
+        seed_id = self._oa_resolve_seed(str(seed).strip())
+        if not seed_id:
+            return json.dumps({
+                "error": f"Could not resolve seed '{seed}' to an OpenAlex work. Try a DOI or arXiv ID.",
+            })
+
+        # Fetch the seed work itself to get its references + metadata
+        seed_work = self._oa_fetch_work(seed_id)
+        if not seed_work:
+            return json.dumps({"error": f"OpenAlex returned no work for {seed_id}."})
+
+        backward: list[dict] = []
+        refs = seed_work.get("referenced_works") or []
+        for ref_url in refs[:per]:
+            ref_id = ref_url.split("/")[-1]
+            if not re.match(r"^W\d+$", ref_id):
+                continue
+            w = self._oa_fetch_work(ref_id)
+            if w:
+                backward.append(self._oa_work_to_compact(w))
+
+        forward_raw = self._oa_fetch_forward(seed_id, per)
+        forward = [self._oa_work_to_compact(w) for w in forward_raw]
+
+        return json.dumps({
+            "seed": self._oa_work_to_compact(seed_work),
+            "backward": backward,
+            "forward": forward,
+            "counts": {"backward": len(backward), "forward": len(forward)},
+            "source": "openalex",
+        }, ensure_ascii=False, indent=2)
 
 
     def _parse_arxiv_page(self, content: str, paper_id: str) -> dict | None:
