@@ -285,26 +285,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # failed launches. Stops burning quota on a stuck pattern and
                 # requires human intervention to resume.
                 if think_result.get("action") == "pause_human":
-                    logger.error(
-                        f"⛔ PAUSE-HUMAN: {think_result.get('reason', 'no reason given')}"
-                    )
-                    self._update_state({
-                        "cycle": self.cycle_count,
-                        "status": "pause_human",
-                        "updated_at": time.time(),
-                        "pause_reason": think_result.get("reason", ""),
-                        "suggested_next_step": (
-                            "Inspect the agent's recent cycles to understand why "
-                            "launch_experiment is never called. Common causes: "
-                            "(1) the code agent's turn budget is exhausted by "
-                            "exploration, (2) the training script has an error "
-                            "the agent can't fix, (3) a phase gate is blocking "
-                            "training. Resume with a directive after fixing."
-                        ),
-                    })
-                    self.memory.log_decision(
-                        f"PAUSE-HUMAN: {think_result.get('reason', '')}"
-                    )
                     self._running = False
                     break
 
@@ -383,16 +363,8 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
                 # This is triggered when the architecture stagnation threshold is reached.
                 # The agent researches alternative architectures AND starts implementing.
-                # ── GATE PIPELINE (v12.4): ordered priority ──
-                # Gate 1 (PRE-VERIFY):  critical preconditions (synthetic data, missing data, broken imports)
-                # Gate 2 (CODE REVIEW): architectural / code defects
-                # Gate 3 (FALSIFIABILITY): hypothesis quality (soft gate, never blocks)
-                #
-                # A hard-gate (full rewrite of think_result) causes subsequent gates to
-                # skip entirely, preventing one gate from overwriting another's output.
-                _gate_blocked = False  # set to True when any hard-gate fires
-
-                # ── Gate 1: PRE-VERIFY ──
+                # Gate 1: PRE-VERIFY (safety check)
+                _gate_blocked = False
                 pre_verify_report = self._pre_verify(self.cycle_count, think_result)
                 critical_pre_issues = pre_verify_report.critical_failures
                 if critical_pre_issues:
@@ -626,21 +598,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         context["cycle"] = self.cycle_count
         context["workspace_dir"] = str(self.workspace)
 
-        # Session stats from SQLite
-        try:
-            stats = self.memory.get_summary_stats()
-            if stats and stats.get("total_cycles", 0) > 0:
-                context["session_stats"] = stats
-        except Exception:
-            pass
 
-        # Recent failures
-        try:
-            failures = self.memory.get_recent_failures(count=3)
-            if failures:
-                context["recent_failures"] = failures
-        except Exception:
-            pass
 
         # Causal history (what design decisions led to what effects)
         try:
@@ -668,13 +626,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         except Exception:
             pass
 
-        # Code review lessons
-        try:
-            lessons = self.memory.get_code_review_lessons(limit=5)
-            if lessons:
-                context["code_review_lessons"] = self.memory.format_lessons_for_context(lessons)
-        except Exception:
-            pass
 
         # Persistent constraints
         constraints_path = self.project_dir / "PERSISTENT_CONSTRAINTS.md"
@@ -1020,17 +971,28 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Metric-based progress tracking (Fix 1: visual analysis trigger) ──
         final_metrics = execute_result.get("final_metrics") or {}
         current_metric = None
-        # v18 Phase 4: metric keys from config goals, fallback to defaults
-        goal_metrics = self.config.get("goals", {}).get("metrics", [])
-        metric_keys = tuple(g.get("key", "val_MAE") for g in goal_metrics) if goal_metrics else \
-                      ("val_MAE", "val_MAE_overall", "best_val_MAE", "val_mae")
-        for key in metric_keys:
-            if key in final_metrics:
-                try:
-                    current_metric = float(final_metrics[key])
-                except (TypeError, ValueError):
-                    pass
-                break
+        # v18: dynamically extract the best available metric from results
+        # (not hardcoded to val_MAE — supports accuracy, MAE, PSNR, etc.)
+        if final_metrics:
+            # Try config-defined keys first, then any *_MAE, then any numeric value
+            config_keys = [g.get("key") for g in self.config.get("goals", {}).get("metrics", [])]
+            search_keys = config_keys + ["val_MAE", "val_mae", "accuracy", "acc", "PSNR", "psnr"]
+            for key in search_keys:
+                if key in final_metrics:
+                    try:
+                        current_metric = float(final_metrics[key])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            # Fallback: take first numeric value
+            if current_metric is None:
+                for key, val in final_metrics.items():
+                    try:
+                        current_metric = float(val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        metric_keys = ()  # no longer used
         # System deterministically writes a quantitative result line to
         # MEMORY_LOG.md. Previously, quantitative results (val_MAE=0.184)
         # only existed in SQLite but never reached MEMORY_LOG (the LLM's
@@ -1067,12 +1029,13 @@ class ResearchLoop(DomainKnowledgeMixin):
                     break
 
         if current_metric is not None:
-            method = ""  # method extraction removed
+            method = ""
             status = "success" if made_progress else "inconclusive"
+            metric_key_used = key if 'key' in dir() and key else "metric"
             try:
                 self.memory.log_structured_result(
                     cycle=self.cycle_count,
-                    metric_key="val_MAE",
+                    metric_key=metric_key_used,
                     metric_value=current_metric,
                     method=method,
                     status=status,
