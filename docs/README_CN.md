@@ -30,13 +30,25 @@ python -m core.loop --project /path/to/your/project --max-cycles 10
 ## 架构
 
 ```
-THINK → EXECUTE → VERIFY → REFLECT → 循环（直到达成目标或达到最大周期数）
+THINK → EXECUTE → VERIFY → REFLECT → 循环
 
-记忆系统（SQLite + MEMORY_LOG）  ← 结构化实验记录
-工具层（自带安全约束）            ← write_file, launch_experiment, GC, analyze_model
+LLM（Leader）基于以下信息做决策：
+  - PROJECT_BRIEF.md（研究目标）
+  - MEMORY_LOG.md（实验历史）
+  - query_memory 工具（因果链、死胡同、最佳指标）
+  - 域知识（方法属性、数据约束）
+
+系统提供：
+  - 自带安全约束的工具层（命名、死胡同检查、GC）
+  - 12 层 VERIFY（客观结果验证）
+  - Provider 故障转移（GLM → Qwen），配额感知冷却
+  - 结构化记忆（定量结果确定性写入）
 ```
 
-**设计原则：系统 = 硬约束。指引 = 方法论。LLM = 博士生大脑。**
+**设计原则：**
+- 系统 = 硬约束（安全、生命周期、工具、记忆）
+- 指引 = 研究方法论（怎么思考，不是做什么）
+- LLM = 博士生大脑（设计、实现、判断、迭代）
 
 详见 [architecture.md](architecture.md)。
 
@@ -44,11 +56,20 @@ THINK → EXECUTE → VERIFY → REFLECT → 循环（直到达成目标或达�
 
 ## 核心特性
 
-- Provider 故障转移（GLM → Qwen），配额感知冷却
-- 反欺骗工具痕迹验证
-- 确定性垃圾回收（不消耗 LLM 配额）
-- 工具层命名规范强制
-- 99 个自动化测试
+- **query_memory 工具**：LLM 主动查询实验历史
+- **Provider 故障转移**：GLM → Qwen，配额感知冷却
+- **反欺骗**：基于工具痕迹的验证（LLM 无法伪造结果）
+- **确定性 GC**：不消耗配额，每周期归档临时文件
+- **工具层安全**：命名规范、死胡同检查、dry-run 门控
+- **99 个自动化测试**
+
+---
+
+## 配置
+
+见 [config.yaml](../config.yaml)。
+
+---
 
 ## 许可证
 
