@@ -23,15 +23,11 @@ from typing import Optional
 from .memory import MemoryManager
 from .monitor import ExperimentMonitor
 from .agents import AgentDispatcher
-from .obsidian import ObsidianExporter
 from .tools import ToolRegistry
 from .verifier import ExperimentVerifier, VerifyCheck
 from .visual_analyzer import VisualAnalyzer
 from .domain_knowledge import DomainKnowledgeMixin
-from .constraint_engine import (
-    StrategyConstraintEngine,
-    ContextPruner,
-)
+from .constraint_engine import ContextPruner
 from .simulation_sandbox import SimulationSandbox
 
 logger = logging.getLogger("autoresearcher")
@@ -88,7 +84,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             max_steps=agent_config.get("max_steps_per_cycle", 3),
             tools=self.tools,
         )
-        self.obsidian = ObsidianExporter(config=config, project_dir=self.project_dir)
 
         # VERIFY phase: module-level result verification
         # v16.1: Use hardcoded thresholds (AdaptiveThresholds removed)
@@ -161,9 +156,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         from .garbage_collector import GarbageCollector
         self._gc = GarbageCollector(self.project_dir)
 
-        # ── Constraint Engine (v10 → v16.1): LLM behavior control ──
-        # v16.1: Removed PlannerChecker, QuickBenchmark, AdaptiveThresholds, ImplementationTracker
-        self.strategy_engine = StrategyConstraintEngine(self.project_dir, self.workspace)
+        # Context pruning: keeps prompts bounded per phase
         self.context_pruner = ContextPruner()
 
         # ── Simulation Sandbox (v11): Model evaluation engine ──
@@ -312,7 +305,7 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                     # VERIFY: Check paper research produced useful output
                     verify_report = self._verify(self.cycle_count, think_result, execute_result)
-                    execute_result["verify_report"] = verify_report.to_dict()
+                    execute_result["verify_summary"] = self._verify_summary(verify_report)
 
                     # REFLECT on research findings (no training to monitor)
                     reflect_result = self._reflect(execute_result, verify_report=verify_report)
@@ -385,7 +378,7 @@ class ResearchLoop(DomainKnowledgeMixin):
 
                 # VERIFY: Reverse-engineer whether each module actually worked
                 verify_report = self._verify(self.cycle_count, think_result, execute_result)
-                execute_result["verify_report"] = verify_report.to_dict()
+                execute_result["verify_summary"] = self._verify_summary(verify_report)
 
                 # VISUAL ANALYSIS: When METRICS stop improving for N consecutive cycles
                 # (OR when experiments keep failing to launch), run inference → multimodal
@@ -804,6 +797,25 @@ class ResearchLoop(DomainKnowledgeMixin):
                 return f"models/{files[0].name}"
         return ""
 
+    def _verify_summary(self, report) -> dict:
+        """Compact VERIFY summary for context injection (P2: summary, not full report).
+
+        The full 30+ check report is too large to inject. We inject only:
+        - counts (passed/failed/warned)
+        - critical failure details (the actionable signal)
+        - top 3 diagnosis strings (if any)
+        The complete report stays on the VerifyReport object for logging.
+        """
+        if not report:
+            return {}
+        return {
+            "passed": sum(1 for c in report.checks if c.status == "pass"),
+            "failed": sum(1 for c in report.checks if c.status == "fail"),
+            "warned": sum(1 for c in report.checks if c.status == "warn"),
+            "critical_failures": [c.detail[:120] for c in report.critical_failures],
+            "top_diagnoses": report.diagnosis[:3] if report.diagnosis else [],
+        }
+
     def _reflect(self, execute_result: dict, verify_report) -> dict:
         """REFLECT phase: Leader evaluates results and records learnings."""
         context = {}
@@ -813,9 +825,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         context["workspace_dir"] = str(self.workspace)
         context["experiment_result"] = execute_result
 
-        # VERIFY report
+        # VERIFY report — inject summary only (full report is too large for context)
         if verify_report:
-            context["verify_report"] = verify_report.to_dict()
             if verify_report.diagnosis:
                 context["verify_diagnosis"] = verify_report.diagnosis
             if verify_report.failed_modules:

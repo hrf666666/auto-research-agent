@@ -128,7 +128,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 self._tool_list_files,
                 self._tool_analyze_model,
                 self._tool_probe_model,
-                self._tool_generate_diagnostic,
                 self._tool_design_ablation,
                 self._tool_code_review,
             ],
@@ -175,7 +174,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "diagnose_error": self._exec_diagnose_error,
             "analyze_model": self._exec_analyze_model,
             "probe_model": self._exec_probe_model,
-            "generate_diagnostic": self._exec_generate_diagnostic,
             "design_ablation": self._exec_design_ablation,            "code_review": self._exec_code_review,
         }
 
@@ -440,15 +438,10 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 "how information flows from input to output through each module, (3) information "
                 "bottleneck detection — where channels compress too aggressively, (4) gradient "
                 "path analysis — whether all branches receive meaningful gradients, (5) structural "
-                "soundness checks — redundant/dominant/dead branches, (6) domain assumption analysis — "
-                "what physical assumptions the architecture makes, (7) GPU memory & data feasibility, "
-                "(8) result-to-architecture diagnosis (if training_results provided), "
-                "(9) IDEA-ARCHITECTURE ALIGNMENT — compares model structure against PROJECT_BRIEF.md "
-                "to verify the core research idea is faithfully implemented. Checks: per-branch channel "
-                "allocation vs idea importance, missing architectural patterns implied by the idea, "
-                "decoder adequacy, and provides an alignment score (0-10) with specific improvement suggestions. "
-                "Use BEFORE training to catch design flaws, or AFTER training to diagnose WHY a model failed. "
-                "MANDATORY after creating or significantly modifying a model architecture."
+                "soundness checks — redundant/dominant/dead branches, (6) GPU memory & data feasibility. "
+                "Returns deterministic architectural facts. The LLM uses these to judge whether the "
+                "architecture is sound — the system does not score or diagnose. "
+                "Use BEFORE training to catch design flaws."
             ),
             "input_schema": {
                 "type": "object",
@@ -464,12 +457,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     "target_size": {
                         "type": "string",
                         "description": "Target spatial size for GPU memory estimate (default: '256x256')",
-                    },
-                    "training_results": {
-                        "type": "string",
-                        "description": "Optional JSON string of training results (metrics) to enable result-to-architecture diagnosis",
-                    },
-                },
+                    },                },
                 "required": ["model_path"],
             },
         }
@@ -510,46 +498,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     },
                 },
                 "required": ["model_path", "model_class"],
-            },
-        }
-
-    @property
-    def _tool_generate_diagnostic(self) -> dict:
-        return {
-            "name": "generate_diagnostic",
-            "description": (
-                "Generate a domain-specific or hypothesis-specific diagnostic script. "
-                "Unlike probe_model (which uses random data), this generates a script "
-                "that tests specific questions about the data/model:\n"
-                "- 'Is a specific branch producing distinct features per domain?'\n"
-                "- 'Does the model produce different outputs for different inputs?'\n"
-                "Returns the generated script path and a summary of what it tests."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "The specific question to answer (e.g., 'Is branch X dead for domain Y?')",
-                    },
-                    "model_path": {
-                        "type": "string",
-                        "description": "Path to the model Python file",
-                    },
-                    "model_class": {
-                        "type": "string",
-                        "description": "Name of the model class",
-                    },
-                    "data_path": {
-                        "type": "string",
-                        "description": "Path to real validation data (optional, uses random data if omitted)",
-                    },
-                    "checkpoint_path": {
-                        "type": "string",
-                        "description": "Path to trained model checkpoint (optional)",
-                    },
-                },
-                "required": ["question", "model_path", "model_class"],
             },
         }
 
@@ -1725,17 +1673,18 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
 
     def _exec_analyze_model(self, model_path: str, dataset_manifest: str = "DATASET_MANIFEST.json",
                            target_size: str = "256x256", training_results: str = "") -> str:
-        """Deep model architecture analysis: data flow, bottlenecks, gradient paths, structural soundness.
+        """Deep model architecture analysis: extracts deterministic facts.
 
-        This tool performs multi-layer analysis of a model's Python source:
-        Layer 1: Surface analysis — parameter counts, channel ratios (legacy)
+        Fact-extraction layers (the system provides facts, the LLM judges):
+        Layer 1: Surface analysis — parameter counts, channel ratios
         Layer 2: Data flow graph — how information flows input → output through modules
         Layer 3: Information bottleneck detection — where channels compress too aggressively
         Layer 4: Gradient path analysis — whether all branches receive meaningful gradients
         Layer 5: Structural soundness — redundant/dominant/dead branches
-        Layer 6: Domain assumption analysis — physical assumptions the architecture encodes
-        Layer 7: Data feasibility + GPU memory estimate
-        Layer 8: Result-to-architecture diagnosis (if training_results provided)
+        Layer 6: Data feasibility + GPU memory estimate
+
+        training_results param is accepted for backward compat but ignored
+        (value-judgment diagnosis was removed per P3 — LLM does this).
         """
         try:
             abs_path = self._resolve_workspace_path(model_path)
@@ -1765,11 +1714,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             structural = self._analyze_structural_soundness(tree, data_flow, bottlenecks)
             analysis["structural_soundness"] = structural
 
-            # Layer 6: Domain assumption analysis
-            domain_assumptions = self._analyze_domain_assumptions(content, analysis)
-            analysis["domain_assumptions"] = domain_assumptions
-
-            # Layer 7: Data feasibility + GPU memory
+            # Layer 6: Data feasibility + GPU memory
             manifest_path = self.workspace / dataset_manifest
             if manifest_path.exists():
                 analysis["data_feasibility"] = self._analyze_data_feasibility(manifest_path, analysis)
@@ -1777,20 +1722,9 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             h, w = self._parse_target_size(target_size)
             analysis["gpu_estimate"] = self._estimate_gpu_memory(analysis, h, w)
 
-            # Layer 8: Result-to-architecture diagnosis
-            if training_results:
-                try:
-                    results_data = json.loads(training_results) if isinstance(training_results, str) else {}
-                    analysis["result_diagnosis"] = self._diagnose_results_vs_architecture(
-                        results_data, analysis, content
-                    )
-                except (json.JSONDecodeError, TypeError):
-                    analysis["result_diagnosis"] = {"error": "Could not parse training_results JSON"}
-
-            # Layer 9: Idea-Architecture alignment analysis
-            idea_alignment = self._analyze_idea_architecture_alignment(analysis, content)
-            if idea_alignment:
-                analysis["idea_architecture_alignment"] = idea_alignment
+            # Value judgments (idea alignment, domain assumptions, result diagnosis)
+            # were here in v18 — removed in v20 per P3: the LLM does value
+            # judgments, the system provides facts only.
 
             return json.dumps(analysis, ensure_ascii=False, indent=2)
 
@@ -1800,15 +1734,12 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
 
 
     # Model analysis methods inherited from ModelAnalyzerMixin (see model_analyzer.py)
-    # Includes: _analyze_model_ast, _extract_branch_info, _extract_channels_from_*,
-    # _estimate_params_from_ast, _parse_target_size, _estimate_gpu_memory,
-    # _analyze_data_feasibility, _analyze_data_flow, _get_call_name,
-    # _trace_forward_flow, _extract_cat_sources, _extract_var_name,
-    # _detect_information_bottlenecks, _get_constant_value, _analyze_gradient_paths,
-    # _analyze_structural_soundness, _analyze_domain_assumptions,
-    # _diagnose_results_vs_architecture, _analyze_idea_architecture_alignment,
-    # _analyze_decoder_adequacy, _exec_probe_model, _build_probe_script,
-    # _exec_generate_diagnostic, _build_diagnostic_script, _exec_design_ablation
+    # Fact extraction only: _analyze_model_ast, _extract_branch_info,
+    # _extract_channels_from_*, _parse_target_size, _estimate_gpu_memory,
+    # _analyze_data_feasibility, _analyze_data_flow, _trace_forward_flow,
+    # _detect_information_bottlenecks, _analyze_gradient_paths,
+    # _analyze_structural_soundness, _exec_probe_model, _build_probe_script,
+    # _exec_design_ablation
 
     # ─────────────────────────────────────────────────
     # Code Review Tool (Knowledge-Base Enhanced)

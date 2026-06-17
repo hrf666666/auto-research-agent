@@ -455,9 +455,9 @@ class AgentDispatcher:
     # Lock guarding _provider_health (R3: class-level dict mutated without sync)
     _provider_health_lock = __import__("threading").Lock()
 
-    def __init__(self, model: str = "claude-sonnet-4-6", provider: str = "anthropic", max_steps: int = 3, tools=None):
+    def __init__(self, model: str = "auto", provider: str = "glm_token_plan", max_steps: int = 3, tools=None):
         self.model = model
-        self.provider = provider  # "anthropic", "openai", "qwen", "ali_token_plan", "glm_token_plan"
+        self.provider = provider  # "glm_token_plan", "ali_token_plan", "openai", "qwen"
         self.max_steps = max_steps
         self._leader_history = []
         self.tools = tools  # ToolRegistry instance for executing tools
@@ -733,9 +733,7 @@ class AgentDispatcher:
         else:
             logger.error(f"All token_plan providers failed. Last error: {last_error}")
 
-        if self.provider == "anthropic":
-            text = self._call_anthropic(system, messages, tools, max_turns, trace, task_tier=task_tier)
-        elif self.provider == "openai":
+        if self.provider == "openai":
             # OPENAI_API_KEY resolved here — _call_openai_compatible now raises
             # on missing api_key (B2 rework), so we must supply a real key.
             _openai_key = os.environ.get("OPENAI_API_KEY")
@@ -1441,127 +1439,6 @@ class AgentDispatcher:
             logger.error(f"{provider_label} API call failed: {e}")
             # Re-raise so _call_llm can try failover
             raise
-
-    # ─────────────────────────────────────────────────
-    # Anthropic provider (different protocol)
-    # ─────────────────────────────────────────────────
-
-    def _call_anthropic(self, system: str, messages: list, tools: list = None, max_turns: int = 10, trace: ToolTrace = None, task_tier: str = None) -> str:
-        """Call Anthropic Claude API with tool execution support."""
-        # Use the shared class-level token map (B5 fix: previously this was a
-        # local copy where 'code' was only 8192 vs 16384 elsewhere, causing
-        # disproportionate write_file truncation on Claude).
-        effective_max_tokens = self._MAX_TOKENS_MAP.get(task_tier, self._MAX_TOKENS_DEFAULT)
-
-        logger.info(f"Calling Anthropic Claude API: model={self.model}, messages={len(messages)}, tools={bool(tools)}")
-        try:
-            import anthropic
-
-            # R8 fix: explicit timeout/retries to match the OpenAI-compatible
-            # path. The SDK defaults (600s timeout, 2 retries) would block a
-            # whole cycle for 10+ minutes on a hung Claude call with no
-            # failover. Anthropic path has no provider-level failover, so a
-            # bounded timeout is the only protection against indefinite hangs.
-            client = anthropic.Anthropic(timeout=120.0, max_retries=1)
-
-            api_messages = []
-            for msg in messages:
-                api_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"],
-                })
-
-            kwargs = {
-                "model": self.model,
-                "max_tokens": effective_max_tokens,
-                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                "messages": api_messages,
-            }
-
-            if tools:
-                kwargs["tools"] = [{"name": t["name"], "description": t.get("description", ""), "input_schema": t.get("input_schema", {"type": "object", "properties": {}})} for t in tools]
-                tool_map = {t["name"]: t for t in tools}
-
-                for turn in range(max_turns):
-                    response = client.messages.create(**kwargs)
-                    content = response.content
-
-                    # Check if ANY block is tool_use (not just the first one)
-                    has_tool_use = any(
-                        hasattr(block, "type") and block.type == "tool_use"
-                        for block in (content or [])
-                    )
-
-                    if not has_tool_use:
-                        # No tool calls — extract text from content blocks
-                        text_parts = [
-                            block.text for block in (content or [])
-                            if hasattr(block, "type") and block.type == "text"
-                        ]
-                        return "\n".join(text_parts) if text_parts else ""
-
-                    # Has tool_use: the Anthropic Messages API requires every
-                    # tool_result user message to be preceded by the matching
-                    # assistant tool_use turn. Append the assistant turn FIRST
-                    # (right after receiving it), then append tool_result
-                    # messages. This keeps ordering naturally correct without
-                    # any peel-off/re-insert gymnastics. Serialize SDK blocks
-                    # to plain dicts so they round-trip through the next request.
-                    assistant_blocks = []
-                    for block in content:
-                        if hasattr(block, "type") and block.type == "text":
-                            assistant_blocks.append({"type": "text", "text": block.text})
-                        elif hasattr(block, "type") and block.type == "tool_use":
-                            assistant_blocks.append({
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": block.input,
-                            })
-                    api_messages.append({"role": "assistant", "content": assistant_blocks})
-
-                    # Now execute each tool_use and append tool_result messages
-                    for block in content:
-                        if not (hasattr(block, "type") and block.type == "tool_use"):
-                            continue
-                        func_name = block.name
-                        func_args = block.input
-                        logger.info(f"Executing tool: {func_name}")
-
-                        if func_name in tool_map:
-                            tool_result = self._execute_tool_with_trace(func_name, func_args, trace)
-                            result_content = str(tool_result)[:8000]
-                        else:
-                            result_content = json.dumps({"error": f"Unknown tool: {func_name}"})
-                        api_messages.append({"role": "user", "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_content,
-                        }]})
-
-                    continue
-
-                # Max turns reached — find last assistant text
-                return self._find_last_assistant_text(api_messages, "Max turns reached")
-            else:
-                response = client.messages.create(**kwargs)
-                # No-tools path: extract text from content blocks (handles
-                # thinking blocks gracefully by only joining text blocks).
-                text_parts = [
-                    block.text for block in (response.content or [])
-                    if hasattr(block, "type") and block.type == "text"
-                ]
-                return "\n".join(text_parts) if text_parts else ""
-
-        except ImportError:
-            # R7 fix: previously fell back to _call_openai_compatible with
-            # api_key=None, which returned an error JSON that downstream code
-            # mistook for a valid leader response (B2 chain). Raise so the
-            # caller sees a real, actionable error.
-            raise RuntimeError(
-                "anthropic package not installed but provider='anthropic'. "
-                "Install with: pip install anthropic"
-            )
 
     # ─────────────────────────────────────────────────
     # Helpers

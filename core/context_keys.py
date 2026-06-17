@@ -149,7 +149,7 @@ THINK_KEYS = [
     ContextKey("relevant_code_review_lessons", "think", "Targeted lessons for current task",
                serializer=_text_section("Relevant Lessons", 1500), tier=2),
 
-    # ── Domain knowledge (tier 2) — PREVIOUSLY DROPPED, now serialized ──
+    # ── Domain knowledge (tier 2) ──
     ContextKey("domain_knowledge", "think",
                "Method-property mappings, domain compatibility, method assumptions",
                serializer=_text_section("Domain Knowledge", 2500), tier=2),
@@ -159,9 +159,7 @@ THINK_KEYS = [
                "Meta-patterns: dominant methods, hypothesis accuracy, calibration",
                serializer=_text_section("Cross-Experiment Insights", 2000), tier=2),
 
-    # ── Architecture planning (tier 2) — PREVIOUSLY DROPPED ──, tier=2),, tier=2),
-
-    # ── Experiment intelligence (tier 2) — PREVIOUSLY DROPPED ──
+    # ── Experiment intelligence (tier 2) ──
     ContextKey("pareto_frontier", "think", "Pareto-optimal methods per domain",
                serializer=_text_section("Pareto Frontier", 1500), tier=2),
     ContextKey("causal_history", "think", "Past design decisions with verified effects",
@@ -172,9 +170,7 @@ THINK_KEYS = [
                "Previously assessed low-value directions (VOI < 0.01)",
                serializer=_text_section("Low-Value Directions (avoid)", 600), tier=3),
 
-    # ── Research roadmap (tier 2) — PREVIOUSLY DROPPED ──
-
-    # ── Direction control (tier 3) — PREVIOUSLY DROPPED ──
+    # ── Direction control (tier 3) ──
     ContextKey("data_scarcity_warning", "think", "Warning when < 10 training samples",
                serializer=_text_section("Data Scarcity Warning", 500), tier=3),
     ContextKey("method_inadequacy_retry_prompt", "think", "Retry guidance for inadequate methods",
@@ -207,7 +203,6 @@ REFLECT_KEYS = [
     # ── Experiment result + VERIFY (tier 1) ──
     ContextKey("experiment_result", "reflect", "Full execute_result dict",
                serializer=_json_section("Experiment Result", 4000), tier=1),
-    # NOTE: injection side uses "experiment_evaluation" — also register it, tier=2),
     ContextKey("verify_diagnosis", "reflect", "List of VERIFY diagnosis strings",
                serializer=_list_section("VERIFY Report — Module Diagnosis", 8), tier=1),
     ContextKey("verify_failed_modules", "reflect", "Modules that failed VERIFY",
@@ -221,10 +216,6 @@ REFLECT_KEYS = [
     ContextKey("fabrication_details", "reflect", "List of fabrication evidence",
                serializer=_list_section("Fabrication Evidence", 5), tier=2),
 
-    # ── Training analysis (tier 2) — PREVIOUSLY DROPPED ──
-
-    # ── Evaluation (tier 2) — PREVIOUSLY DROPPED ──, tier=2),, tier=2),
-
     # ── Visual analysis (tier 2) ──
     ContextKey("visual_analysis", "reflect", "VisualAnalysisResult dict (when triggered)",
                serializer=_serialize_visual_analysis, tier=2),
@@ -233,9 +224,6 @@ REFLECT_KEYS = [
     ContextKey("visual_analysis_actions", "reflect", "Recommended actions from visual analysis",
                serializer=_list_section("Recommended Actions (Visual)", 5, prefix="1."), tier=2),
 
-    # ── Domain/quality prompts (tier 3) — PREVIOUSLY DROPPED ──, tier=3),, tier=3),, tier=3),, tier=3),, tier=3),
-
-    # ── Dataset quality (tier 3) ──, tier=3),, tier=3),, tier=3),, tier=3),
 ]
 
 
