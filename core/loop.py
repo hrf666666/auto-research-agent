@@ -483,7 +483,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # REFLECT: Evaluate and update (now with VERIFY diagnosis)
                 reflect_result = self._reflect(
                     execute_result, verify_report=verify_report,
-                    visual_analysis_result=visual_analysis_result,
                 )
                 self._update_state(
                     {
