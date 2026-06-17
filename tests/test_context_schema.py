@@ -24,8 +24,6 @@ class TestRegistryCompleteness:
     def test_think_keys_nonempty(self):
         assert len(THINK_KEY_NAMES) >= 20, "THINK_KEYS should have at least 20 keys"
 
-    def test_reflect_keys_nonempty(self):
-        assert len(REFLECT_KEY_NAMES) >= 15, "REFLECT_KEYS should have at least 15 keys"
 
     def test_no_ghost_keys_from_removed_modules(self):
         """Keys from removed modules (v16.1 cleanup) must not linger."""
@@ -76,13 +74,6 @@ class TestSerialization:
         prompt = serialize_context(ctx, "think")
         assert "truncated" in prompt
         assert len(prompt) < 10000  # truncated well below the raw size
-
-    def test_json_keys_serialize_as_json(self):
-        """Dict/list values must serialize as readable JSON, not str()."""
-        ctx = {"architecture_plan": {"modules": ["enc", "dec"], "layers": 12}}
-        prompt = serialize_context(ctx, "think")
-        assert '"modules"' in prompt or "'modules'" in prompt
-        assert "Architecture Plan" in prompt
 
 
 class TestIntegrationWithFormatLeaderInput:

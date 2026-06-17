@@ -159,11 +159,7 @@ THINK_KEYS = [
                "Meta-patterns: dominant methods, hypothesis accuracy, calibration",
                serializer=_text_section("Cross-Experiment Insights", 2000), tier=2),
 
-    # ── Architecture planning (tier 2) — PREVIOUSLY DROPPED ──
-    ContextKey("architecture_plan", "think", "Full IdeaPlanner plan dict",
-               serializer=_json_section("Architecture Plan", 2000), tier=2),
-    ContextKey("architecture_plan_summary", "think", "One-line plan summary",
-               serializer=_text_section("Architecture Plan Summary", 500), tier=2),
+    # ── Architecture planning (tier 2) — PREVIOUSLY DROPPED ──, tier=2),, tier=2),
 
     # ── Experiment intelligence (tier 2) — PREVIOUSLY DROPPED ──
     ContextKey("pareto_frontier", "think", "Pareto-optimal methods per domain",
@@ -211,9 +207,7 @@ REFLECT_KEYS = [
     # ── Experiment result + VERIFY (tier 1) ──
     ContextKey("experiment_result", "reflect", "Full execute_result dict",
                serializer=_json_section("Experiment Result", 4000), tier=1),
-    # NOTE: injection side uses "experiment_evaluation" — also register it
-    ContextKey("experiment_evaluation", "reflect", "ExperimentEvaluator output",
-               serializer=_json_section("Experiment Evaluation", 3000), tier=2),
+    # NOTE: injection side uses "experiment_evaluation" — also register it, tier=2),
     ContextKey("verify_diagnosis", "reflect", "List of VERIFY diagnosis strings",
                serializer=_list_section("VERIFY Report — Module Diagnosis", 8), tier=1),
     ContextKey("verify_failed_modules", "reflect", "Modules that failed VERIFY",
@@ -229,11 +223,7 @@ REFLECT_KEYS = [
 
     # ── Training analysis (tier 2) — PREVIOUSLY DROPPED ──
 
-    # ── Evaluation (tier 2) — PREVIOUSLY DROPPED ──
-    ContextKey("iteration_guidance_prompt", "reflect", "Priority-sorted next steps",
-               serializer=_text_section("Iteration Guidance", 1500), tier=2),
-    ContextKey("sandbox_evaluation", "reflect", "Sandbox evaluation: feasibility, design, verdict",
-               serializer=_text_section("Sandbox Evaluation", 2000), tier=2),
+    # ── Evaluation (tier 2) — PREVIOUSLY DROPPED ──, tier=2),, tier=2),
 
     # ── Visual analysis (tier 2) ──
     ContextKey("visual_analysis", "reflect", "VisualAnalysisResult dict (when triggered)",
@@ -243,28 +233,9 @@ REFLECT_KEYS = [
     ContextKey("visual_analysis_actions", "reflect", "Recommended actions from visual analysis",
                serializer=_list_section("Recommended Actions (Visual)", 5, prefix="1."), tier=2),
 
-    # ── Domain/quality prompts (tier 3) — PREVIOUSLY DROPPED ──
-    ContextKey("domain_analysis_prompt", "reflect", "Cross-domain metric comparison",
-               serializer=_text_section("Domain Analysis", 1500), tier=3),
-    ContextKey("architecture_feedback_prompt", "reflect", "Result-to-architecture feedback",
-               serializer=_text_section("Architecture Feedback", 1000), tier=3),
-    ContextKey("hypothesis_validation_prompt", "reflect", "Forced hypothesis validation",
-               serializer=_text_section("Hypothesis Validation", 1000), tier=3),
-    ContextKey("training_architecture_reflection_prompt", "reflect",
-               "Training architecture reflection",
-               serializer=_text_section("Training Architecture Reflection", 1000), tier=3),
-    ContextKey("analysis_reflection_prompt", "reflect", "Analysis reflection guidance",
-               serializer=_text_section("Analysis Reflection", 1000), tier=3),
+    # ── Domain/quality prompts (tier 3) — PREVIOUSLY DROPPED ──, tier=3),, tier=3),, tier=3),, tier=3),, tier=3),
 
-    # ── Dataset quality (tier 3) ──
-    ContextKey("dataset_quality_issues", "reflect", "Dataset quality issue strings",
-               serializer=_list_section("Dataset Quality Issues", 5), tier=3),
-    ContextKey("dataset_quality_prompt", "reflect", "Mandatory dataset reliability guidance",
-               serializer=_text_section("Dataset Quality Guidance", 1000), tier=3),
-    ContextKey("independent_assessment_warning", "reflect", "Third-party probe anomaly warning",
-               serializer=_text_section("Independent Assessment Warning", 500), tier=3),
-    ContextKey("method_inadequacy_history", "reflect", "Method inadequacy history",
-               serializer=_text_section("Method Inadequacy History", 1000), tier=3),
+    # ── Dataset quality (tier 3) ──, tier=3),, tier=3),, tier=3),, tier=3),
 ]
 
 

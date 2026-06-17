@@ -169,10 +169,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── Simulation Sandbox (v11): Model evaluation engine ──
         self.sandbox = SimulationSandbox(self.project_dir, self.workspace, config=config)
 
-        # ── Research Roadmap (v15): Structured research methodology ──
-        from .research_roadmap import ResearchRoadmap
-        self.roadmap = ResearchRoadmap(self.workspace)
-        self._roadmap_initialized = False  # Set True after first generate_from_brief()    # Consecutive phase violations in THINK
+        # ── Research Roadmap (v15): Structured research methodology ──  # Set True after first generate_from_brief()    # Consecutive phase violations in THINK
 
         # Graceful shutdown
         try:
@@ -882,16 +879,6 @@ class ResearchLoop(DomainKnowledgeMixin):
             )
         except Exception as e:
             logger.warning(f"Failed to record cycle outcome to SQLite: {e}")
-
-        # ── ROADMAP UPDATE (v15): Feed cycle outcome back to roadmap ──
-        try:
-            self.roadmap.update_from_cycle_outcome(
-                think_result=think_result,
-                reflect_result=reflect_result,
-                cycle=self.cycle_count,
-            )
-        except Exception as e:
-            logger.debug(f"ROADMAP update from cycle outcome skipped: {e}")
 
         if think_result.get("action") == "paper_research":
             # Paper research is always considered progress — it generates new knowledge

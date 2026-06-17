@@ -19,7 +19,6 @@ from typing import Optional
 
 from .mcp_client import MCPClientMixin
 from .model_analyzer import ModelAnalyzerMixin
-from .idea_planner import IdeaPlanner
 
 logger = logging.getLogger("autoresearcher.tools")
 
@@ -130,7 +129,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 self._tool_probe_model,
                 self._tool_generate_diagnostic,
                 self._tool_design_ablation,
-                self._tool_plan_model,
                 self._tool_code_review,
             ],
             "writing": [self._tool_write_file, self._tool_read_file, self._tool_list_files],
@@ -176,9 +174,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "analyze_model": self._exec_analyze_model,
             "probe_model": self._exec_probe_model,
             "generate_diagnostic": self._exec_generate_diagnostic,
-            "design_ablation": self._exec_design_ablation,
-            "plan_model": self._exec_plan_model,
-            "code_review": self._exec_code_review,
+            "design_ablation": self._exec_design_ablation,            "code_review": self._exec_code_review,
         }
 
         handler = handlers.get(name)
@@ -573,76 +569,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         }
 
     # --- Tool Implementations ---
-
-    @property
-    def _tool_plan_model(self) -> dict:
-        return {
-            "name": "plan_model",
-            "description": (
-                "Generate a PhD-level model architecture plan from the research idea (PROJECT_BRIEF). "
-                "This performs FORWARD DESIGN — analyzing the idea BEFORE any code is written. "
-                "The plan includes:\n"
-                "1. Idea Formalization — hypothesis, innovations, assumptions, success criteria\n"
-                "2. Module Decomposition — what modules are needed and why\n"
-                "3. Capacity Planning — channel counts, parameter budgets per module\n"
-                "4. Fusion Strategy — optimal method for combining modules (attention, concat, gated, etc.)\n"
-                "5. Integration Plan — data flow, skip connections, normalization\n"
-                "6. Verification Plan — what to check at each implementation stage\n"
-                "7. Risk Assessment — data scarcity, branch imbalance, overfitting risks\n"
-                "8. Implementation Order — which module to build first\n"
-                "9. Alignment Score (0-10) — how well the plan matches the idea\n"
-                "Use BEFORE creating any model architecture. This is the 'design before coding' step."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "brief_text": {
-                        "type": "string",
-                        "description": "Optional: PROJECT_BRIEF text to plan from. If omitted, reads from PROJECT_BRIEF.md.",
-                    },
-                    "existing_model_path": {
-                        "type": "string",
-                        "description": "Optional: path to existing model for incremental planning.",
-                    },
-                },
-            },
-        }
-
-    def _exec_plan_model(self, brief_text: str = None, existing_model_path: str = None) -> str:
-        """Execute plan_model: generate architecture plan from idea."""
-        try:
-            planner = IdeaPlanner(self.workspace)
-
-            # Optionally read existing model for incremental design
-            model_src = None
-            if existing_model_path:
-                model_abs = self._resolve_workspace_path(existing_model_path)
-                if model_abs.exists():
-                    model_src = model_abs.read_text()
-
-            plan = planner.plan(brief_text=brief_text, existing_model_path=existing_model_path)
-
-            if "error" in plan:
-                return json.dumps(plan, ensure_ascii=False, indent=2)
-
-            # If existing model was provided, add comparison
-            if model_src:
-                plan["existing_model_analysis"] = "Existing model provided — compare plan modules against implemented modules"
-
-            return json.dumps({
-                "status": "plan_generated",
-                "plan": plan,
-                "next_steps": [
-                    "1. Review the plan's alignment_score (aim for ≥ 7)",
-                    "2. Follow implementation_order to build modules sequentially",
-                    "3. After each module, run analyze_model to verify",
-                    "4. After complete model, run probe_model for runtime validation",
-                ],
-            }, ensure_ascii=False, indent=2)
-
-        except Exception as e:
-            logger.error(f"plan_model failed: {e}", exc_info=True)
-            return json.dumps({"error": str(e)})
 
     def _resolve_workspace_path(self, path: str) -> Path:
         """Resolve a user-supplied path and keep it inside the workspace.
