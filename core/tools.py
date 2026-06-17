@@ -884,7 +884,24 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     )
                 })
 
-        env = os.environ.copy()
+        # P1: Check dead-end constraints before launching (safety in the tool)
+        if self._memory:
+            try:
+                from .constraint_engine import StrategyConstraintEngine
+                engine = StrategyConstraintEngine.__new__(StrategyConstraintEngine)
+                engine.rules = []
+                engine.generate_rules_from_history(self._memory)
+                violations = engine.check_constraints({"task": command}, self._memory)
+                if engine.has_forbidden_violation(violations):
+                    return json.dumps({
+                        "error": "This approach has been recorded as a dead end (failed 5+ times). "
+                                 "Choose a different approach. Dead-end details: " +
+                                 "; ".join(violations[:3])
+                    })
+            except Exception:
+                pass  # Don't block launch if constraint check fails
+
+                env = os.environ.copy()
         if gpu:
             env["CUDA_VISIBLE_DEVICES"] = gpu
 

@@ -642,15 +642,6 @@ class ResearchLoop(DomainKnowledgeMixin):
 
         result = self.dispatcher.dispatch_leader(task="think", context=context)
 
-        # Constraint check (FORBIDDEN only)
-        try:
-            violations = self.strategy_engine.check_constraints(result, self.memory)
-            if self.strategy_engine.has_forbidden_violation(violations):
-                logger.warning(f"FORBIDDEN constraint violation — redirecting to paper_research")
-                result["action"] = "paper_research"
-                result["task"] = "Constraint violation. Research alternative approaches."
-        except Exception:
-            pass
 
         logger.info(f"THINK result: action={result.get('action', 'unknown')}")
         return result
