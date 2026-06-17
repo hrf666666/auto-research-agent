@@ -36,9 +36,9 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     Fewer tools = fewer tokens in each API call = lower cost.
 
     Literature search fallback chain:
-    - search_papers: MCP web_search_prime → Semantic Scholar API → DuckDuckGo
-    - get_paper: Semantic Scholar API → MCP web_reader (arXiv page parse)
-    - web_search: MCP web_search_prime → DuckDuckGo HTML
+    - search_papers: MCP web search only
+    - get_paper: MCP web_reader only
+    - web_search: MCP web search only
     - web_fetch: MCP web_reader → urllib direct fetch
     """
 
@@ -287,7 +287,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def _tool_search_papers(self) -> dict:
         return {
             "name": "search_papers",
-            "description": "Search for academic papers via Semantic Scholar API.",
+            "description": "Search for academic papers via MCP web search.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -303,7 +303,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def _tool_web_search(self) -> dict:
         return {
             "name": "web_search",
-            "description": "Perform a web search to find papers, project pages, or technical information. Use for retrieving current information that Semantic Scholar may not have.",
+            "description": "Perform a web search to find papers, project pages, or technical information. Use for retrieving current information that MCP may not find.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -348,11 +348,11 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     def _tool_get_paper(self) -> dict:
         return {
             "name": "get_paper",
-            "description": "Fetch details for a specific paper by Semantic Scholar paper ID or arXiv ID. Returns title, abstract, authors, year, citation count, and URL.",
+            "description": "Fetch details for a specific paper by arXiv ID or URL. Returns title, abstract, authors, year, citation count, and URL.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "paper_id": {"type": "string", "description": "Semantic Scholar paper ID (e.g. '649def34f8be52c8b66281af98ae884c09aef38b') or arXiv ID (e.g. 'arXiv:2401.12345')"},
+                    "paper_id": {"type": "string", "description": "arXiv ID (e.g. '649def34f8be52c8b66281af98ae884c09aef38b') or arXiv ID (e.g. 'arXiv:2401.12345')"},
                 },
                 "required": ["paper_id"],
             },
@@ -1042,11 +1042,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         return json.dumps({"files": files[:100]})  # Cap at 100 entries
 
     def _exec_search_papers(self, query: str, limit: int = 10, year: str = None) -> str:
-        """Search for academic papers with fallback chain.
-
-        Fallback chain: MCP web_search_prime → Semantic Scholar API → DuckDuckGo
-        """
-        # ── Level 1: Try MCP web_search_prime first ──
+        """Search for academic papers via MCP."""
         mcp_result = self._mcp_web_search(
             f"{query} academic paper" + (f" {year}" if year else ""),
             max_results=limit,
@@ -1055,212 +1051,29 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             try:
                 parsed = json.loads(mcp_result)
                 if parsed.get("results") and len(parsed["results"]) > 0:
-                    # Validate: each result must have a title
                     valid = [r for r in parsed["results"] if r.get("title")]
                     if valid:
                         parsed["results"] = valid[:limit]
-                        parsed["source"] = "mcp_web_search_prime"
+                        parsed["source"] = "mcp"
                         return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, TypeError):
                 pass
-            logger.info("search_papers: MCP result invalid, falling back")
+        return json.dumps({"error": "MCP search returned no results."})
 
-        # ── Level 2: Try Semantic Scholar API ──
-        ss_result = self._search_papers_semantic_scholar(query, limit, year)
-        if ss_result:
-            try:
-                parsed = json.loads(ss_result)
-                if parsed.get("papers") and len(parsed["papers"]) > 0:
-                    # Validate: each paper must have at least a title
-                    valid = [p for p in parsed["papers"] if p.get("title")]
-                    if valid:
-                        parsed["papers"] = valid[:limit]
-                        parsed["source"] = "semantic_scholar"
-                        return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, KeyError):
-                pass
-            logger.info("search_papers: Semantic Scholar result invalid, falling back")
-
-        # ── Level 3: Try DuckDuckGo web search ──
-        ddg_result = self._search_papers_duckduckgo(query, limit, year)
-        if ddg_result:
-            try:
-                parsed = json.loads(ddg_result)
-                if parsed.get("papers") and len(parsed["papers"]) > 0:
-                    parsed["source"] = "duckduckgo_fallback"
-                    return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        return json.dumps({
-            "error": "All paper search methods failed (MCP, Semantic Scholar, DuckDuckGo)",
-            "query": query,
-        })
-
-    def _search_papers_semantic_scholar(self, query: str, limit: int, year: str = None) -> Optional[str]:
-        """Search Semantic Scholar Graph API. Returns raw JSON or None."""
-        import urllib.request
-        import urllib.parse
-
-        params = {
-            "query": query,
-            "limit": limit,
-            "fields": "title,year,authors,abstract,citationCount,url,externalIds",
-        }
-        if year:
-            params["year"] = year
-
-        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{urllib.parse.urlencode(params)}"
-
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                papers = data.get("data", [])
-                return json.dumps({"papers": papers[:limit]}, indent=2)
-        except Exception as e:
-            logger.warning(f"search_papers: Semantic Scholar failed: {e}")
-            return None
-
-    def _search_papers_duckduckgo(self, query: str, limit: int, year: str = None) -> Optional[str]:
-        """Fallback: search papers via DuckDuckGo HTML parsing. Returns raw JSON or None."""
-        try:
-            from urllib.parse import quote
-            import urllib.request
-
-            search_q = f"{query} paper arxiv"
-            if year:
-                search_q += f" {year}"
-            url = f"https://lite.duckduckgo.com/lite/?q={quote(search_q)}&kl=wt-wt"
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; AutoResearcher/1.0)"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-
-            papers = []
-            # Extract result links and snippets
-            result_pattern = re.compile(
-                r'<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-                re.DOTALL,
-            )
-            snippet_pattern = re.compile(
-                r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-                re.DOTALL,
-            )
-
-            titles = result_pattern.findall(html)
-            snippets = snippet_pattern.findall(html)
-
-            for i, (link, raw_title) in enumerate(titles[:limit]):
-                title = re.sub(r"<[^>]+>", "", raw_title).strip()
-                snippet = ""
-                if i < len(snippets):
-                    snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()[:300]
-                if title:
-                    papers.append({
-                        "title": title,
-                        "url": link,
-                        "abstract": snippet,
-                    })
-
-            if not papers:
-                return None
-
-            return json.dumps({"papers": papers})
-        except Exception as e:
-            logger.warning(f"search_papers: DuckDuckGo fallback failed: {e}")
-            return None
 
     def _exec_get_paper(self, paper_id: str) -> str:
-        """Fetch details for a specific paper with fallback chain.
-
-        Fallback chain: Semantic Scholar API → MCP web_reader (arXiv page)
-        """
-        # ── Level 1: Try Semantic Scholar API ──
-        ss_result = self._get_paper_semantic_scholar(paper_id)
-        if ss_result:
-            try:
-                parsed = json.loads(ss_result)
-                # Validate: must have title
-                if parsed.get("title"):
-                    parsed["source"] = "semantic_scholar"
-                    return json.dumps(parsed, ensure_ascii=False, indent=2)
-                elif parsed.get("error") and "not found" in parsed.get("error", "").lower():
-                    # 404 — paper genuinely doesn't exist, no need to fallback
-                    return json.dumps(parsed, ensure_ascii=False)
-            except (json.JSONDecodeError, KeyError):
-                pass
-            logger.info("get_paper: Semantic Scholar result invalid, trying fallback")
-
-        # ── Level 2: Try MCP web_reader for arXiv pages ──
-        arxiv_url = None
+        """Fetch paper details via MCP web_reader."""
+        url = None
         if paper_id.startswith("arXiv:"):
-            arxiv_url = f"https://arxiv.org/abs/{paper_id[6:]}"
-        elif "/" not in paper_id and len(paper_id) < 20:
-            # Might be an arXiv ID without prefix
-            arxiv_url = f"https://arxiv.org/abs/{paper_id}"
+            url = f"https://arxiv.org/abs/{paper_id[6:]}"
+        elif paper_id.startswith("http"):
+            url = paper_id
+        if url:
+            result = self._mcp_web_fetch(url)
+            if result:
+                return result
+        return json.dumps({"error": "Could not fetch paper. Use web_fetch with the URL."})
 
-        if arxiv_url:
-            mcp_result = self._mcp_web_fetch(arxiv_url, f"Paper details for {paper_id}")
-            if mcp_result:
-                try:
-                    parsed = json.loads(mcp_result)
-                    content = parsed.get("content_snippet", "")
-                    if content and len(content) > 50:
-                        # Parse arXiv page to extract structured data
-                        paper_data = self._parse_arxiv_page(content, paper_id)
-                        if paper_data and paper_data.get("title"):
-                            paper_data["source"] = "mcp_arxiv_page"
-                            return json.dumps(paper_data, ensure_ascii=False, indent=2)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            logger.info("get_paper: MCP web_reader failed, trying direct fetch")
-
-            # ── Level 3: Direct urllib fetch of arXiv page ──
-            direct_result = self._get_paper_arxiv_direct(arxiv_url, paper_id)
-            if direct_result:
-                try:
-                    parsed = json.loads(direct_result)
-                    if parsed.get("title"):
-                        parsed["source"] = "arxiv_direct"
-                        return json.dumps(parsed, ensure_ascii=False, indent=2)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-        return json.dumps({
-            "error": f"All paper lookup methods failed for: {paper_id}",
-            "paper_id": paper_id,
-        })
-
-    def _get_paper_semantic_scholar(self, paper_id: str) -> str | None:
-        """Fetch paper details from Semantic Scholar API. Returns raw JSON or None."""
-        import urllib.request
-        import urllib.error
-        from urllib.parse import quote
-
-        if paper_id.startswith("arXiv:"):
-            lookup_id = f"ArXiv:{paper_id[6:]}"
-        else:
-            lookup_id = paper_id
-
-        fields = "title,year,authors,abstract,citationCount,url,externalIds,venue"
-        url = f"https://api.semanticscholar.org/graph/v1/paper/{quote(lookup_id, safe='')}?fields={fields}"
-
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "AutoResearcher/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                return json.dumps(data, indent=2, ensure_ascii=False)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return json.dumps({"error": f"Paper not found: {paper_id}", "exists": False})
-            logger.warning(f"get_paper: Semantic Scholar HTTP {e.code}")
-            return None
-        except Exception as e:
-            logger.warning(f"get_paper: Semantic Scholar failed: {e}")
-            return None
 
     def _parse_arxiv_page(self, content: str, paper_id: str) -> dict | None:
         """Parse arXiv page content to extract paper metadata."""
@@ -1305,67 +1118,8 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             "paperId": paper_id,
         }
 
-    def _get_paper_arxiv_direct(self, arxiv_url: str, paper_id: str) -> Optional[str]:
-        """Direct urllib fetch of arXiv page as fallback. Returns parsed JSON or None."""
-        try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                arxiv_url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; AutoResearcher/1.0)"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-
-            # Extract title from <title> or <h1>
-            title = ""
-            h1_match = re.search(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>(.*?)</h1>', html, re.DOTALL)
-            if h1_match:
-                title = re.sub(r"<[^>]+>", "", h1_match.group(1)).strip()
-            if not title:
-                title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE)
-                if title_match:
-                    title = title_match.group(1).strip()
-
-            # Extract abstract
-            abstract = ""
-            abs_match = re.search(
-                r'<blockquote[^>]*class="[^"]*abstract[^"]*"[^>]*>(.*?)</blockquote>',
-                html, re.DOTALL,
-            )
-            if abs_match:
-                abstract = re.sub(r"<[^>]+>", "", abs_match.group(1)).strip()
-
-            # Extract authors
-            authors = []
-            author_matches = re.findall(r'<meta\s+name="citation_author"\s+content="([^"]+)"', html)
-            if author_matches:
-                authors = [{"name": a.strip()} for a in author_matches[:10]]
-
-            # Extract year
-            year = None
-            date_match = re.search(r'<meta\s+name="citation_date"\s+content="[^"]*(\d{4})', html)
-            if date_match:
-                year = int(date_match.group(1))
-
-            if not title:
-                return None
-
-            return json.dumps({
-                "title": title,
-                "abstract": abstract[:1000],
-                "authors": authors,
-                "year": year,
-                "url": arxiv_url,
-                "paperId": paper_id,
-            }, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"get_paper: arxiv direct fetch failed: {e}")
-            return None
-
     def _exec_web_search(self, query: str, max_results: int = 5) -> str:
-        """Web search with fallback chain: MCP → DuckDuckGo."""
-        # ── Level 1: Try MCP web_search_prime ──
+        """Web search via MCP."""
         mcp_result = self._mcp_web_search(query, max_results)
         if mcp_result:
             try:
@@ -1374,72 +1128,12 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     valid = [r for r in parsed["results"] if r.get("title")]
                     if valid:
                         parsed["results"] = valid[:max_results]
-                        parsed["source"] = "mcp_web_search_prime"
-                        parsed["query"] = query
+                        parsed["source"] = "mcp"
                         return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, TypeError):
                 pass
-            logger.info("web_search: MCP result invalid, falling back to DuckDuckGo")
+        return json.dumps({"error": "MCP web search returned no results."})
 
-        # ── Level 2: DuckDuckGo HTML search ──
-        ddg_result = self._web_search_duckduckgo(query, max_results)
-        if ddg_result:
-            return ddg_result
-
-        return json.dumps({
-            "error": "All web search methods failed (MCP, DuckDuckGo)",
-            "query": query,
-        })
-
-    def _web_search_duckduckgo(self, query: str, max_results: int) -> Optional[str]:
-        """DuckDuckGo HTML search. Returns JSON string or None."""
-        try:
-            from urllib.parse import quote
-            import urllib.request
-
-            url = f"https://lite.duckduckgo.com/lite/?q={quote(query)}&kl=wt-wt"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; AutoResearcher/1.0)",
-                    "Accept": "text/html",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-
-            lines = []
-            in_result = False
-            count = 0
-            for line in html.split("\n"):
-                if '<a class="result__a"' in line:
-                    start = line.find(">") + 1
-                    end = line.find("<", start)
-                    if start > 0 and end > start and count < max_results:
-                        title = line[start:end].strip()
-                        lines.append(f"- {title}")
-                        count += 1
-                        in_result = True
-                elif in_result and '<a class="result__snippet"' in line:
-                    start = line.find(">") + 1
-                    end = line.rfind("<")
-                    if start > 0 and end > start:
-                        snippet = line[start:end].strip()
-                        lines.append(f"  {snippet[:200]}")
-                    in_result = False
-
-            if not lines:
-                return None
-
-            result_text = "\n".join(lines[: max_results * 2])
-            return json.dumps({
-                "query": query,
-                "results": result_text,
-                "source": "duckduckgo",
-            }, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"web_search: DuckDuckGo failed: {e}")
-            return None
 
     def _exec_web_fetch(self, url: str, fetch_info: str) -> str:
         """Fetch a URL with fallback chain: MCP web_reader → urllib direct."""
