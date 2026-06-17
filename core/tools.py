@@ -889,7 +889,9 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             try:
                 from .constraint_engine import StrategyConstraintEngine
                 engine = StrategyConstraintEngine.__new__(StrategyConstraintEngine)
-                engine.rules = []
+                engine._rules = []
+                engine._rules_loaded = False
+                engine.workspace = self.workspace
                 engine.generate_rules_from_history(self._memory)
                 violations = engine.check_constraints({"task": command}, self._memory)
                 if engine.has_forbidden_violation(violations):
@@ -901,7 +903,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             except Exception:
                 pass  # Don't block launch if constraint check fails
 
-                env = os.environ.copy()
+        env = os.environ.copy()
         if gpu:
             env["CUDA_VISIBLE_DEVICES"] = gpu
 
@@ -1643,7 +1645,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 stats = self._memory.get_summary_stats()
                 return json.dumps(stats, default=str)
             elif query_type == "dead_ends":
-                ends = self._memory.get_dead_ends_full(limit=limit)
+                ends = self._memory.get_dead_ends_full()[:limit]
                 return json.dumps(ends, default=str)
             elif query_type == "causal_chain":
                 chain = self._memory.get_causal_history(limit=limit)

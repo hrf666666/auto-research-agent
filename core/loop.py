@@ -353,7 +353,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                     )
                     self._record_cycle_outcome(think_result, execute_result, reflect_result,
                                                 verify_report_dict=verify_report.to_dict() if verify_report else None)
-                    self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
                     self._gc.run()  # Phase 2: deterministic GC
                     # Post-reflect code review: learn from mistakes
                     # Paper research is meaningful work — persist cycle counter
@@ -509,8 +508,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                     logger.debug(f"Phase status update skipped: {e}")
                 self._record_cycle_outcome(think_result, execute_result, reflect_result,
                                             verify_report_dict=verify_report.to_dict())
-
-                self._refresh_obsidian(reflect_result=reflect_result, directive=directive)
 
                 # Post-reflect code review: learn from mistakes
 
@@ -952,7 +949,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     self._metric_no_progress_streak = 0
             return
 
-        signature = self._plan_signature(think_result)
+        signature = think_result.get("task", "")[:100]
         made_progress = bool(
             execute_result.get("experiment_launched")
             or execute_result.get("final_metrics")
@@ -1022,7 +1019,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         if current_metric is not None:
             method = ""
             status = "success" if made_progress else "inconclusive"
-            metric_key_used = key if 'key' in dir() and key else "metric"
+            metric_key_used = "metric"  # simplified
             try:
                 self.memory.log_structured_result(
                     cycle=self.cycle_count,
@@ -1080,29 +1077,9 @@ class ResearchLoop(DomainKnowledgeMixin):
                     logger.debug(f"Pareto recording failed: {e}")
 
         # ── CAUSAL CHAIN UPDATE ──
-        # Update actual effect for any causal links from this cycle's hypothesis
-        if domain_metrics and think_result.get("hypothesis"):
-            for dk, dv in domain_metrics.items():
-                try:
-                    self.memory.update_causal_actual(
-                        cycle=self.cycle_count,
-                        metric_affected=dk,
-                        actual_effect=f"MAE={dv:.4f}",
-                    )
-                except Exception as e:
-                    logger.debug(f"Causal actual update skipped: {e}")
         # Compare actual improvement with expected improvement
         if current_metric is not None and self._best_metric_ever < float('inf'):
             actual_improvement = self._best_metric_ever - current_metric
-            was_correct = actual_improvement > 0
-            try:
-                self.memory.update_experiment_value_actual(
-                    cycle=self.cycle_count,
-                    actual_improvement=actual_improvement,
-                    was_correct=was_correct,
-                )
-            except Exception as e:
-                logger.debug(f"Experiment value update skipped: {e}")
         else:
             # v18 Phase 3: Direction/architecture stagnation tracking removed.
         # These counters had 0 triggers in 23 cycles of production. The LLM
