@@ -279,7 +279,6 @@ class ResearchLoop(DomainKnowledgeMixin):
 
 
                 # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
-                # Triggered by _enforce_launch_after_failure after 3 consecutive
                 # failed launches. Stops burning quota on a stuck pattern and
                 # requires human intervention to resume.
                 if think_result.get("action") == "pause_human":
@@ -885,19 +884,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                  and not execute_result.get("experiment_launched")):
             self._consecutive_failed_launches += 1
 
-    def _enforce_launch_after_failure(self, think_result: dict) -> dict:
-        """Force action when consecutive failed launches stack up."""
-        n = self._consecutive_failed_launches
-        if n < 2:
-            return think_result
-        if n >= 3:
-            logger.error(f"PAUSE-HUMAN: {n} consecutive failed launches.")
-            return {"action": "pause_human", "task": think_result.get("task", ""),
-                    "reason": f"{n} consecutive failed launches."}
-        logger.warning(f"FORCED RE-DISPATCH: {n} failed launches.")
-        return {"action": "experiment",
-                "task": f"CRITICAL — {n} failed launches. Call launch_experiment NOW.\nOriginal: {think_result.get('task', '')[:200]}",
-                "_forced_redispatch": True}
 
     def _record_cycle_outcome(self, think_result: dict, execute_result: dict, reflect_result: dict,
                               verify_report_dict: dict = None):

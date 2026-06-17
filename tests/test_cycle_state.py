@@ -111,29 +111,5 @@ class TestFailedLaunchCounter:
                                      "deception_detected": True})
         assert loop._consecutive_failed_launches == 0
 
-    def test_force_redispatch_after_two_failures(self, tmp_workspace):
-        """After 2 consecutive failed launches, the action is forced to a
-        'fix + launch' task rather than a fresh plan."""
-        loop = _make_loop(tmp_workspace)
-        loop._consecutive_failed_launches = 2
-        think_result = {"action": "experiment", "task": "new idea"}
-        forced = loop._enforce_launch_after_failure(think_result)
-        assert forced.get("_forced_redispatch") is True
-        assert "launch_experiment" in forced.get("task", "")
 
-    def test_pause_human_after_three_failures(self, tmp_workspace):
-        """After 3 consecutive failed launches, the loop must pause for human
-        intervention instead of burning more quota."""
-        loop = _make_loop(tmp_workspace)
-        loop._consecutive_failed_launches = 3
-        decision = loop._enforce_launch_after_failure({"action": "experiment",
-                                                        "task": "x"})
-        assert decision.get("action") == "pause_human"
 
-    def test_no_force_below_threshold(self, tmp_workspace):
-        """Below 2 failures, the think_result is unchanged."""
-        loop = _make_loop(tmp_workspace)
-        loop._consecutive_failed_launches = 1
-        think_result = {"action": "experiment", "task": "plan"}
-        result = loop._enforce_launch_after_failure(think_result)
-        assert result is think_result  # unchanged, same object

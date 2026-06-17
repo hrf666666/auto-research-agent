@@ -1626,7 +1626,8 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                     "query_type": {
                         "type": "string",
                         "enum": ["best_metrics", "dead_ends", "causal_chain",
-                                 "experiment_history", "lessons"],
+                                 "experiment_history", "lessons",
+                                 "failed_launches"],
                         "description": "Type of memory query"
                     },
                     "limit": {"type": "integer", "description": "Max results (default 5)"}
@@ -1654,6 +1655,17 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 rows = self._memory.get_experiment_history(limit=limit) \
                     if hasattr(self._memory, 'get_experiment_history') else []
                 return json.dumps(rows, default=str)
+            elif query_type == "failed_launches":
+                # Read from ResearchLoop's counter (stored in state.json)
+                import json
+                state_path = self.workspace / "state.json"
+                if state_path.exists():
+                    try:
+                        state = json.loads(state_path.read_text())
+                        return json.dumps({"consecutive_failed_launches": state.get("consecutive_failed_launches", 0)})
+                    except Exception:
+                        pass
+                return json.dumps({"consecutive_failed_launches": 0})
             elif query_type == "lessons":
                 lessons = self._memory.get_code_review_lessons(limit=limit) \
                     if hasattr(self._memory, 'get_code_review_lessons') else []
