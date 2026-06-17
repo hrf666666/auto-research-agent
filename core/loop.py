@@ -857,6 +857,28 @@ class ResearchLoop(DomainKnowledgeMixin):
         if result.get("active_problem"):
             self.memory.log_active_problem(result["active_problem"])
 
+        # Causal link + lesson (v20: feeds causal_chain and code_review_lessons tables)
+        if result.get("causal_link"):
+            try:
+                self.memory.record_causal_chain_entry(
+                    cycle=self.cycle_count,
+                    design_decision=result["causal_link"],
+                )
+                logger.info(f"Causal link recorded: {result['causal_link'][:80]}")
+            except Exception as e:
+                logger.warning(f"Failed to record causal link: {e}")
+        if result.get("lesson"):
+            try:
+                self.memory.record_code_review_lesson(
+                    cycle=self.cycle_count,
+                    category="reflect_insight",
+                    pattern="general",
+                    description=result["lesson"],
+                )
+                logger.info(f"Lesson recorded: {result['lesson'][:80]}")
+            except Exception as e:
+                logger.warning(f"Failed to record lesson: {e}")
+
         logger.info(f"REFLECT result: milestone={'yes' if result.get('milestone') else 'no'}")
         return result
 
@@ -871,6 +893,28 @@ class ResearchLoop(DomainKnowledgeMixin):
                  and not execute_result.get("experiment_launched")):
             self._consecutive_failed_launches += 1
 
+
+    def _extract_method_name(self, think_result: dict) -> str:
+        """Extract a short method label from the think_result for Pareto tracking.
+
+        Looks for known method keywords in the task/hypothesis text. Falls back
+        to 'experiment' (not empty string) so the Pareto matrix is non-degenerate.
+        """
+        import re
+        text = (think_result.get("task", "") + " " + think_result.get("hypothesis", "")).lower()
+        # Common ML/architecture method keywords
+        method_keywords = [
+            "fft", "frequency", "gcd", "cost_volume", "cost volume",
+            "gradient_boosting", "random_forest", "xgboost", "lightgbm",
+            "resnet", "unet", "transformer", "attention", "mask",
+            "epipolar", "brdf", "lambertian", "rpcs", "pca",
+            "focal_loss", "contrastive", "curriculum", "distill",
+            "ensemble", "stacking", "concat", "bilinear",
+        ]
+        for kw in method_keywords:
+            if kw in text:
+                return kw.replace(" ", "_")
+        return "experiment"
 
     def _record_cycle_outcome(self, think_result: dict, execute_result: dict, reflect_result: dict,
                               verify_report_dict: dict = None):
@@ -1022,7 +1066,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ── PARETO MATRIX RECORDING ──
         # Record method×domain results for cross-experiment Pareto frontier tracking
         if domain_metrics:
-            method_name = ""  # method extraction removed
+            # v20: restore method extraction from think_result task/hypothesis
+            method_name = self._extract_method_name(think_result)
             exp_type = "pilot" if think_result.get("pilot_experiment") else "full"
             for dk, dv in domain_metrics.items():
                 domain_name = dk.replace("MAE_", "")
@@ -1037,9 +1082,21 @@ class ResearchLoop(DomainKnowledgeMixin):
                 except Exception as e:
                     logger.debug(f"Pareto recording failed: {e}")
 
-        # ── CAUSAL CHAIN UPDATE ──
-        # Compare actual improvement with expected improvement
-                    # v18: improvement tracking simplified
+        # ── EXPERIMENT VALUE OF INFORMATION ──
+        # v20: auto-record hypothesis vs actual outcome for calibration
+        hypothesis = think_result.get("hypothesis", "")
+        if hypothesis and current_metric is not None:
+            try:
+                was_correct = 1 if made_progress else 0
+                self.memory.record_experiment_value(
+                    cycle=self.cycle_count,
+                    hypothesis=hypothesis,
+                    expected_improvement=None,
+                    actual_improvement=current_metric,
+                    was_correct=was_correct,
+                )
+            except Exception as e:
+                logger.debug(f"Experiment value recording failed: {e}")
 
         # Check architecture survey completion
         if not self._architecture_survey_done and self._architecture_survey_path.exists():

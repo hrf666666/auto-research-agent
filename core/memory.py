@@ -500,6 +500,25 @@ class MemoryManager:
 
     # ── Causal Chain Tracking ──
 
+    def record_causal_chain_entry(self, cycle: int, design_decision: str,
+                                   metric_affected: str = "", expected_effect: str = "",
+                                   actual_effect: str = "", verified: int = 0):
+        """Record a causal link between a design decision and a metric outcome.
+
+        Fed by the REFLECT phase's 'causal_link' field. Consumed by
+        get_causal_history() which injects into THINK context.
+        """
+        if not design_decision:
+            return
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("""
+                INSERT INTO causal_chain
+                    (cycle, design_decision, architectural_property,
+                     metric_affected, expected_effect, actual_effect, verified, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (cycle, design_decision[:500], "", metric_affected[:200],
+                  expected_effect[:500], actual_effect[:500], verified, time.time()))
+
     def get_causal_history(self, limit: int = 20) -> list[dict]:
         """Get recent causal chain entries for reasoning."""
         with sqlite3.connect(str(self.db_path)) as conn:
@@ -514,6 +533,27 @@ class MemoryManager:
             return [dict(r) for r in rows]
 
     # ── Experiment Value of Information ──
+
+    def record_experiment_value(self, cycle: int, hypothesis: str,
+                                 expected_improvement: float = None,
+                                 actual_improvement: float = None,
+                                 was_correct: int = None):
+        """Record the value-of-information for one experiment.
+
+        Tracks whether a hypothesis prediction matched reality. Consumed by
+        get_experiment_calibration() which feeds StrategyConstraintEngine
+        to learn which hypothesis types tend to work.
+        """
+        if not hypothesis:
+            return
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("""
+                INSERT INTO experiment_value
+                    (cycle, hypothesis, expected_improvement, prior_probability,
+                     information_value, actual_improvement, was_correct, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (cycle, hypothesis[:500], expected_improvement, None, None,
+                  actual_improvement, was_correct, time.time()))
 
     def get_experiment_calibration(self) -> dict:
         """Get calibration data: how often do hypotheses actually work?
@@ -837,6 +877,25 @@ class MemoryManager:
     # ─────────────────────────────────────────────────
     # Code Review Lessons (Knowledge Base)
     # ─────────────────────────────────────────────────
+
+    def record_code_review_lesson(self, cycle: int, category: str,
+                                    pattern: str, description: str,
+                                    fix_suggestion: str = ""):
+        """Record a reusable code/architecture lesson from a cycle.
+
+        Fed by the REFLECT phase's 'lesson' field. Consumed by
+        get_code_review_lessons() and query_memory(type='lessons').
+        """
+        if not description:
+            return
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("""
+                INSERT INTO code_review_lessons
+                    (timestamp, cycle, category, pattern, description,
+                     fix_suggestion, source)
+                VALUES (?, ?, ?, ?, ?, ?, 'reflect')
+            """, (time.time(), cycle, category[:100], pattern[:200],
+                  description[:1000], fix_suggestion[:500]))
 
     def get_code_review_lessons(self, severity: str = None, category: str = None, limit: int = 30) -> list[dict]:
         """Retrieve code review lessons, optionally filtered."""
