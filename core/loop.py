@@ -303,11 +303,8 @@ class ResearchLoop(DomainKnowledgeMixin):
                         )
                         logger.warning(reason)
                         self.memory.log_decision(reason)
-                        # Override wait → experiment
-                        think_result = {
-                            "action": "experiment",
-                            "task": "Propose and launch a concrete experiment now.",
-                        }
+                        # v18: System is referee — record but don't override.
+                        # LLM sees idle warning in memory and self-corrects.
                     else:
                         self._update_state(
                             {
