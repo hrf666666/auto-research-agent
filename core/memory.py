@@ -137,14 +137,13 @@ class MemoryManager:
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     milestone TEXT NOT NULL DEFAULT '',
                     decision TEXT NOT NULL DEFAULT '',
-                    dead_end TEXT NOT NULL DEFAULT '',
                     active_problem TEXT NOT NULL DEFAULT '',
                     module_failure TEXT NOT NULL DEFAULT '',
                     duration_seconds REAL,
                     notes TEXT NOT NULL DEFAULT ''
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
+CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
                 CREATE INDEX IF NOT EXISTS idx_launched ON experiments(experiment_launched);
 
                 CREATE TABLE IF NOT EXISTS memory_entries (
@@ -219,23 +218,6 @@ class MemoryManager:
                 CREATE INDEX IF NOT EXISTS idx_lesson_pattern ON code_review_lessons(pattern);
                 CREATE INDEX IF NOT EXISTS idx_lesson_severity ON code_review_lessons(severity);
                 CREATE INDEX IF NOT EXISTS idx_lesson_category ON code_review_lessons(category);
-
-                -- v15: Research Roadmap history
-                CREATE TABLE IF NOT EXISTS roadmap_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    cycle INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    module_name TEXT NOT NULL DEFAULT '',
-                    old_phase TEXT NOT NULL DEFAULT '',
-                    new_phase TEXT NOT NULL DEFAULT '',
-                    details TEXT NOT NULL DEFAULT '',
-                    global_phase TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_roadmap_cycle ON roadmap_history(cycle);
-                CREATE INDEX IF NOT EXISTS idx_roadmap_module ON roadmap_history(module_name);
-                CREATE INDEX IF NOT EXISTS idx_roadmap_event ON roadmap_history(event_type);
             """)
 
     def record_cycle_outcome(self, cycle: int, think_result: dict,
@@ -260,9 +242,9 @@ class MemoryManager:
                     cycle, timestamp, action, hypothesis, success_criteria,
                     agent_type, task_summary, experiment_launched, pid, log_file,
                     verify_pass, verify_fail, verify_warnings, verify_diagnosis,
-                    metrics_json, milestone, decision, dead_end,
+                    metrics_json, milestone, decision,
                     active_problem, module_failure, duration_seconds, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 cycle,
                 time.time(),
@@ -281,7 +263,6 @@ class MemoryManager:
                 json.dumps(metrics, ensure_ascii=False),
                 (reflect_result.get("milestone") or "")[:500],
                 (reflect_result.get("decision") or "")[:500],
-                (reflect_result.get("dead_end") or "")[:500],
                 (reflect_result.get("active_problem") or "")[:500],
                 (reflect_result.get("module_failure") or "")[:500],
                 duration,
@@ -303,7 +284,7 @@ class MemoryManager:
             rows = conn.execute("""
                 SELECT cycle, timestamp, action, hypothesis, success_criteria,
                        experiment_launched, pid, verify_pass, verify_fail,
-                       metrics_json, milestone, decision, dead_end, active_problem
+                       metrics_json, milestone, decision, active_problem
                 FROM experiments
                 ORDER BY cycle DESC
                 LIMIT ?
@@ -366,20 +347,6 @@ class MemoryManager:
             except Exception:
                 # Column may not exist yet (pre-v12 database)
                 return 0
-
-    def get_recent_failures(self, count: int = 5) -> list[dict]:
-        """Get recent experiment failures for REFLECT context."""
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT cycle, hypothesis, success_criteria, verify_diagnosis,
-                       dead_end, active_problem
-                FROM experiments
-                WHERE experiment_launched = 0 OR verify_fail > 0
-                ORDER BY cycle DESC
-                LIMIT ?
-            """, (count,)).fetchall()
-            return [dict(r) for r in rows]
 
     def get_summary_stats(self) -> dict:
         """Get aggregate statistics for the research session."""
@@ -634,12 +601,18 @@ class MemoryManager:
 
         Replaces regex-based pattern detection in _build_cross_experiment_insights.
         Uses actual metrics from experiments table instead of text matching.
+
+        Note: dead_end tracking was migrated to the memory_entries table (see
+        B9 gate / log_dead_end). The experiments table no longer carries a
+        dead_end column. success_rate/dead_ends below are kept as baseline
+        fields (1.0 / 0) so downstream dict consumers (api/tools) don't break;
+        they are no longer driven by per-cycle dead-end data.
         """
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT cycle, hypothesis, metrics_json, experiment_launched,
-                       dead_end, milestone
+                       milestone
                 FROM experiments
                 WHERE experiment_launched = 1 AND metrics_json != '{}'
                 ORDER BY cycle ASC
@@ -670,7 +643,6 @@ class MemoryManager:
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-                is_dead_end = bool(row["dead_end"])
                 for method in methods_found:
                     if method not in matrix:
                         matrix[method] = {}
@@ -684,24 +656,29 @@ class MemoryManager:
                                 matrix[method][domain_name].append({
                                     "mae": mae_val,
                                     "cycle": row["cycle"],
-                                    "dead_end": is_dead_end,
                                 })
                             except (TypeError, ValueError):
                                 pass
 
-            # Summarize: best MAE per method per domain + success rate
+            # Summarize: best MAE per method per domain + success rate.
+            # Note: dead_end tracking moved to memory_entries; these per-domain
+            # dead_ends/success_rate fields are kept as baseline (0 / 1.0) so
+            # downstream dict consumers don't KeyError.
             summary = {}
             for method, domains in matrix.items():
                 summary[method] = {}
                 for domain, entries in domains.items():
                     maes = [e["mae"] for e in entries]
-                    dead_ends = sum(1 for e in entries if e["dead_end"])
+                    # dead_end tracking moved to memory_entries (see docstring);
+                    # these two fields are baseline placeholders, not driven by
+                    # per-cycle dead-end data.
+                    dead_ends = 0
                     summary[method][domain] = {
                         "best_mae": round(min(maes), 4),
                         "avg_mae": round(sum(maes) / len(maes), 4),
                         "attempts": len(entries),
                         "dead_ends": dead_ends,
-                        "success_rate": round(1 - dead_ends / max(len(entries), 1), 2),
+                        "success_rate": 1.0,
                     }
 
             return summary
@@ -768,7 +745,11 @@ class MemoryManager:
         """
         sections = self._parse_log()
         method_str = f" method={method}" if method else ""
-        line = f"[Cycle {cycle}] {metric_key}={metric_value:.6f}{method_str} status={status}"
+        try:
+            mv = f"{float(metric_value):.6f}"
+        except (TypeError, ValueError):
+            mv = str(metric_value)[:20]
+        line = f"[Cycle {cycle}] {metric_key}={mv}{method_str} status={status}"
         sections["milestones"].append(line)
         self._write_log(sections)
 
@@ -1094,3 +1075,30 @@ class MemoryManager:
             compressed = f"[Historical {len(old)} entries: {'; '.join(themes[:3])}]"
             return [compressed] + recent
         return recent
+
+    # ── Phase 1 (Reform v21): Deterministic fact spine ──
+
+    def scan_experiment_facts(self, rescan: bool = False) -> dict[str, int]:
+        """Scan all experiment manifests + logs on disk, record structured facts.
+
+        This is the fact spine: it reads files that survived any reboot/crash
+        and records what happened — independent of any LLM or agent process.
+        Idempotent (output_dir is the primary key). Safe to call every cycle.
+
+        Returns {"scanned": N, "inserted": M, "skipped": K, "errors": E}.
+        """
+        from core.fact_scanner import scan_all
+
+        return scan_all(self.project_dir, self.db_path, rescan=rescan)
+
+    def get_experiment_facts(self, limit: int = 20) -> list[dict]:
+        """Retrieve experiment facts (newest scan first). For THINK context + gates."""
+        from core.fact_scanner import get_all_facts
+
+        return get_all_facts(self.db_path)[:limit]
+
+    def get_fact_for_output_dir(self, output_dir: str) -> dict | None:
+        """Retrieve the fact record for a specific experiment output_dir."""
+        from core.fact_scanner import get_facts_for_output_dir
+
+        return get_facts_for_output_dir(self.db_path, output_dir)

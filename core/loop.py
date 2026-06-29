@@ -32,6 +32,19 @@ from .simulation_sandbox import SimulationSandbox
 
 logger = logging.getLogger("autoresearcher")
 
+
+def _ff(val, ndigits: int = 4) -> str:
+    """Safely format any value as float string. Never raises.
+
+    Metrics values may arrive as str (from legacy DB rows, monitor's old
+    str() behavior, or JSON deserialization). This function coerces to float
+    before formatting, returning a fallback string on failure.
+    """
+    try:
+        return f"{float(val):.{ndigits}f}"
+    except (TypeError, ValueError):
+        return str(val)[:20]
+
 # Numerical safety epsilon
 _EPS = 1e-8
 
@@ -198,7 +211,9 @@ class ResearchLoop(DomainKnowledgeMixin):
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
         )
-        logging.getLogger().addHandler(file_handler)
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)  # must set root level — default WARNING filters INFO before handler
+        root.addHandler(file_handler)
         logger.info(f"File logging enabled: {log_path}")
 
     def run(self, directive: str = ""):
@@ -215,6 +230,22 @@ class ResearchLoop(DomainKnowledgeMixin):
             logger.info(f"=== Cycle {self.cycle_count} ===")
             # Save counter immediately at cycle start for crash recovery
             self._save_cycle_counter()
+
+            # Phase 1 (Reform v21): Deterministic fact spine.
+            # Scan disk for experiment facts BEFORE any LLM call. This is the
+            # single source of truth for "what experiments happened" — it reads
+            # files that survive reboots, independent of REFLECT or agent liveness.
+            # Idempotent (INSERT OR IGNORE), safe to call every cycle.
+            try:
+                fact_stats = self.memory.scan_experiment_facts()
+                if fact_stats.get("inserted", 0) > 0:
+                    logger.info(
+                        f"[fact_spine] scanned={fact_stats['scanned']} "
+                        f"inserted={fact_stats['inserted']} "
+                        f"skipped={fact_stats['skipped']}"
+                    )
+            except Exception as e:
+                logger.warning(f"[fact_spine] scan failed (non-fatal): {e}")
 
             try:
                 # Keep leader context bounded to one cycle.
@@ -308,7 +339,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                     execute_result["verify_summary"] = self._verify_summary(verify_report)
 
                     # REFLECT on research findings (no training to monitor)
-                    reflect_result = self._reflect(execute_result, verify_report=verify_report)
+                    reflect_result = self._reflect(execute_result, verify_report=verify_report, think_result=think_result)
                     self._update_state(
                         {
                             "cycle": self.cycle_count,
@@ -349,6 +380,13 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # next cycle's THINK can force a re-dispatch or pause_human.
                 self._update_launch_counter(execute_result)
 
+                # Pre-initialize monitor_result so the post-VERIFY metrics
+                # alignment below is safe even when no experiment was launched.
+                # Previously this was only assigned inside the
+                # `if experiment_launched` branch, so a non-launched cycle raised
+                # UnboundLocalError at the `monitor_result.get(...)` call below.
+                monitor_result = {"metrics": {}, "log_tail": "", "elapsed_hours": None}
+
                 if execute_result.get("experiment_launched"):
                     self._update_state(
                         {
@@ -379,6 +417,21 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # VERIFY: Reverse-engineer whether each module actually worked
                 verify_report = self._verify(self.cycle_count, think_result, execute_result)
                 execute_result["verify_summary"] = self._verify_summary(verify_report)
+
+                # Phase 4c (Reform v21): Align last_metrics with fact spine.
+                # monitor's metrics come from tail-50-lines (may be incomplete).
+                # If monitor returned empty metrics, try fact_scanner as fallback.
+                monitor_metrics = monitor_result.get("metrics", {})
+                if not monitor_metrics and execute_result.get("log_file"):
+                    try:
+                        log_dir = str(Path(execute_result["log_file"]).parent)
+                        fact = self.memory.get_fact_for_output_dir(log_dir)
+                        if fact and fact.get("metrics_json"):
+                            import json as _json
+                            monitor_metrics = _json.loads(fact["metrics_json"])
+                    except Exception:
+                        pass
+                execute_result["final_metrics"] = monitor_metrics or execute_result.get("final_metrics", {})
 
                 # VISUAL ANALYSIS: When METRICS stop improving for N consecutive cycles
                 # (OR when experiments keep failing to launch), run inference → multimodal
@@ -447,6 +500,7 @@ class ResearchLoop(DomainKnowledgeMixin):
                 # REFLECT: Evaluate and update (now with VERIFY diagnosis)
                 reflect_result = self._reflect(
                     execute_result, verify_report=verify_report,
+                    think_result=think_result,
                 )
                 self._update_state(
                     {
@@ -515,6 +569,16 @@ class ResearchLoop(DomainKnowledgeMixin):
             except Exception as e:
                 err_msg = str(e)
                 logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
+                # Direct file write (bypasses logger buffering) for crash diagnosis
+                import traceback as _tb
+                try:
+                    crash_path = self.workspace / "last_crash.txt"
+                    crash_path.write_text(
+                        f"Cycle {self.cycle_count} crash:\n{_tb.format_exc()}\n",
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
                 self.memory.log_decision(f"Cycle {self.cycle_count} error: {err_msg[:200]}")
                 self._update_state(
                     {
@@ -816,7 +880,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             "top_diagnoses": report.diagnosis[:3] if report.diagnosis else [],
         }
 
-    def _reflect(self, execute_result: dict, verify_report) -> dict:
+    def _reflect(self, execute_result: dict, verify_report, think_result: dict = None) -> dict:
         """REFLECT phase: Leader evaluates results and records learnings."""
         context = {}
         context["brief"] = self.memory.get_brief()
@@ -837,6 +901,27 @@ class ResearchLoop(DomainKnowledgeMixin):
             context["llm_fabrication_detected"] = True
             context["fabrication_details"] = execute_result.get("deception_detail", [])
 
+        # Phase 3 (Reform v21): Methodology gates — run BEFORE REFLECT so the
+        # LLM sees deterministic facts (criteria met? control exists? dead end?).
+        # Gates are FACT-layer only: they don't change action, they attach
+        # structured verdicts to context so the LLM can reason about them.
+        methodology_verdict = None
+        if think_result and execute_result.get("experiment_launched"):
+            try:
+                from core.methodology_gates import run_all_gates
+
+                log_file = execute_result.get("log_file", "")
+                current_out = str(Path(log_file).parent) if log_file else ""
+                methodology_verdict = run_all_gates(
+                    think_result, execute_result, self.memory.db_path, current_out,
+                    workspace=self.workspace,
+                )
+                context["methodology_verdict"] = methodology_verdict.summary()
+                context["methodology_verdict_detail"] = methodology_verdict.to_dict()
+                logger.info(f"[methodology] {methodology_verdict.summary()}")
+            except Exception as e:
+                logger.warning(f"[methodology] gates failed (non-fatal): {e}")
+
         # Context pruning
         context = self.context_pruner.prune(context, "reflect")
 
@@ -846,6 +931,45 @@ class ResearchLoop(DomainKnowledgeMixin):
             logger.warning(f"REFLECT LLM call failed: {e}")
             result = {"milestone": "", "decision": "Reflect failed", "dead_end": None,
                       "active_problem": None}
+
+        # Reform v21 root-cause fix (see docs): the ORIGINAL comment here blamed
+        # REFLECT failure on "the LLM wrote prose instead of JSON". Black-box
+        # probing (angle-3) disproved this — GLM returns valid REFLECT JSON
+        # 3/3. The real cause was the leader parser demanding an ``action`` key
+        # that REFLECT's schema never carries; that parser bug (now fixed at
+        # agents.py:_extract_first_decision_json) made every valid REFLECT
+        # output look like an empty shell here.
+        #
+        # With the parser fixed, REFLECT succeeds and this fallback should
+        # almost never fire. We keep it ONLY as a last-resort safety net for
+        # genuine LLM/API failure (the except branch above) — NOT as a routine
+        # path. Critically, it must now mark itself LOUDLY (warning, explicit
+        # [REFLECT-FAILED] tag) so a regression in the parser is never silently
+        # papered over again. The old comment's framing turned this fallback
+        # into a reverse-incentive that masked the very bug it was "fixing".
+        if not result.get("milestone"):
+            fallback = self._derive_factual_milestone(execute_result)
+            if fallback:
+                result["milestone"] = fallback
+                # Mark loudly — this is a DEGRADED reflection, not a normal one.
+                # Do NOT use a vague "Recorded from fact spine" decision that
+                # disguises a failure as success.
+                result["decision"] = "[REFLECT-FAILED] LLM produced no parseable reflection; milestone salvaged from facts only. Investigate parser/LLM."
+                # Do NOT clobber other reflect fields with None. Previously this
+                # overwrote dead_end/active_problem/causal_link/lesson even when
+                # the LLM had produced valid values for them, which — combined
+                # with the schema never prompting for dead_end — kept the entire
+                # dead_end feedback loop dead. Drop any stray keys instead, so
+                # downstream .get() returns None naturally without destroying
+                # legitimately-produced values.
+                for _k in ("dead_end", "active_problem", "causal_link", "lesson"):
+                    result.pop(_k, None)
+                result["_milestone_source"] = "fact_spine_fallback"
+                logger.warning(
+                    f"[REFLECT-FAILED] REFLECT produced no milestone (this should be "
+                    f"RARE after the parser fix — investigate if frequent). "
+                    f"Salvaged milestone from facts: {fallback[:80]}"
+                )
 
         # Record to memory
         if result.get("milestone"):
@@ -880,7 +1004,73 @@ class ResearchLoop(DomainKnowledgeMixin):
                 logger.warning(f"Failed to record lesson: {e}")
 
         logger.info(f"REFLECT result: milestone={'yes' if result.get('milestone') else 'no'}")
+        # Attach methodology verdict so _record_cycle_outcome can use it for
+        # fact-based action gating (Phase 4b).
+        if methodology_verdict is not None:
+            result["_methodology_verdict"] = methodology_verdict
         return result
+
+    def _derive_factual_milestone(self, execute_result: dict) -> str:
+        """Derive a milestone string from deterministic facts when REFLECT fails.
+
+        Phase 2b (Reform v21). This is the fact-spine fallback: when the REFLECT
+        LLM produces no parseable JSON, we still record what happened using
+        facts extracted from train.log (via fact_scanner / training_log_parser).
+
+        This records FACTS (metric=X, trend=Y), never INTERPRETATIONS (why it
+        happened). Interpretations stay with the LLM. The milestone is a terse
+        factual record so the experiment is never "forgotten".
+
+        Returns "" if no facts can be derived (e.g. no experiment ran).
+        """
+        # Prefer fact_scanner record (most reliable, from disk)
+        log_file = execute_result.get("log_file", "")
+        if log_file:
+            output_dir = str(Path(log_file).parent) if log_file else ""
+            if output_dir:
+                try:
+                    fact = self.memory.get_fact_for_output_dir(output_dir)
+                    if fact and fact.get("best_metric_value") is not None:
+                        name = fact.get("best_metric_name", "metric")
+                        val = fact["best_metric_value"]
+                        trend = fact.get("loss_trend", "")
+                        epoch = fact.get("best_epoch")
+                        parts = [f"[FACT] best {name}={_ff(val)}"]
+                        if epoch:
+                            parts.append(f"@epoch {epoch}")
+                        if trend:
+                            parts.append(f"loss:{trend}")
+                        # Per-domain metrics if available
+                        metrics_json = fact.get("metrics_json", "{}")
+                        try:
+                            metrics = json.loads(metrics_json)
+                            domain_parts = []
+                            for k, v in metrics.items():
+                                if k.startswith("mae_") and k != name:
+                                    domain_parts.append(f"{k}={_ff(v)}")
+                            if domain_parts:
+                                parts.append("(" + ", ".join(domain_parts[:3]) + ")")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        return " ".join(parts)
+                except Exception as e:
+                    logger.debug(f"fact_spine milestone lookup failed: {e}")
+
+        # Fallback: use execute_result's final_metrics directly
+        metrics = execute_result.get("final_metrics") or execute_result.get("training_metrics")
+        if isinstance(metrics, dict) and metrics:
+            # Pick best metric using same priority as fact_scanner
+            for name in ("val_mae", "val_mae_overall", "best_val_mae", "mae_overall", "mae"):
+                if name in metrics:
+                    try:
+                        return f"[FACT] best {name}={float(metrics[name]):.4f} (REFLECT fallback)"
+                    except (TypeError, ValueError):
+                        return f"[FACT] best {name}={metrics[name]} (REFLECT fallback)"
+            # Any metric
+            name, val = next(iter(metrics.items()))
+            return f"[FACT] {name}={val} (REFLECT fallback)"
+
+        return ""
 
 
     def _update_launch_counter(self, execute_result: dict):
@@ -960,6 +1150,36 @@ class ResearchLoop(DomainKnowledgeMixin):
             or execute_result.get("final_metrics")
             or reflect_result.get("milestone")
         )
+
+        # Phase 4b (Reform v21): Fact-based action gating.
+        # A causal claim that FAILED its success_criteria AND has no control
+        # run should NOT be counted as progress — it's an uncontrolled negative
+        # result. Recording it as progress would inflate the progress streak
+        # and mask the real signal (the method may not work).
+        #
+        # STRICT BOUNDARY (Ground 2): this only fires when ALL three facts hold:
+        #   (1) criteria is parseable AND criteria_met is explicitly False
+        #       (None/unparseable → NOT gated, because "couldn't evaluate" ≠ "failed")
+        #   (2) claim_type is "causal"
+        #   (3) no control run found (marked_inconclusive)
+        # If any fact is missing (None, unparseable, non-causal, has control),
+        # we do NOT override — the LLM's judgment stands.
+        verdict = reflect_result.get("_methodology_verdict")
+        if verdict is not None and made_progress:
+            f_gate = verdict.falsification
+            c_gate = verdict.control_coverage
+            if (
+                f_gate.parseable
+                and f_gate.criteria_met is False  # explicitly failed, not None
+                and c_gate.needs_control
+                and c_gate.marked_inconclusive
+            ):
+                made_progress = False
+                logger.info(
+                    f"[action_gate] progress overridden: criteria NOT MET "
+                    f"({_ff(f_gate.actual_value)}{f_gate.operator}{f_gate.threshold}) "
+                    f"+ uncontrolled causal claim → not counted as progress"
+                )
 
         # ── Metric-based progress tracking (Fix 1: visual analysis trigger) ──
         final_metrics = execute_result.get("final_metrics") or {}
@@ -1055,8 +1275,8 @@ class ResearchLoop(DomainKnowledgeMixin):
                 if best_val > 0.01 and domain_val > best_val * 1.10:
                     quality_degraded = True
                     logger.warning(
-                        f"QUALITY DEGRADATION: {domain_key} = {domain_val:.4f} "
-                        f"vs best = {best_val:.4f} ({(domain_val/best_val - 1)*100:.1f}% worse)"
+                        f"QUALITY DEGRADATION: {domain_key} = {_ff(domain_val)} "
+                        f"vs best = {_ff(best_val)} ({(float(domain_val)/float(best_val) - 1)*100:.1f}% worse)"
                     )
                     break
             # Always update best — first occurrence or improvement

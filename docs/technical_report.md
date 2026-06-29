@@ -871,6 +871,9 @@ experiment:
 ## 附录 B: SQLite 数据库模式
 
 ```sql
+-- ⚠️ 以下 DDL 为早期设计快照，已与现行代码不一致（experiments 表实际列定义见
+-- core/memory.py:_init_db；dead_end 真相源已迁移至 memory_entries，experiments 表
+-- 不再有 dead_end 列）。权威 schema 清单见 docs/DATA_CONTRACT.md。
 -- 实验记录
 CREATE TABLE experiments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

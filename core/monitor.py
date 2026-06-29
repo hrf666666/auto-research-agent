@@ -280,9 +280,11 @@ class ExperimentMonitor:
         # Use shared parser for val_MAE / rmse / accuracy etc.
         metrics = {}
         parsed = extract_metrics(log_text)
-        # extract_metrics returns lowercase keys; keep original-case values
+        # extract_metrics returns lowercase keys with float values.
+        # Keep as float — do NOT str(), that breaks falsification gate
+        # comparisons and fact milestone formatting (Reform v21 fix).
         for k, v in parsed.items():
-            metrics[k] = str(v)
+            metrics[k] = v
 
         # Monitor-specific patterns not in the shared parser
         for line in reversed(log_lines):

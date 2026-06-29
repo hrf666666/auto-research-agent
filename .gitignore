@@ -12,6 +12,7 @@ venv/
 workspace/
 *.log
 .cycle_counter
+experiment_history.db
 *.pt
 *.pth
 *.ckpt

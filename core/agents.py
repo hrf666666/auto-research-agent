@@ -12,12 +12,27 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("autoresearcher.agents")
+
+
+class _LLMCallTimeout(Exception):
+    """Raised when a single LLM API call exceeds its wall-clock budget.
+
+    GLM's streaming mode (for chunk in response_stream) is NOT protected by
+    the socket timeout — if the server stops sending chunks, the client blocks
+    forever (verified: process stuck in do_poll for 4+ min). This exception
+    is raised by SIGALRM to break out of that block so failover can kick in.
+    """
+
+
+def _llm_timeout_handler(signum, frame):
+    raise _LLMCallTimeout("LLM call exceeded wall-clock timeout (stream hung)")
 
 
 # Agent definitions directory
@@ -542,7 +557,54 @@ class AgentDispatcher:
         # Persist conversation for within-cycle coherence
         self._leader_history = messages + [{"role": "assistant", "content": response_text}]
 
-        result = self._parse_leader_response(response_text)
+        result = self._parse_leader_response(response_text, task=task)
+
+        # Phase 2a (Reform v21): THINK parse-failure retry with feedback.
+        # Phase 0 probe showed GLM usually outputs valid JSON (often in ```json
+        # fences) but occasionally outputs prose. A single feedback retry
+        # recovers most of these. REFLECT failures are handled by the fact
+        # spine (Phase 2b), so we only retry THINK here.
+        if (
+            task == "think"
+            and result.get("action") == "wait"
+            and "Unparseable" in result.get("reason", "")
+        ):
+            retry_messages = list(self._leader_history) + [{
+                "role": "user",
+                "content": (
+                    "Your previous response could not be parsed as a decision JSON. "
+                    "Please output your decision as a ```json code block containing "
+                    "a JSON object with at least these fields: "
+                    '"action", "task", "hypothesis", "success_criteria". '
+                    "Do not write prose before or after the JSON block."
+                ),
+            }]
+            try:
+                retry_response, retry_trace = self._call_llm(
+                    system=system_prompt,
+                    messages=retry_messages,
+                    tools=None,
+                    max_turns=10,
+                    task_tier=task,
+                )
+                retry_result = self._parse_leader_response(retry_response, task=task)
+                # Only accept retry if it actually parsed (not another default wait)
+                if "Unparseable" not in retry_result.get("reason", ""):
+                    logger.info(
+                        f"THINK retry succeeded after parse failure. "
+                        f"action={retry_result.get('action')}"
+                    )
+                    self._leader_history = retry_messages + [
+                        {"role": "assistant", "content": retry_response}
+                    ]
+                    if retry_trace is not None and retry_trace.calls:
+                        retry_result["leader_trace"] = retry_trace.to_dict()
+                    return retry_result
+                else:
+                    logger.warning("THINK retry also failed to parse. Defaulting to wait.")
+            except Exception as e:
+                logger.warning(f"THINK retry call failed: {e}")
+
         # F23 fix: previously the REFLECT trace was discarded (_trace). During
         # REFLECT the Leader uses read_file/list_files for cross-validation,
         # so the trace records what it actually inspected — valuable both for
@@ -1001,7 +1063,19 @@ class AgentDispatcher:
                             "contain '/coding/'. Check TOKEN_PLAN_PROVIDERS."
                         )
                     })
-                client = ZhipuAiClient(api_key=api_key, base_url=base_url)
+                # CRITICAL: pass an explicit timeout. Without it, ZhipuAiClient
+                # (httpx under the hood) has NO read timeout — if the server
+                # half-closes the socket (CLOSE-WAIT), the client polls forever
+                # and the whole agent hangs indefinitely (verified: process
+                # stuck in do_poll for 4+ min, no log, no crash). 120s matches
+                # the openai.OpenAI path below; thinking-mode calls can be slow
+                # so keep it generous, but it MUST be bounded.
+                client = ZhipuAiClient(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=120.0,
+                    max_retries=1,
+                )
             else:
                 kwargs = {
                     "timeout": 120.0,
@@ -1084,6 +1158,14 @@ class AgentDispatcher:
 
                     if is_glm:
                         # ── GLM Streaming Mode ──
+                        # Wall-clock protection: streaming reads are NOT covered
+                        # by socket timeout. If the server stops sending chunks,
+                        # the for-loop blocks forever. SIGALRM breaks it so
+                        # failover can kick in. 120s = generous for thinking mode
+                        # (normal calls take 10-30s), but bounded.
+                        _LLM_WALL_CLOCK = 120
+                        signal.signal(signal.SIGALRM, _llm_timeout_handler)
+                        signal.alarm(_LLM_WALL_CLOCK)
                         response_stream = client.chat.completions.create(**create_kwargs)
                         reasoning_parts = []
                         content_parts = []
@@ -1135,10 +1217,20 @@ class AgentDispatcher:
                                                     base_fn.arguments = (getattr(base_fn, 'arguments', None) or "") + fn.arguments
 
                                 # Capture finish_reason from last chunk
-                                fr = getattr(chunk.choices[0], 'finish_reason', None)
+                                fr = getattr(chunk.choices[0], "finish_reason", None)
                                 if fr:
                                     finish_reason = fr
+                            signal.alarm(0)  # cancel wall-clock timer — stream completed
+                        except _LLMCallTimeout:
+                            signal.alarm(0)
+                            partial_content = "".join(content_parts)
+                            logger.warning(
+                                f"GLM stream hung >{_LLM_WALL_CLOCK}s (wall-clock timeout). "
+                                f"Partial: {partial_content[:150]!r}... Triggering failover."
+                            )
+                            raise  # Re-raise for failover
                         except Exception as stream_err:
+                            signal.alarm(0)
                             partial_content = "".join(content_parts)
                             logger.warning(
                                 f"GLM stream interrupted: {stream_err}. "
@@ -1726,9 +1818,23 @@ class AgentDispatcher:
 
         return "\n".join(parts)
 
-    def _parse_leader_response(self, response: str) -> dict:
-        """Parse Leader's response into structured action."""
-        parsed = self._extract_first_decision_json(response)
+    def _parse_leader_response(self, response: str, task: str = "think") -> dict:
+        """Parse Leader's response into structured action.
+
+        task selects the schema key used to accept a parsed JSON object:
+          - "think"   requires an ``action`` key (decision schema)
+          - "reflect" requires a ``milestone`` or ``decision`` key (reflection
+            schema, which legitimately has NO ``action`` key — see leader.md)
+
+        Reform v21 root-cause fix: previously this method always demanded an
+        ``action`` key, but REFLECT's schema (milestone/decision/dead_end/
+        active_problem/causal_link/lesson) contains no ``action`` key. So every
+        valid REFLECT JSON was rejected as "Unparseable", REFLECT was reported as
+        "100% failing", and the wrong root cause ("LLM writes prose") was logged.
+        Black-box testing (Reform v21 angle-3 probe) proved GLM returns valid
+        REFLECT JSON 3/3 — the parser was the bug, not the model.
+        """
+        parsed = self._extract_first_decision_json(response, task=task)
         if parsed is not None:
             return parsed
 
@@ -1747,19 +1853,33 @@ class AgentDispatcher:
         }
 
     @staticmethod
-    def _extract_first_decision_json(response: str) -> Optional[dict]:
+    def _extract_first_decision_json(response: str, task: str = "think") -> Optional[dict]:
         """Find the first balanced {...} in `response` that parses to a dict
-        with an ``action`` key.
+        matching the expected schema for `task`.
 
         B6 fix: the old walker counted braces without tracking string context,
         so a brace inside a JSON string value (e.g. ``"task": "apply {x:1}"``)
         made depth hit 0 at the wrong offset and the real JSON was never
         extracted. This version is string-aware: it tracks ``in_string`` and
         handles ``\\`` escapes, and it also strips ``` ```json ``` fences first.
-        Returns None if no decision JSON is found.
+
+        Schema selection (Reform v21 root-cause fix): a parsed JSON object is
+        accepted only if it carries a key that identifies its schema.
+          - task="think"   → must contain ``action`` (decision schema)
+          - task="reflect" → must contain ``milestone`` or ``decision`` (the
+            reflection schema has no ``action`` key; demanding one rejected
+            every valid REFLECT output — see _parse_leader_response docstring).
+        Returns None if no matching JSON is found.
         """
         if not response:
             return None
+
+        # Which key(s) identify the expected schema for this task.
+        # A parsed dict must contain at least one of these to be accepted.
+        if task == "reflect":
+            schema_keys = ("milestone", "decision")
+        else:
+            schema_keys = ("action",)
 
         # Strip markdown code fences so fenced JSON is parsed directly.
         # Keep this conservative: only strip a leading fence and a trailing fence.
@@ -1799,27 +1919,15 @@ class AgentDispatcher:
                         candidate = stripped[start:i + 1]
                         try:
                             parsed = json.loads(candidate)
-                            if isinstance(parsed, dict) and "action" in parsed:
+                            if isinstance(parsed, dict) and any(
+                                k in parsed for k in schema_keys
+                            ):
                                 return parsed
-                            # Balanced & valid JSON but not a decision — keep scanning.
+                            # Balanced & valid JSON but wrong schema — keep scanning.
                         except json.JSONDecodeError:
                             pass
                         start = None
         return None
-
-
-        # Parse failure must NEVER auto-trigger an experiment. A confused,
-        # truncated, or empty leader response used as a task description would
-        # send the code agent off to modify code on garbage instructions. Wait
-        # is the safe default — the next cycle can retry with fresh context.
-        logger.warning(
-            f"Leader response unparseable (no decision JSON found). "
-            f"Defaulting to wait. Response head: {response[:200]!r}"
-        )
-        return {
-            "action": "wait",
-            "reason": f"Unparseable leader response: {response[:200]}",
-        }
 
     def _parse_worker_response(self, response: str, agent_type: str, trace: ToolTrace = None, task: str = "") -> dict:
         """Parse worker response into structured result.

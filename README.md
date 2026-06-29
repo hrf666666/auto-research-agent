@@ -42,15 +42,18 @@ LLM (Leader) decides what to do based on:
 
 System provides:
   - Tool layer with built-in safety (naming, dead-end checks, GC)
+  - Methodology gates (falsification, control coverage, dead-end signature, spec conformance)
   - 12-layer VERIFY (objective result validation)
   - Provider failover (GLM → Qwen) with quota cooldown
   - Structured memory (quantitative results written deterministically)
+  - DB read/write contract test (catches orphan tables/columns before they ship)
 ```
 
 **Design principles:**
-- System = hard constraints (safety, lifecycle, tools, memory)
+- System = hard constraints (safety, lifecycle, tools, memory, methodology)
 - Prompt = research methodology (how to think, not what to do)
 - LLM = PhD brain (design, implement, judge, iterate)
+- Single source of truth per data type (e.g. dead_end lives in `memory_entries`, not duplicated across tables — see [docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md))
 
 See [docs/architecture.md](docs/architecture.md) for full documentation.
 
@@ -59,11 +62,14 @@ See [docs/architecture.md](docs/architecture.md) for full documentation.
 ## Key Features
 
 - **query_memory tool**: LLM actively queries experiment history
+- **Methodology gates**: falsification + control-coverage + dead-end-signature + spec-conformance gates (Phase 3/4 reform)
 - **Provider failover**: GLM → Qwen with quota-aware cooldown
 - **Anti-deception**: tool-trace verification (LLM can't fake results)
 - **Deterministic GC**: no LLM cost, archives temp files each cycle
 - **Tool-level safety**: naming enforcement, dead-end checks, dry-run gate
-- **99 automated tests**
+- **dead_end feedback loop**: falsified approaches are recorded and warned against on retry (single source of truth in `memory_entries`)
+- **DB read/write contract**: a test asserts every SQLite table has both a writer and a reader, and every SQL column reference matches the schema — orphan tables/columns fail the build
+- **255+ automated tests**
 
 ---
 
