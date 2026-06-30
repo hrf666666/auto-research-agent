@@ -14,6 +14,15 @@ workspace/
 .cycle_counter
 experiment_history.db
 *.pt
+
+# Local-only files (development scripts, papers, run artifacts)
+verify_runs/
+run_agent_overnight.sh
+docs/technical_report.*
+docs/phase0_probe_log.txt
+*.bak
+__pycache__/
+*.pyc
 *.pth
 *.ckpt
 *.bin

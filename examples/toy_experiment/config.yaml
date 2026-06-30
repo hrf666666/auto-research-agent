@@ -1,9 +1,13 @@
 # Toy experiment config — override defaults for quick demo
+# This example uses Anthropic (claude). Set ANTHROPIC_API_KEY to run.
+# For GLM (default in repo config): set GLM_CODING_PLAN_API_KEY and remove
+# the agent.model line to use "auto" (provider-managed model selection).
 project:
   name: "mnist-demo"
   brief: "PROJECT_BRIEF.md"
 
 agent:
+  provider: "anthropic"
   model: "claude-sonnet-4-6"
   max_cycles: 3
   max_steps_per_cycle: 2

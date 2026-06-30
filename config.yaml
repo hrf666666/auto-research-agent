@@ -4,7 +4,7 @@
 project:
   name: "depth_estimation_unify_theory"
   brief: "PROJECT_BRIEF.md"
-  workspace: "/home/bigboss/code"
+  workspace: "."
 
 # v18 Phase 4: goal definitions (config-driven, replaces hardcoded val_MAE)
 goals:

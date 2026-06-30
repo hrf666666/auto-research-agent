@@ -1,1510 +1,333 @@
 # Architecture
 
-> Detailed architecture documentation for Deep Researcher Agent.
+> Deep-dive into how AutoResearcher works. For a quick overview, see the [README](../README.md). For data-table contracts, see [DATA_CONTRACT.md](DATA_CONTRACT.md). 中文版：[architecture_CN.md](architecture_CN.md)
 
-## System Overview
+## Table of Contents
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Deep Researcher Agent                      │
-│                                                              │
-│  ┌─────────────┐                                             │
-│  │ config.yaml │──→ Configuration for all components         │
-│  └─────────────┘                                             │
-│                                                              │
-│  ┌──────────── Core Loop (loop.py) ────────────────────┐     │
-│  │                                                      │     │
-│  │  ┌───────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │     │
-│  │  │ THINK │→│ EXECUTE │→│ VERIFY  │→│ REFLECT │→↻  │     │
-│  │  └───┬───┘  └────┬────┘  └────┬────┘  └────┬────┘ │     │
-│  │      │             │              │                 │     │
-│  │      ↓             ↓              ↓                 │     │
-│  │  ┌───────────────────────────────────────┐          │     │
-│  │  │        Agent Dispatcher (agents.py)   │          │     │
-│  │  │                                       │          │     │
-│  │  │  Leader ──→ Idea / Code / Writing /  │          │     │
-│  │  │            Researcher                 │          │     │
-│  │  │  (w/ Reasoning Principles injection)  │          │     │
-│  │  └───────────────────────────────────────┘          │     │
-│  │      │             │              │                 │     │
-│  │      ↓             ↓              ↓                 │     │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │     │
-│  │  │ Memory   │ │ Monitor  │ │  Tools   │ │Verifier│ │     │
-│  │  │ Manager  │ │ (Zero$)  │ │ Registry │ │(CHECK) │ │     │
-│  │  └──────────┘ └──────────┘ └────┬─────┘ └────────┘ │     │
-│  │                                   │                    │     │
-│  │          ┌────────────────────────┼──────────┐       │     │
-│  │          │    ToolRegistry (v8)   │          │       │     │
-│  │          │  ┌─────────────────────┼───────┐  │       │     │
-│  │          │  │MCPClientMixin       │       │  │       │     │
-│  │          │  │(mcp_client.py)      │       │  │       │     │
-│  │          │  └─────────────────────┼───────┘  │       │     │
-│  │          │  ┌─────────────────────┼───────┐  │       │     │
-│  │          │  │ModelAnalyzerMixin   │       │  │       │     │
-│  │          │  │(model_analyzer.py)  │       │  │       │     │
-│  │          │  └─────────────────────┼───────┘  │       │     │
-│  │          └────────────────────────┼──────────┘       │     │
-│  │                                   │                    │     │
-│  │                            ┌──────┴──────┐            │     │
-│  │                            │   Vision    │            │     │
-│  │                            │  Analyzer   │            │     │
-│  │                            │(MCP+API)   │            │     │
-│  │                            │SSE+stdio   │            │     │
-│  │                            └─────────────┘            │     │
-│  │                                                      │     │
-│  │  ┌──────────── Research Intelligence (v8) ──────────┐│     │
-│  │  │ DomainKnowledgeMixin (domain_knowledge.py)       ││     │
-│  │  │ Idea Guardian (every 5 cycles)                    ││     │
-│  │  │ Direction Circuit Breaker                         ││     │
-│  │  │ Data Scarcity Awareness                           ││     │
-│  │  └──────────────────────────────────────────────────┘│     │
-│  │                                                      │     │
-│  │  ┌──────── Constraint Engine (v10, v16.1 cleanup) ─┐│     │
-│  │  │ StrategyEngine │ ContextPruner (14-key limit)   ││     │
-│  │  │ [Removed: PlannerChecker, QuickBenchmark,       ││     │
-│  │  │  AdaptiveThresholds, ImplementationTracker]     ││     │
-│  │  └──────────────────────────────────────────────────┘│     │
-│  │                                                      │     │
-│  │  ┌──────── Simulation Sandbox (v11) ───────────────┐│     │
-│  │  │ 5-layer evaluation: Feasibility → Design A/B →  ││     │
-│  │  │ Reference → Internal Behavior → Synthesis → Scale││     │
-│  │  │ Config-driven: gpu_memory_mb, timeout, shape     ││     │
-│  │  └──────────────────────────────────────────────────┘│     │
-│  │                                                      │     │
-│  │  ┌──────────── Audit & Safety ──────────────┐       │     │
-│  │  │ Experiment Auditor → 4-Level Escalation  │       │     │
-│  │  │ Error-handler skill │ Code-cleanup skill │       │     │
-│  │  └──────────────────────────────────────────┘       │     │
-│  │                                                      │     │
-│  │  ┌────────── Research ROADMAP (v15) ──────────────┐  │     │
-│  │  │ Module state machine: theory_verify → design   │  │     │
-│  │  │ → validation → integrated | Phase-gated gate   │  │     │
-│  │  │ 3-Strike hard gate | Circuit breaker priority  │  │     │
-│  │  └────────────────────────────────────────────────┘  │     │
-│  └──────────────────────────────────────────────────────┘     │
-│                                                              │
-│  ┌──────────── GPU Layer ──────────────────────────────┐     │
-│  │  detect.py  │  keeper.py (standalone utility)       │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                                                              │
-│  ┌──────────── Skills Layer ───────────────────────────┐     │
-│  │  daily-papers │ paper-analyze │ conf-search │ report │     │
-│  │  REASONING_PRINCIPLES.md │ error-handler │ auditor  │     │
-│  └─────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────┘
+1. [Design Philosophy](#1-design-philosophy)
+2. [System Overview](#2-system-overview)
+3. [The Research Cycle](#3-the-research-cycle)
+4. [Multi-Agent Architecture](#4-multi-agent-architecture)
+5. [Memory System](#5-memory-system)
+6. [Hard Constraints (the soul of the system)](#6-hard-constraints)
+7. [Provider & Failover](#7-provider--failover)
+8. [File Tree](#8-file-tree)
+9. [Configuration Reference](#9-configuration-reference)
+10. [Testing](#10-testing)
+11. [Appendix: Version History Highlights](#11-appendix-version-history-highlights)
+
+---
+
+## 1. Design Philosophy
+
+Three layers, each with a strict role:
+
+| Layer | Role | Implemented by |
+|---|---|---|
+| **System = hard constraints** | Safety, lifecycle, tools, memory, methodology — *the LLM cannot bypass these* | `core/tools.py`, `core/verifier.py`, `core/methodology_gates.py` |
+| **Prompt = research methodology** | *How* to think (form hypotheses, run controlled experiments, falsify) — not *what* to do | `agents/leader.md`, `agents/code_agent.md`, ... |
+| **LLM = PhD brain** | Design, implement, judge, iterate | The model itself (GLM / Qwen / Claude / GPT) |
+
+**One data type, one source of truth.** Each kind of data lives in exactly one place. For example, `dead_end` records exist only in `memory_entries` (`entry_type='dead_end'`), never duplicated across tables. This is enforced by the [L3 contract test](#10-testing).
+
+---
+
+## 2. System Overview
+
+```mermaid
+flowchart LR
+    subgraph Leader["Leader LLM (strong model)"]
+        T[THINK<br/>decide action]
+        R[REFLECT<br/>record outcome]
+    end
+
+    subgraph Workers["Worker LLMs (one at a time)"]
+        C[code agent<br/>write + train]
+        I[idea agent<br/>literature]
+        RE[researcher<br/>deep search]
+        W[writing agent<br/>reports]
+    end
+
+    subgraph System["Hard Constraints (non-LLM)"]
+        V[12-layer VERIFY]
+        MG[Methodology Gates]
+        CE[Constraint Engine]
+        TS[Tool Sandbox]
+    end
+
+    subgraph Memory["Memory (3-tier)"]
+        BRIEF["PROJECT_BRIEF.md<br/>(frozen)"]
+        LOG["MEMORY_LOG.md<br/>(rolling)"]
+        DB["experiment_history.db<br/>(full history)"]
+    end
+
+    T --> C & I
+    C --> V
+    V --> MG
+    MG --> R
+    R --> LOG & DB
+    CE -.->|forbidden rules| T
+    DB -.->|history| CE
 ```
 
-## Component Details
+The **Leader** decides what to do and reflects on results. **Workers** execute specialized tasks. The **System** layer enforces constraints the LLM cannot bypass. **Memory** persists across cycles and crash-restarts.
 
-### 1. Core Loop (`core/loop.py`)
+---
 
-The main orchestrator. Runs the THINK → EXECUTE → VERIFY → REFLECT cycle indefinitely.
+## 3. The Research Cycle
 
-**Key design decisions:**
-- **Signal handling**: SIGTERM/SIGINT trigger graceful shutdown
-- **Cycle counter**: Persisted to `.cycle_counter` file (survives restarts)
-- **Smart cooldown**: Polls every N seconds instead of fixed sleep
-- **Directive consumption**: Human directives are archived after reading (no re-reads)
-- **Error backoff**: Doubles cooldown after errors to prevent burn loops
-- **VERIFY phase**: Between EXECUTE and REFLECT, reverse-engineers whether each module actually worked
+One iteration of `ResearchLoop.run()` (`core/loop.py`):
 
-### 2. Agent Dispatcher (`core/agents.py`)
-
-**Leader-Worker pattern** where:
-- Leader persists conversation within a cycle (for coherent multi-step reasoning)
-- Workers are stateless (each dispatch is independent)
-- Only one worker runs at a time
-
-**Anti-Deception Architecture:**
-Every worker dispatch returns a **ToolTrace** alongside the LLM's text response. The ToolTrace records every tool call the LLM made, including the actual system-returned results. Key facts (PIDs, log file paths, exit codes) are extracted from tool results — never from LLM narrative text.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│               Anti-Deception Data Flow                       │
-│                                                               │
-│  LLM says: "I launched PID=12345, dry-run passed"           │
-│       │                                                       │
-│       ├──── Tool Trace says: launch_experiment NOT called    │
-│       │     → FABRICATION DETECTED                           │
-│       │     → experiment_launched = False                    │
-│       │     → deception_detected = True                      │
-│       │                                                       │
-│  LLM says: "dry-run OK, launching training"                 │
-│       │                                                       │
-│       ├──── Tool Trace says: launch_experiment returned      │
-│       │     {"pid": 67890, "log_file": "logs/exp.log"}      │
-│       │     → VERIFIED: pid=67890 from tool result           │
-│       │     → dry-run check: no "dry" command in trace       │
-│       │     → dry_run_performed = False (warning)            │
-│                                                               │
-│  VERIFY then checks:                                          │
-│  - Is PID 67890 a real process?                              │
-│  - Does log_file exist?                                      │
-│  - Did dry-run actually happen?                              │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    S([Cycle start]) --> SCAN["1. Fact Spine<br/>scan disk for experiment facts<br/>LLM-independent, idempotent"]
+    SCAN --> THINK["2. THINK<br/>Leader: action? hypothesis? success_criteria?"]
+    THINK --> BR{action?}
+    BR -->|wait| WAIT[record + continue]
+    BR -->|paper_research| PAPER["_execute_paper_research<br/>then VERIFY, REFLECT"]
+    BR -->|experiment| PRE["3. PRE-VERIFY<br/>intercept before EXECUTE"]
+    PRE --> EXE["4. EXECUTE<br/>code agent writes and launches experiment"]
+    EXE --> MON["5. MONITOR<br/>zero-LLM-cost poll until done"]
+    MON --> ALIGN["6. Align metrics<br/>monitor to fact_scanner fallback"]
+    ALIGN --> VIS["7. Visual analysis?<br/>if stuck or high-error domain"]
+    VIS --> VER["8. VERIFY<br/>12-layer check + anti-deception"]
+    VER --> GATES["9. Methodology Gates<br/>falsifiability / control / dead-end / spec"]
+    GATES --> REFL["10. REFLECT<br/>milestone / decision / dead_end / lesson"]
+    REFL --> REC["11. Record<br/>SQLite + memory + constraint rules"]
+    REC --> FB{"fuse blown?<br/>no progress 2+ and critical"}
+    FB -->|yes| DIR["write DIRECTIVE.md<br/>force paper_research"]
+    FB -->|no| GC["12. GC<br/>deterministic cleanup"]
+    GC --> NEXT([next cycle])
 ```
 
-**Key classes:**
-- `ToolTrace`: Records all tool calls + results from one LLM session
-- `ToolCallRecord`: Immutable record of one tool call
-- `extract_launch_facts()`: Gets PID/log_file from actual `launch_experiment` results
-- `extract_shell_facts()`: Gets exit codes from actual `run_shell` results
+**Key design points:**
 
-**Worker Types:**
-| Worker | Tools | Role |
-|--------|-------|------|
-| Idea Agent | `read_files`, `web_search`, `web_fetch`, `search_papers` | Literature research, hypothesis generation |
-| Code Agent | `read_files`, `write_file`, `run_shell`, `launch_experiment`, `log_memory` | Experiment implementation |
-| Writing Agent | `read_files`, `write_file`, `run_shell` | Reporting, documentation |
-| Researcher Agent | `web_search`, `web_fetch`, `search_papers`, `get_paper` | Deep literature search for breakthrough methods |
+- **Crash-resilient**: `cycle_count` is saved at the *start* of each cycle (`loop.py:231`), `state.json` is written atomically (tmp then rename, `loop.py:1378`). A crash resumes from the last saved cycle.
+- **Fact Spine first**: before any LLM reasoning, the system scans disk for real experiment facts (`outputs/*/experiment_manifest.json` + `train.log`). This is the ground truth — it survives even if the agent process was killed mid-run.
+- **REFLECT fallback is loud**: if REFLECT produces no milestone, the system derives one from facts but labels it `[REFLECT-FAILED]` — never disguising a degradation as success.
 
-**Code Agent Turn Budget:**
-- `max_turns`: 25 (reduced from 40 to prevent endless exploration)
-- Turn budget reminder injected into every tool result: shows current turn / max turns
-- At 60% budget: "WARNING: Stop exploring and focus on PRIMARY task"
-- At 80% budget: "CRITICAL: Must call launch_experiment NOW or report failure"
-- Consecutive `list_files` limited to 3 calls — prevents directory browsing loops
+---
 
-**Session Statistics Injection:**
-The Leader agent context includes SQLite session statistics:
-- Total cycles completed
-- Experiments launched count and launch rate
-- Dead ends accumulated
-- Recent failure patterns (last 3)
+## 4. Multi-Agent Architecture
 
-This enables the Leader to make informed decisions based on session history rather than only the current cycle's data.
+**Leader-Worker model** (`core/agents.py`). Only one worker runs at a time; others cost zero tokens.
 
-**Tiered Model Strategy:**
-Tasks are categorized by complexity. `STRONG_MODEL_TASKS` (think, reflect, idea, researcher) use the strong model for better reasoning. Routine tasks (code, writing) use the fast model to save tokens. Configurable via `"model": "auto"` in config.
+| Agent | Prompt | max_turns | Tools | Role |
+|---|---|---|---|---|
+| **Leader** | `leader.md` | 10 (reflect: 20) | log/query_memory, write/read/list_files | THINK + REFLECT decisions |
+| **code** | `code_agent.md` | 40 | run_shell, run_python, launch_experiment, diagnose, code_review, probe_model, ... | Implement + train |
+| **idea** | `idea_agent.md` | 12 | search_papers, get_paper, write/read | Literature + hypothesis |
+| **researcher** | `researcher_agent.md` | 30 | web_search, web_fetch, explore_citations, analyze_image | Deep search + multimodal |
+| **writing** | `writing_agent.md` | 30 | write/read/list_files | Reports |
 
-**Provider Failover:**
-When a provider fails, the system automatically falls back to the next available provider with health tracking and cooldown periods. Supports: `anthropic`, `openai`, `ali_token_plan`, `glm_token_plan`.
+**Dispatch** (`agents.py:513-668`):
+- `dispatch_leader(task)` → strong model chain (e.g. GLM: glm-5.2 then 5.1 then 5 ...)
+- `dispatch_worker(agent_type)` → code uses fast model; idea/researcher use strong
+- **Convergence gate**: code agent loses exploration tools (read/list/search) past 60% of turn budget — forced to converge on launching the experiment.
+- **Tool minimization**: each agent gets only 3–6 tools. Fewer tools = fewer tokens in every request.
 
-**Why this works:**
-- Leader sees the full picture without re-reading everything each step
-- Workers are cheap (no accumulated context)
-- Switching workers costs nothing (previous worker's context is gone)
-- **Facts come from system execution, not LLM claims**
+---
 
-### 3. Memory Manager (`core/memory.py`)
+## 5. Memory System
 
-**Two tiers with automatic compaction:**
+Three tiers, with strictly separated lifetimes:
 
-- **Tier 1 (Brief)**: Human-written, frozen. The "constitution" of the project.
-- **Tier 2 (Log)**: Agent-written, rolling. Milestones and decisions.
-
-**Compaction rules:**
-1. Milestones: Drop oldest when section exceeds 1,200 chars
-2. Decisions: Keep only last 15 entries
-3. Total log: Hard cap at 4,000 chars (summarize old entries first, then trim if still too large)
-4. Compression: Old entries are summarized into a single `[Historical N entries: ...]` line before deletion, preserving knowledge
-
-### 4. Experiment Monitor (`core/monitor.py`)
-
-**The zero-cost innovation.** During training:
-- `os.kill(pid, 0)` — is process alive? (zero cost)
-- `nvidia-smi` — GPU utilization (zero cost)
-- File tail read — last log lines (zero cost)
-
-No LLM API calls until training completes.
-
-### 5. Tool Registry (`core/tools.py` + Mixins)
-
-**v8 Architecture**: `ToolRegistry` inherits from two mixin classes:
-
-```
-ToolRegistry (core/tools.py, 1667 lines)
-  ├── MCPClientMixin (core/mcp_client.py, 724 lines)
-  │     MCP transport (SSE + stdio), service detection, vision tools
-  └── ModelAnalyzerMixin (core/model_analyzer.py, 2282 lines)
-        9-layer AST analysis, runtime probes, diagnostics, ablation design
+```mermaid
+flowchart TD
+    subgraph T1["Tier 1 - Frozen"]
+        PB["PROJECT_BRIEF.md<br/>agent never modifies"]
+    end
+    subgraph T2["Tier 2 - Rolling (LLM context)"]
+        ML["MEMORY_LOG.md<br/>milestones (priority queue)<br/>decisions (last N)<br/>dead_ends (never dropped)<br/>~5000 char budget"]
+    end
+    subgraph T3["Tier 3 - Full history"]
+        DB["experiment_history.db (SQLite)"]
+        EX["experiments<br/>per-cycle record"]
+        ME["memory_entries<br/>milestone/decision/dead_end/..."]
+        CC["causal_chain<br/>decision-to-metric links"]
+        CRL["code_review_lessons"]
+        PM["pareto_matrix"]
+        EV["experiment_value"]
+        EF["experiment_facts<br/>disk-scanned"]
+        DB --> EX & ME & CC & CRL & PM & EV & EF
+    end
+    T1 --> T2
+    T2 --> T3
 ```
 
-**Why mixins instead of a monolith**: The original `tools.py` was 4,714 lines — too large for effective maintenance. The mixin pattern preserves single-inheritance semantics while separating concerns. Each mixin is independently testable and can be reused by other classes.
-
-**Per-agent minimal tool sets** reduce token overhead:
-- Each tool definition is ~200 tokens in the API call
-- 15 tools = 3,000 extra tokens per call
-- 4 tools = 800 extra tokens per call
-- Over 100 API calls/day, that's 220K tokens saved
-
-**Security:** Shell commands are validated with regex-based safety checks (`_validate_command`). Shell operators (`cd`, `&&`, `|`, `> /dev/null`) are supported via `shell=True`, while dangerous operations (sudo, rm -rf /, dd to device) are blocked.
-
-**File write protection:** The `_exec_write_file` tool enforces:
-- Protected files: `state.json`, `MEMORY_LOG.md`, `PROJECT_BRIEF.md`, `config.yaml`, etc.
-- Protected directories: `models/`, `datasets/`, `data/`, `scripts/` — with exceptions:
-  - `scripts/*.py` is allowed (experiment scripts)
-  - `datasets/__init__.py` and `datasets/unified_lf_dataset.py` are allowed (dataset registration)
-- Synthetic data detection: Writing to `scripts/*.py` triggers pattern scanning for random noise (`np.random.rand`, `torch.rand`, `SyntheticLF`, `RandomDataset`). Returns a warning to the agent, and VERIFY will block the experiment.
-
-#### Model Analysis Tools (v5)
-
-Two complementary tools for model architecture understanding:
-
-**`analyze_model`** — Static multi-layer architecture analysis:
-```
-Layer 1: Surface analysis (parameter counts, channel ratios)
-Layer 2: Data flow graph (input → processing → fusion → output)
-Layer 3: Information bottleneck detection (compression > 8:1)
-Layer 4: Gradient path analysis (dead branches, skip connections)
-Layer 5: Structural soundness score (0-10)
-Layer 6: Domain assumption detection (EPI→Lambertian, FFT→stability, etc.)
-Layer 7: Data feasibility + GPU memory estimate
-Layer 8: Result-to-architecture diagnosis (when metrics provided)
-```
-
-**`probe_model`** — Runtime tensor diagnostics:
-```
-1. Instantiates model, runs forward+backward with dummy data
-2. Captures per-module activation statistics (mean/std/dead_ratio)
-3. Captures per-module gradient norms
-4. Computes gradient balance (max/min ratio, warns > 100x imbalance)
-5. Tests input sensitivity (random vs uniform vs near-zero)
-6. Optionally loads trained checkpoint for post-training diagnosis
-```
-
-| Tool | Type | Best For |
-|------|------|----------|
-| `analyze_model` | Static (AST) | Before training: catch design flaws |
-| `probe_model` | Runtime (PyTorch) | After training: diagnose why model failed |
-
-#### Research Intelligence Tools (v6→v7)
-
-**v7: Idea-Architecture Alignment** — Ensures models faithfully implement research ideas:
-```
-analyze_model() → Layer 9: idea_architecture_alignment
-  1. Parse PROJECT_BRIEF.md → extract 10 key idea components
-  2. Map idea components to model branches/modules
-  3. Per-branch channel allocation vs idea importance
-     - Flag: KEY INNOVATION branch < 15% of fusion → "under-represented"
-  4. Structural gap detection (skip connections, multi-scale, attention)
-     - Only flags patterns relevant to the specific idea
-  5. Decoder adequacy (depth, skip connections, domain-awareness)
-  6. Alignment score (0-10) + specific improvement suggestions
-
-Example output (AngularFreqDepthNetV2):
-  Score: 3/10 — "core idea components missing or under-represented"
-  CRITICAL: fft_branch gets only 11% of fusion channels (32/288)
-  MISSING: skip_connection_residual, multi_scale_processing
-  SUGGESTION: INCREASE fft_branch from 32 to ~72 channels
-```
-
-**v6: Research Intelligence Tools**
-
-Three new capabilities for PhD-level scientific reasoning:
-
-**`generate_diagnostic`** — Targeted diagnostic script generation:
-```
-Input:  Natural language question ("Is FFT branch dead for Non-Lambertian?")
-Output: Generated + executed Python diagnostic script
-
-Four diagnostic types (auto-detected from question):
-- domain_analysis:  Tests different input patterns (smooth/high_freq/specular/constant)
-- branch_analysis:  Compares branch activations + pairwise cosine similarity
-- gradient_analysis: Checks gradient flow + identifies bottleneck layers
-- attention_analysis: Analyzes attention weight distribution
-```
-
-**`design_ablation`** — Systematic ablation experiment planning:
-```
-1. AST parse model to identify all components
-2. Group by category: backbone, branch, head, fusion, normalization
-3. Generate ablation experiments:
-   - Component removal (each branch, normalization layers)
-   - Freeze (backbone, specific branches)
-   - Single-branch model
-   - Fusion replacement (learned → mean)
-4. Priority rank by expected information value
-```
-
-**Pareto Frontier + Causal Chain + VOI** (system-level, not tools):
-```
-pareto_matrix:    method × domain → best MAE (avoids repeating suboptimal methods)
-causal_chain:     design_decision → architectural_property → metric (tracks causation)
-experiment_value: hypothesis → expected_improvement × prior_probability (calibrates judgment)
-```
-
-### 6. GPU Utilities (`gpu/`)
-
-- **detect.py**: Auto-detect GPUs, check availability, reserve last GPU
-- **keeper.py**: Keep cloud instances alive with minimal GPU activity
-
-### 7. Reasoning Principles System (`skills/REASONING_PRINCIPLES.md`)
-
-A mandatory behavioral framework injected into every agent dispatch to reduce common LLM reasoning mistakes. Five principles (plus Verify-first) guide the THINK→EXECUTE→VERIFY→REFLECT cycle:
-
-| Principle | THINK | EXECUTE | VERIFY | REFLECT |
-|-----------|-------|---------|--------|---------|
-| **Think Before Acting** | State assumptions, present alternatives | Investigate before implementing | — | Don't rationalize failures |
-| **Simplicity First** | Pick simplest hypothesis to test | Change ONE variable, minimal code | — | — |
-| **Surgical Changes** | — | Only touch relevant files | — | — |
-| **Goal-Driven Execution** | Define concrete success criteria | Verify at each step | Check outputs vs criteria | Check if criteria were met |
-| **Verify-First** | — | — | Module outputs → are they real? | Address VERIFY failures before judging |
-| **Anti-Deception** | — | Don't trust claims, trust tool traces | Cross-verify PID/paths against tool trace | If fabrication detected, mark UNRELIABLE |
-
-**Injection mechanism:**
-- `_REASONING_REMINDER` constant in `agents.py` is prepended to every Leader dispatch
-- Code agent prompt (`agents/code_agent.md`) includes full principles in system prompt
-- Leader agent prompt (`agents/leader.md`) includes expanded Decision Framework with mandatory assumption/criteria steps
-
-### 8. Experiment Verifier (`core/verifier.py`)
-
-**The VERIFY phase: reverse-engineering whether each module actually worked.**
-
-Unlike the old auditor which checked static properties (code text matching, dataset registration), VERIFY checks **runtime behavior** — did the dataset loader actually load? Did the model produce valid loss? Did training make progress?
+**The dead_end feedback loop (data flow):**
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                     VERIFY Phase Pipeline                         │
-│                                                                    │
-│  Step 1: Artifact Discovery                                       │
-│  ├── Scan workspace for output files, logs, checkpoints           │
-│  └── Classify by module (dataset, model, training, evaluation)   │
-│                                                                    │
-│  Step 2: Module-Level Verification                                │
-│  ├── Dataset: files exist? shape/dtype valid? not all zeros?      │
-│  ├── Model: checkpoint exists? weights valid? forward pass OK?    │
-│  ├── Training: loss not NaN/Inf? decreasing? GPU was used?        │
-│  └── Evaluation: metrics file exists? values in expected range?   │
-│                                                                    │
-│  Step 3: Behavioral Cross-Checks                                  │
-│  ├── Plan vs reality: did EXECUTE implement what THINK planned?   │
-│  ├── Loss dynamics: is the loss curve physically plausible?       │
-│  └── Metric consistency: do reported metrics match training logs? │
-│                                                                    │
-│  Step 4: Diagnosis Output                                         │
-│  ├── PASS: module functioned correctly                            │
-│  ├── FAIL: module did not produce expected output (with detail)   │
-│  └── SKIP: module not applicable this cycle                       │
-│                                                                    │
-│  Step 5 (v5): Model Structural Soundness (Layer 9)               │
-│  ├── Dead modules: __init__ assigns but forward() never uses     │
-│  └── Fusion warnings: 3+ branches concatenated without balance   │
-│                                                                    │
-│  Step 6 (v6): Training Curve Analysis                             │
-│  ├── Overfitting: loss rises after minimum                        │
-│  ├── Oscillation: direction change ratio > 15%                    │
-│  ├── Convergence speed: < 5% total decrease = under-capacity     │
-│  └── Plateau: loss flat (< 0.1% change) for extended period      │
-└──────────────────────────────────────────────────────────────────┘
+LLM (REFLECT) produces dead_end text
+   -> log_dead_end() writes memory_entries (entry_type='dead_end')
+   -> get_dead_ends_full() / B9 gate reads it
+   -> constraint_engine generates StrategyRule (priority=forbidden after 5 failures)
+   -> launch_experiment tool hard-blocks forbidden methods
+   -> next THINK cycle sees the block
 ```
 
-**9 verification layers (+ training curve diagnostics):**
-1. Execution verification (did it run?)
-2. Output artifact verification (did it produce files?)
-3. Module functionality verification (did each module work?)
-4. Data integrity verification (is data valid?)
-5. Metric consistency verification (do metrics match logs?)
-6. Configuration consistency verification (checkpoint/config match?)
-7. System health verification (OOM, disk full?)
-8. Dataset quality verification (validation splits statistically meaningful?)
-9. **Model structural soundness** (v5 — dead modules, fusion balance)
+This is a **closed loop**: the agent learns from falsified approaches and is structurally prevented from repeating them. See [DATA_CONTRACT.md](DATA_CONTRACT.md) for the exact write/read contract of every table.
 
-**Training curve diagnostics** (v6, within Layer 3 loss function check):
-- Overfitting detection (loss rises > 5% above minimum in latter half)
-- Oscillation detection (direction change ratio > 15%)
-- Convergence speed classification (very_slow / fast_early_plateau / normal)
-- Plateau detection (< 0.1% variation over extended window)
+---
 
-**Key design:**
-- **Zero LLM cost**: All checks are file/system-based (no API calls)
-- **Structured diagnosis**: `VerifyReport` with per-module `VerifyCheck` objects
-- **Actionable**: Each failure includes a detail string explaining *what* went wrong
-- **Composable**: New module checkers can be added via `ExperimentVerifier` subclass
-- **Anti-Deception**: Cross-verifies tool trace against LLM claims:
-  - `llm_fabrication`: LLM claimed experiment launched but `launch_experiment` was never called
-  - `pid_trace_mismatch`: PID in LLM text differs from PID in tool trace
-  - `dry_run_skipped`: Experiment launched without mandatory dry-run
-  - `dry_run_failed`: Dry-run failed but experiment was launched anyway
+## 6. Hard Constraints
 
-### 9. Audit Escalation System (`core/loop.py`)
+The constraints below run in the **tool/fact layer**, not the LLM layer. The LLM cannot talk its way around them.
 
-A 4-level escalation system that prevents the agent from looping indefinitely on repeated errors. Now powered by VERIFY failure detection:
+### 6.1 Tool-level safety (`core/tools.py`)
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     Audit Escalation Flow                         │
-│                                                                    │
-│  VERIFY Phase (every cycle)                                       │
-│       │                                                            │
-│       ▼                                                            │
-│  ┌─────────────────┐                                               │
-│  │ Same issue again?│──→ No ──→ Reset counter                     │
-│  └────────┬────────┘                                               │
-│           │ Yes                                                     │
-│           ▼                                                        │
-│  ┌─────────────────────────────────────────────────┐               │
-│  │ Count ≥ 3?  (L1) ──→ Inject DIRECTIVE.md        │               │
-│  │ Count ≥ 6?  (L2) ──→ Force error-handler skill  │               │
-│  │ Count ≥ 9?  (L3) ──→ Pause + AGENT_STUCK.md     │               │
-│  │ Count ≥ 12? (L4) ──→ Mark unfixable dead_end    │               │
-│  └─────────────────────────────────────────────────┘               │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-**L4 (unfixable)** is new: after 4x the threshold attempts, the issue is logged as a dead_end and the counter is reset. The agent stops trying to fix this automatically and moves on to alternative approaches.
-
-**VERIFY checks include:**
-1. Dataset: files exist, shape/dtype valid, not all zeros/ones
-2. Model: checkpoint exists, weights contain no NaN/Inf, forward pass produces valid output
-3. Training: loss is not NaN/Inf, loss decreased over time, GPU was actually used
-4. Evaluation: metrics file exists, values in expected range, match training logs
-5. Plan vs reality: THINK plan items implemented by EXECUTE
-6. Loss dynamics: loss curve is physically plausible
-7. Runtime data fingerprint: loads one sample from dataset, checks spatial correlation and constant values to verify training used real data (not random noise)
-
-**Error-handler skill** (`skills/error-handler/SKILL.md`) provides a 7-step diagnostic workflow:
-1. Identify error → 2. Read relevant files → 3. Diagnose root cause → 4. Validate fix → 5. Apply minimal fix → 6. Re-validate → 7. Cleanup
-
-### 10. Token Plan Provider Support (`core/agents.py`)
-
-Cost-optimized LLM providers using OpenAI-compatible protocol:
-
-```yaml
-# config.yaml
-agent:
-  provider: "ali_token_plan"    # Alternative to "anthropic" / "openai"
-  model: "qwen3.6-plus"         # See TOKEN_PLAN_PROVIDERS for all models
-```
-
-**Available models:**
-| Provider | Models | Best For |
-|----------|--------|----------|
-| `ali_token_plan` | qwen3.6-plus, deepseek-v3.2, glm-5, MiniMax-M2.5 | Cost-optimized daily experiments |
-| `ali_token_plan` | qwen-image-2.0, wan2.7-image | Image generation tasks |
-| `glm_token_plan` | glm-5.1, glm-5-turbo | Zhipu GLM Coding Plan |
-
-**Architecture:** All token plan providers use the OpenAI-compatible API (`_call_token_plan`), which shares the same tool-execution loop as `_call_openai`. Automatic failover between providers with health tracking and cooldown.
-
-### 11. No-Progress Paper Research Fallback (`core/loop.py`)
-
-When the agent detects repeated cycles with no progress on the same experimental plan, it automatically redirects effort to paper research:
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     No-Progress Detection                         │
-│                                                                    │
-│  After each REFLECT:                                              │
-│       │                                                            │
-│       ▼                                                            │
-│  ┌──────────────────────┐                                          │
-│  │ Same plan repeated   │──→ No ──→ Continue normal cycle          │
-│  │ N times with no      │                                          │
-│  │ metric improvement?  │──→ Yes ──→ Dispatch Researcher Agent     │
-│  └──────────────────────┘            to search for new methods     │
-│                                      via papers/arXiv              │
-│                                      ↓                             │
-│                                      New ideas feed back into      │
-│                                      next THINK phase              │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-This prevents the agent from looping endlessly on a plateau. Instead of repeating the same failed approach, it seeks breakthrough methods from the literature.
-
-### 12. Dataset Understanding System (`core/loop.py` + `core/verifier.py`)
-
-On the first cycle (or when `DATASET_MANIFEST.json` is missing), the agent performs a mandatory scan of the `data/` directory:
-
-- Validates file existence and structure
-- Checks data shapes, dtypes, and value ranges
-- Produces a structured `DATASET_MANIFEST.json` for future reference
-- Feeds dataset understanding into the THINK phase
-
-This ensures the agent knows what data it's working with before making experimental plans.
-
-### 13. Visual Analysis & Vision MCP (`core/visual_analyzer.py` + `core/tools.py`)
-
-When training results are consistently poor (>= 5 consecutive no-progress cycles), the agent triggers a **visual analysis pipeline**:
-
-```
-Inference Pipeline:
-1. Find best checkpoint → run inference on validation scenes
-2. Collect output images (depth maps, predictions)
-3. Send to multimodal LLM for visual diagnosis
-4. Parse into structured findings for REFLECT phase
-```
-
-#### MCP Transport Architecture
-
-The system uses **two MCP transport types** depending on the service:
-
-| Service | Transport | How it works |
-|---------|-----------|-------------|
-| web_search_prime | SSE (remote) | `GET /sse` → endpoint event → `POST /message` (dual-connection) |
-| web_reader | SSE (remote) | Same as above |
-| zread | SSE (remote) | Same as above |
-| zai-mcp-server | stdio (local) | `npx @z_ai/mcp-server` subprocess, stdin/stdout JSON-RPC |
-
-**SSE dual-connection protocol** (GLM platform services):
-- Connection 1: `GET /sse` — long-lived SSE stream, background reader thread collects responses
-- Connection 2: `POST /message?sessionId=...` — send JSON-RPC requests (returns empty HTTP 202)
-- All responses arrive asynchronously on the SSE stream
-
-**stdio transport** (zai-mcp-server vision):
-- Spawned as `npx -y @z_ai/mcp-server` with `Z_AI_API_KEY` + `Z_AI_MODE=ZHIPU` env vars
-- JSON-RPC messages sent via stdin, responses read from stdout (newline-delimited)
-- **Requires Node.js 18+ and npx** — if absent, the degradation chain skips MCP entirely
-
-#### Vision Degradation Chain
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. MCP zai-mcp-server (stdio, requires Node.js + npx)          │
-│    Tools: analyze_image, diagnose_error_screenshot,             │
-│    analyze_data_visualization, understand_technical_diagram,    │
-│    extract_text_from_screenshot, ui_diff_check, ui_to_artifact, │
-│    analyze_video                                                 │
-│    Images: local file paths (subprocess reads filesystem)       │
-├─────────────────────────────────────────────────────────────────┤
-│ 2. Direct API — GLM Coding Plan (GLM_CODING_PLAN_API_KEY)       │
-│    Models: glm-5v-turbo → glm-4.6v                              │
-│    Endpoint: open.bigmodel.cn/api/coding/paas/v4                │
-│    Images: base64 data URLs                                      │
-├─────────────────────────────────────────────────────────────────┤
-│ 3. Direct API — Ali Token Plan (ALI_TOKEN_PLAN_API_KEY)          │
-│    Models: qwen3.6-plus                                          │
-│    Endpoint: token-plan.cn-beijing.maas.aliyuncs.com             │
-│    Images: base64 data URLs                                      │
-├─────────────────────────────────────────────────────────────────┤
-│ 4. Direct API — Ali DashScope (ALI_API_KEY)                      │
-│    Models: qwen3.6-plus → qwen3.5-plus                          │
-│    Endpoint: dashscope.aliyuncs.com                              │
-│    Images: base64 data URLs                                      │
-└─────────────────────────────────────────────────────────────────┘
-
-Note: If Node.js is not installed, step 1 is skipped entirely.
-      Steps 2-4 work without any Node.js dependency.
-```
-
-**MCP Vision Tools** (via `@z_ai/mcp-server`, stdio transport):
-- `analyze_image`: General-purpose image understanding
-- `diagnose_error_screenshot`: Parse error popups/stack traces
-- `extract_text_from_screenshot`: OCR from screenshots
-- `analyze_data_visualization`: Charts → trends/anomalies
-- `understand_technical_diagram`: Architecture/flow diagrams
-- `ui_diff_check`, `ui_to_artifact`, `analyze_video`
-
-**Agent-facing tools**:
-- `analyze_image` (researcher agent): Routes `analysis_type` to specialized MCP tools, with API fallback
-- `diagnose_error` (code agent): Error screenshot diagnosis with MCP + API fallback
-
-**Parameter compatibility**: Internal code uses `image_path`, auto-remapped to `image_source` for zai-mcp-server. Tool name `image_analysis` auto-remapped to `analyze_image`.
-
-**Node.js requirement**: Vision MCP requires Node.js 18+ with npx. Install via `apt install nodejs` (Ubuntu) or `brew install node` (macOS). Without Node.js, vision analysis degrades gracefully to direct multimodal API calls.
-
-### 14. Enhanced REFLECT Phase (`core/agents.py`)
-
-The REFLECT phase has been enhanced for deep cross-validation:
-
-| Feature | Value |
-|---------|-------|
-| Tools available | `read_file`, `list_files` |
-| Max turns | 20 (vs 10 for other phases) |
-| Max tokens | 16384 (vs 4096 previously) |
-| Cross-validation | Read model code + data manifest + training logs |
-
-The Leader receives explicit prompting to use these tools for **Step 3.5: Visual + Code Cross-Validation**:
-1. Read model source code to verify architecture matches visual findings
-2. Read `DATASET_MANIFEST.json` to check data splits
-3. Read training logs to verify loss curves
-4. List output files to check what artifacts were produced
-
-### 15. Auto Code-Cleanup v2 (`core/loop.py`)
-
-Automatic cleanup triggers with 6 conditions:
-
-| # | Condition | Threshold |
-|---|-----------|-----------|
-| 1 | Root .py files | > 15 |
-| 2 | Unarchived log files | > 10 |
-| 3 | Output experiment dirs | > 10 |
-| 4 | Archived experiments | > 20 |
-| 5 | scripts/ .py files | > 10 (naming pollution) |
-| 6 | Experiment failed | Immediate trigger |
-
-Cleanup steps: outputs/ (delete dry-runs, keep only best_checkpoint.pt) → archive/ (delete .pt files, remove dirs without SUMMARY.md) → scripts/ (delete stale/diagnostic scripts) → root .py files.
-
-### 16. Script Naming Convention (`agents/code_agent.md`)
-
-Enforced naming rules for experiment scripts:
-
-| Category | Pattern | Example |
-|----------|---------|---------|
-| Training | `train_{model}.py` | `train_v12.py`, `train_dcbn.py` |
-| Evaluation | `eval_{target}.py` | `eval_per_domain.py` |
-| Diagnostic | `diagnose_{target}.py` | `diagnose_gt_stats.py` |
-| One-time | `_{name}.py` (delete after use) | `_check_shapes.py` |
-| Dry-run output | `dry_*` or `dryrun_*` | Auto-cleaned |
-
-**Forbidden**: `*_v2.py`, `*_fix.py`, `*_new.py`, `test_*.py`, `debug_*.py`
-
-### 17. Output Quality Awareness (`core/loop.py`)
-
-The agent now tracks per-domain metrics and detects when experiments produce "successful bad results":
-
-- `_best_domain_metrics`: Tracks best metric per domain (dynamically from `domain_keys`).
-- `_quality_alert_streak`: Counts consecutive cycles with domain degradation (>10% worse than best).
-- When streak >= 2: Forces paper research with hypothesis validation prompt.
-
-### 18. Strategic Abandonment (`core/loop.py`)
-
-Research direction stagnation detection prevents the agent from stuck in the same approach:
-
-- `_extract_direction_signature()`: Extracts methodology keywords from task description (edge/loss/pretrain/epi/angular/etc.) with hyphen/underscore normalization.
-- `_direction_stagnation_count`: Counts cycles without improvement in the same direction.
-- When count >= 3: Forces paper research for fundamentally different approaches.
-
-### 19. Infrastructure Degradation (`core/loop.py`)
-
-After 3 consecutive infrastructure failures (API timeout, process crash):
-
-- VERIFY no longer blocks experiments — runs in non-blocking mode.
-- Infrastructure issues are logged but don't halt progress.
-- Counter resets when no new infra failures occur.
-
-### 20. Enhanced REFLECT Prompts (`core/loop.py`)
-
-Two new prompts are injected into the REFLECT context:
-
-- **Cross-Domain Analysis Prompt**: Forces the Leader to analyze WHY different domains perform differently, identify violated method assumptions, and estimate the current approach's ceiling.
-- **Hypothesis Validation Prompt**: When quality degrades repeatedly, the agent must state the core assumption, identify which domain violates it, and propose a new method.
-
-### 21. Configuration Consistency Verification (`core/verifier.py`)
-
-New VERIFY Layer 6 checks:
-
-- Checkpoint mismatch detection: Scans training log tail (last 50KB) for "size mismatch" or "missing key" errors.
-- Hardcoded parameter detection: Flags `num_views` hardcoded values that may not match actual data grid sizes.
-
-### 22. Dynamic Domain Knowledge (`core/domain_knowledge.py`) — v8
-
-Replaces all hardcoded domain-specific logic with dynamic extraction:
-
-- **`DomainKnowledgeMixin`** is inherited by `ResearchLoop` (same pattern as `MCPClientMixin` for `ToolRegistry`)
-- **`METHOD_PROPERTIES`**: Generic method database (7 entries: EPI, FFT, attention, ResNet, sigmoid, Conv3D, contrastive) with scientific knowledge only. Each entry has `patterns` (for detection), `assumption`, `violated_when`, `failure_symptoms`, and `alternatives`. Adding a new method here automatically enables detection for all projects.
-- **`_infer_domain_compatibility()`**: Extracts domain names from PROJECT_BRIEF text, then uses method violation conditions to determine strong/weak domains. No hardcoded "EPI is strong for Lambertian" logic.
-- **`_extract_data_constraints()`**: Detects data scarcity (`< 10 training samples`) and data imbalance from brief text patterns.
-- **`_detect_implemented_methods()`**: Scans `models/` directory to find which methods are actually in the codebase.
-- **Cross-project reusability**: Zero hardcoded project references. The same module works for any domain.
-
-### 23. Idea Guardian & Direction Circuit Breaker — v8
-
-Two mechanisms to prevent research direction drift:
-
-**Idea Guardian** (every 5 cycles):
-- Injects `idea_guardian_check` context into THINK phase
-- Forces Leader to: (1) re-read PROJECT_BRIEF phase goals, (2) rate core idea implementation / phase completion / data-first verification (each 0-10), (3) propose course correction if any score < 5
-- Prevents the common failure mode of spending 20+ cycles on incremental tuning while ignoring the core research idea
-
-**Direction Circuit Breaker**:
-- When `_direction_stagnation_count >= _direction_change_threshold`, injects `direction_circuit_breaker` context
-- Forces Leader to stop and re-read PROJECT_BRIEF, record current direction as dead end, propose fundamentally different approach
-- Prevents infinite loops on the same failed direction
-
-**Data Scarcity Awareness**:
-- When `data_constraints` detects < 10 training samples for a domain, injects `data_scarcity_warning`
-- Leader is instructed: "DO NOT propose architecture changes — the model CANNOT learn domain-specific features from < 10 samples"
-- Hard wall prevents wasted GPU hours on impossible tasks
-
-### 24. Data Analysis Experiments — v8
-
-Not every experiment requires model training. v8 explicitly supports data analysis experiments:
-
-- **Code Agent workflow**: New section in `code_agent.md` describes data analysis experiment patterns
-- Uses `run_shell` (NOT `launch_experiment`) since no training is involved
-- Designed for Phase 1 verification (verify data supports the idea before building models)
-- Scripts prefixed with `_` and deleted after use (e.g., `_phase1_fft_analysis.py`)
-- Example: "Load 5 scenes from each domain, compute angular FFT spectra, plot histograms, report KL divergence"
-
-### 25. Memory Configuration Injection — v8
-
-`MemoryManager.__init__` now accepts optional parameters:
-- `method_keywords: dict` — custom method→keyword mapping (default: generic method vocabulary)
-- `domain_keys: list` — custom domain metric keys (default: inferred from `DATASET_MANIFEST.json`)
-- `get_method_domain_effect_matrix()` and related queries use instance variables instead of hardcoded values
-- Enables cross-domain reuse without code changes
-
-### 26. Forward Design Pipeline (`core/idea_planner.py`) — v9
-
-**IdeaPlanner** generates a PhD-level architecture plan from `PROJECT_BRIEF.md` before any model code is written. The 9-phase pipeline:
-
-1. **Idea Formalization** — Extracts hypothesis, innovations, assumptions, success criteria from PROJECT_BRIEF
-2. **Module Decomposition** — Breaks idea into independent functional modules using `IDEA_PATTERNS` (6 generic architectural patterns)
-3. **Capacity Planning** — Channel counts, parameter budgets (light/medium/heavy tiers)
-4. **Fusion Strategy** — Optimal combination method (attention_weighted, gated, concat, etc.)
-5. **Integration Plan** — Data flow, skip connections, normalization choices
-6. **Verification Plan** — Per-module and overall verification checkpoints
-7. **Risk Assessment** — Data scarcity, branch imbalance, overfitting probability
-8. **Implementation Order** — Which module to build first, second, etc.
-9. **Alignment Score** — Overall plan quality rating (0-10)
-
-**Knowledge organization design**:
-- `_extract_innovations()`: Vocabulary-to-concept mapping (natural language → abstract innovation categories). This is a knowledge organization method — adding new term-category pairs extends coverage without changing logic.
-- `_extract_physical_assumptions()`: Pattern-based assumption extraction from text
-- `_extract_target_domains()`: Generic CV domain vocabulary (Lambertian, outdoor, indoor, specular, etc.)
-- `_INNOVATION_TO_PATTERN`: Maps innovation keywords to `IDEA_PATTERNS` keys for architecture pattern selection
-
-**Pipeline integration**:
-- Registered as `plan_model` tool in ToolRegistry (available to Leader and Code Agent)
-- Auto-invoked in THINK phase (cycle ≤ 1) to generate `architecture_plan` context
-- Code Agent uses `implementation_order` as step-by-step build guide
-
-### 27. Post-Experiment Evaluation (`core/experiment_evaluator.py`) — v9
-
-Three classes for structured post-experiment analysis:
-
-**ExperimentEvaluator**:
-- Compares planned success criteria against actual results
-- 5-type failure diagnosis: `architecture`, `data`, `training`, `alignment`, `capacity`
-- Generates priority-sorted iteration guidance
-- Injected into REFLECT phase as `experiment_evaluation` + `iteration_guidance_prompt` context
-
-**IndependentProbe** (third-party verification):
-- Loads model checkpoint, runs forward pass on random input
-- Detects output anomalies: collapsed output (std < 1e-5), NaN/Inf, range mismatch
-- Integrated as VERIFY Layer 10 (`_verify_independent_probe`)
-- Avoids "self-evaluation" by independently probing the model's actual behavior
-
-**IterationGuidance** + **FailureDiagnosis**:
-- Root cause chain with severity levels
-- Actionable next-step recommendations sorted by priority
-- Failure type → correct response mapping table in leader.md
-
-### 28. Domain-Agnostic Hardcoding Cleanup — v9
-
-Systematic removal of all project-specific hardcoding across 10 files. Design principle: **only knowledge organization methods may be hardcoded; project-specific data/scenarios must be dynamic**.
-
-**Agent prompts** (`agents/*.md`):
-- All project-specific examples replaced with generic equivalents
-- `UnifiedLFDataset` → "the project's real dataset class"
-- `EPI assumes Lambertian` → "check `domain_knowledge.critical_assumptions`"
-- `Non-Lambertian MAE=0.335` → "domain A metric=X vs domain B metric=Y"
-- `81 angular views` / `9x9` → generic feature extraction language
-- Zero remaining project-specific identifiers (HCInew, EPINet, etc.)
-
-**Dynamic discovery patterns** (replacing hardcoded references):
-
-| Before (hardcoded) | After (dynamic) |
+| Constraint | What it prevents |
 |---|---|
-| `{"HCInew": "Lambertian", ...}` dict | `DATASET_MANIFEST.json` `type` field + heuristic fallback |
-| `UnifiedLFDataset` class reference | AST-based scanning of `datasets/` for Dataset subclasses |
-| `AngularAwareDepthNet` class reference | AST-based scanning of `models/` for `nn.Module` subclasses |
-| `[1, 81, 3, 64, 64]` default shape | `_infer_input_shape()` reading Conv3d/Conv2d `in_channels` |
-| `["MAE_Lambertian", "MAE_Non_Lambertian", "MAE_Mixed"]` | `_infer_domain_keys()` reading manifest types |
-| `{"epi": ["epi", "epinet", "epipolar"], ...}` | `_default_method_keywords()` with generic CV vocabulary |
+| Protected files (`PROJECT_BRIEF.md`, `config.yaml`, `state.json`, ...) | Agent overwriting critical files |
+| Protected dirs (`models/`, `datasets/`, `data/`) | Agent corrupting your code |
+| `run_python` blacklist (`os.system`, `subprocess`, `eval`, `exec`, `open(...,'w')`) | Arbitrary code execution; includes anti-obfuscation (blocks string concatenation, `chr()`, `getattr(os,...)`) |
+| Shell command validation (~30 patterns) | `rm -rf /`, `sudo`, reverse-shell (`nc -e`), pipe-to-shell (`curl ... \| sh`), `mkfifo`, PATH tampering |
+| Path sandbox (`_resolve_workspace_path`) | Path traversal / escaping the workspace |
+| write_file naming | `train_*.py` must go in `scripts/`; root `.py` forbidden |
+| launch_experiment blacklist | infinite loops (`while True`) blocked |
+| Mandatory dry-run gate | Refuses to launch training if no dry-run in last 10 min |
+| Experiment manifest | `experiment_manifest.json` written on every launch — system-level proof the experiment started |
 
-**What remains as acceptable "hardcoding"** (knowledge organization methods):
-- `METHOD_PROPERTIES` in `domain_knowledge.py`: Scientific method properties (EPI/FFT/attention assumptions) — generic CV knowledge
-- `IDEA_PATTERNS` in `idea_planner.py`: 6 reusable architectural patterns — generic structural templates
-- `_extract_innovations()` vocabulary: Natural language → concept category mapping — extensible retrieval vocabulary
-- `_extract_domain_names()` patterns: Common CV domain vocabulary (Lambertian, outdoor, indoor) — generic scientific terms
+### 6.2 StrategyConstraintEngine (`core/constraint_engine.py`)
 
-### 29. Knowledge Organization Architecture — v9
+Generates executable rules from history:
 
-The agent's knowledge is organized in 6 layers, from static to dynamic:
+- **Hypothesis calibration**: if historical hypothesis accuracy is less than 30% → force "next experiment must cite evidence + propose a falsifiable minimal test"
+- **Dead-end rules**: a method recorded as dead-end 3+ times → `priority=high` (warn); 5+ times → `priority=forbidden` (hard block)
+- **Pareto frontier**: methods dominated on all domains → blocked
 
-```
-Layer 1: Static Prompts (agents/*.md)
-  → Generic workflow guidance (THINK/REFLECT checklists, tool usage)
-  → Zero project-specific references after v9 cleanup
+### 6.3 Methodology Gates (`core/methodology_gates.py`)
 
-Layer 2: Persistent Memory (MEMORY_LOG.md + SQLite)
-  → Accumulated experimental results, dead ends, milestones
-  → Pareto frontier, hypothesis calibration, causal history
+Run before REFLECT, on **FACT layer only** (numbers, SQL queries, text search). They never reinterpret — "is this really the same dead end?" is left to the LLM.
 
-Layer 3: Domain Knowledge (METHOD_PROPERTIES in domain_knowledge.py)
-  → Generic scientific method properties: assumptions, failure symptoms, alternatives
-  → 7 entries: EPI, FFT, attention, ResNet, sigmoid, Conv3D, contrastive
+| Gate | Checks | Prevents |
+|---|---|---|
+| **G1 Falsifiability** | Parses `success_criteria` into a predicate, queries actual metric, does pure math | LLM claiming "target met" when metric exceeds threshold |
+| **G2 Control coverage** | SQL checks `experiment_facts` for ablation/control experiments on causal claims | Uncontrolled causal claims |
+| **G3 Dead-end signature** | Matches `method@dataset` signature against recorded dead-ends | Retrying a falsified approach |
+| **G4 Spec conformance** | Text-searches code for declared `required_signatures` | Claiming an operation that isn't in the code |
 
-Layer 4: Architecture Patterns (IDEA_PATTERNS in idea_planner.py)
-  → 6 reusable architectural patterns for plan generation
-  → Pattern matching from innovation keywords
+Gates **don't modify** the LLM's chosen action — they attach structured facts to context. But `_record_cycle_outcome` uses G1+G2 for **factual progress gating**: if criteria clearly failed and there is no control → the cycle doesn't count as progress.
 
-Layer 5: Runtime Context Injection (48 keys in loop.py _think() + _reflect())
-  → Dynamic knowledge from current project state:
-    architecture_plan, experiment_evaluation, domain_compatibility,
-    data_constraints, training_curve_analysis, pareto_frontier, etc.
-  → Constraint engine outputs (v10):
-    plan_compliance_warning, quick_benchmark_warning,
-    adaptive_thresholds, implementation_progress
+### 6.4 Anti-deception (`core/agents.py` ToolTrace)
 
-Layer 6: Tool Chain Knowledge
-  → domain_knowledge.py: Method-property-based analysis framework
-  → idea_planner.py: 9-phase forward design pipeline
-  → experiment_evaluator.py: Post-experiment diagnosis framework
-  → model_analyzer.py: 9-layer AST structural analysis
-  → constraint_engine.py: LLM behavior control (v10)
-```
+Every tool call records `{tool_name, args, system_return_value}`. Critical facts (PID, log_file, exit code) are extracted from the **tool return**, never from LLM text.
 
-All layers except Layer 2 (project-specific memory) are fully domain-agnostic after v9.
+- **launch_facts extraction**: "I launched PID 12345" but no `launch_experiment` in trace → `deception_detected`
+- **VERIFY cross-check**: LLM-text PID vs trace PID mismatch → critical fail
+- **Runtime data fingerprint**: the verifier actually imports the dataset and checks if std is constant or spatial autocorrelation is pure noise — detects swapped-in synthetic data
+- **Independent probe** (VERIFY Layer 10): a separate code path loads the checkpoint and runs forward — doesn't trust the model's own reported metrics
 
-### 30. Constraint Engine (`core/constraint_engine.py`) — v10, cleaned in v16.1
+---
 
-**LLM Behavior Control Layer**: Prevents hallucination and corner-cutting through 2 constraint mechanisms (originally 6, 4 removed in v16.1 as dead modules):
+## 7. Provider & Failover
 
-1. **StrategyConstraintEngine**: Learns constraint rules from SQLite history. Three rule sources:
-   - Hypothesis calibration → confidence constraints (accuracy < 30%: must cite evidence)
-   - Dead ends → forbidden approaches (failed 3+ times: FORBIDDEN)
-   - Pareto frontier → dominated method elimination
-   Rules persist in `STRATEGY_RULES.json`, checked after THINK dispatch.
-   v16.1: Fixed `generate_rules_from_history()` to preserve human-authored rules (`source=human`).
+Two-level failover (`core/agents.py`):
 
-2. **ContextPruner**: 4-tier priority system that trims context to **14 keys max** (reduced from 20 in v16.1) before LLM dispatch. Prevents information overload from masking critical constraints.
-   v16.1: Added `persistent_constraints` to TIER_1_ALWAYS, removed keys from deleted modules.
-
-**Removed in v16.1** (dead modules, runtime analysis scores ≤3/10):
-- ~~PlannerChecker~~: AST compliance check never useful (2/10). Only produced warnings that didn't change behavior.
-- ~~QuickBenchmark~~: Conditions too strict, never triggered in production (1/10).
-- ~~AdaptiveThresholds~~: Insufficient data for calibration, always fell back to defaults (3/10). Replaced with hardcoded thresholds: `severe_degradation=0.35`, `improvement_threshold=0.005`.
-- ~~ImplementationTracker~~: Overlapped with research_roadmap functionality (2/10).
-
-**Integration points** (v16.1):
-- `_think()`: StrategyConstraintEngine check, PERSISTENT_CONSTRAINTS.md loading, ContextPruner pruning
-- `_reflect()`: StrategyEngine rule generation, ContextPruner pruning
-
-### 31. Simulation Sandbox (`core/simulation_sandbox.py`) — v11
-
-**Pre-Training Model Validation & A/B Evaluation**: A 5-layer evaluation system that answers whether model modifications are actually useful.
-
-**Layer 0 — Feasibility Check** (PRE-VERIFY):
-Runs the model in a subprocess: instantiate → forward → backward. Checks shape correctness, GPU memory estimation, crash detection. Blocks training if model cannot run.
-
-**Layer 1 — Design Comparison** (REFLECT):
-AST-based structural A/B comparison of before/after models. Tracks: parameter delta, new/removed modules, information bottleneck ratios (compress ratio), module parameter share percentages.
-
-**Layer 2a — Reference Evaluation** (REFLECT):
-Runs inference on 5-10 validation samples with both before and after models. Computes: per-sample MAE delta, parameter efficiency (MAE per 1K params), domain-specific breakdown.
-
-**Layer 2b — Internal Behavior** (REFLECT):
-Reference-free module-level analysis: activation dead ratio, gradient health (norm vs backbone baseline), parameter utilization (weight std), module contribution via ablation, data flow shape tracing.
-
-**Layer 3 — Synthesis Judgment** (REFLECT):
-Combines Layers 1+2a+2b into comprehensive verdict: effective/partial/ineffective/harmful. Checks project intent alignment by matching modification keywords against PROJECT_BRIEF core goals.
-
-**Layer 4 — Scaling Guidance** (REFLECT):
-Identifies scalable modules (active + healthy gradients + good parameter utilization), remaining bottlenecks, GPU memory budget headroom, and estimated max batch size after scaling.
-
-**Key data structures**:
-- `FeasibilityReport`: Layer 0 output (feasible, params, shapes, GPU memory)
-- `DesignComparison`: Layer 1 output (A/B params, new modules, bottlenecks)
-- `ReferenceEvaluation`: Layer 2a output (MAE delta, param efficiency)
-- `InternalBehaviorReport`: Layer 2b output (dead/active modules, gradient balance)
-- `SynthesisJudgment`: Layer 3 output (verdict, effective/ineffective modules, alignment)
-- `ScalingGuidance`: Layer 4 output (scalable modules, GPU budget)
-- `SandboxReport`: Full pipeline output combining all layers
-
-**Integration points**:
-- `_pre_verify()`: Layer 0 feasibility + model snapshot save
-- `_reflect()`: Layers 1-4 full evaluation + verdict caching
-- `_think()` (next cycle): Reads cached verdict as `sandbox_design_guidance`
-
-### 32. Code Review & Robustness Hardening — v11.1
-
-Three rounds of exhaustive code review across all 17 Python modules in `core/`. v1-v6 had never been reviewed; v7+ had partial reviews. This was the first systematic audit.
-
-#### Bug Fixes (9 total)
-
-| # | Module | Severity | Issue | Fix |
-|---|--------|----------|-------|-----|
-| 1 | `constraint_engine.py` | BUG | `get_dead_ends(limit=20)` method doesn't exist in `MemoryManager` — `AttributeError` silently caught by `except Exception` | Changed to `get_dead_ends_full()[:20]` |
-| 2 | `memory.py` | BUG | `get_summary_stats()` missing `best_metric`/`worst_metric` keys — `AdaptiveThresholds` could never calibrate, always used defaults | Added metrics extraction from `metrics_json` across all experiments |
-| 3 | `simulation_sandbox.py` | BUG | `_resolve_model()` dangerous fallback: when exact path not found, silently returned most-recently-modified `.py` file from `models/` | Removed fallback, returns `None` with warning log |
-| 4 | `loop.py` | BUG | Duplicate `import math` inside `_record_cycle_outcome()` | Removed redundant import |
-| 5 | `loop.py` | BUG | `_cooldown_after_error` time tracking: `elapsed += 60` even when sleep was shorter, causing insufficient cooldown | Changed to `elapsed += sleep_chunk` |
-| 6 | `loop.py` | BUG | `_quality_alert_streak` incremented unconditionally whenever metric existed, regardless of whether quality degraded | Wrapped in `if quality_degraded` check |
-| 7 | `simulation_sandbox.py` | BUG | `_build_behavior_script()` registered forward/backward hooks twice (duplicated registration block) | Removed second registration block |
-| 8 | `simulation_sandbox.py` | BUG | Conv3d parameter estimation used `k*k` instead of `k*k*kd` for 3D kernels | Added depth dimension calculation |
-| 9 | `simulation_sandbox.py` | BUG | `_build_inference_script()` only collected output statistics but never computed MAE vs GT — Layer 2a always returned empty | Complete rewrite with `_find_gt_for()`, `_load_array()`, actual MAE computation |
-
-#### Configuration Extraction (Hardcoding → config.yaml)
-
-New `sandbox` configuration section allows per-project customization:
-
-```yaml
-sandbox:
-  gpu_memory_mb: 24000            # Target GPU memory budget (MB)
-  default_input_shape: [1, 3, 64, 64]  # Fallback input shape
-  subprocess_timeout: 120         # Sandbox subprocess timeout (seconds)
-  inference_timeout: 120          # Inference subprocess timeout (seconds)
-  feasibility_timeout: 90         # Feasibility check timeout (seconds)
+```mermaid
+flowchart TD
+    REQ[request] --> L1{"Level 1:<br/>try models in chain"}
+    L1 -->|429 rate_limit| NEXT_M[next model in chain]
+    L1 -->|429 quota_exhausted| L2["Level 2:<br/>switch provider"]
+    L1 -->|permanent error<br/>4xx/auth/bad name| SKIP[skip entire matrix]
+    L1 -->|hung stream >120s| ALRM["SIGALRM kill<br/>trigger failover"]
+    NEXT_M --> L1
+    L2 --> DONE{got result?}
+    ALRM --> L2
+    SKIP --> FAIL[fail this request]
 ```
 
-**Modules reading from sandbox config:**
-- `SimulationSandbox.__init__()`: Reads all 5 settings, stores as instance attributes
-- `loop.py`: Passes config to sandbox constructor
+**Quota-aware cooldown**: a 429 carrying a reset timestamp (e.g. "resets at 2026-06-15 19:42:06") sets an absolute deadline — the provider is never retried until the window resets. This avoids burning an entire matrix against a permanently-exhausted quota.
 
-**Modules no longer using hardcoded thresholds** (v16.1: AdaptiveThresholds removed, thresholds hardcoded):
-- `loop.py` visual analysis trigger → hardcoded `severe_degradation=0.35`
-- `loop.py` improvement detection → hardcoded `improvement_threshold=0.005`
-- `experiment_evaluator.py` gap thresholds → hardcoded `{"severe_degradation": 0.35, "improvement_threshold": 0.005}`
-- `verifier.py` oscillation/overfitting → from config
-- `domain_knowledge.py` stuck domain → from config
+**Task tiering**: think/reflect/idea/researcher/code use the strong chain; writing uses the fast chain (and disables "thinking" to save tokens).
 
-**Numerical safety constants** (`1e-8` epsilon for division):
-- Extracted to module-level `_EPS = 1e-8` in `loop.py`, `verifier.py`, `memory.py`
-- All inline `1e-8` replaced with `_EPS` reference (except in subprocess script strings where `_EPS` is inaccessible)
+---
 
-#### Default Provider Update
-
-`ResearchLoop.__init__` default fallback values aligned with `config.yaml`:
-
-| Parameter | Before | After |
-|-----------|--------|-------|
-| `provider` | `"anthropic"` | `"glm_token_plan"` |
-| `model` | `"claude-sonnet-4-6"` | `"auto"` |
-
-`AgentDispatcher.__init__` defaults still reference Anthropic for backward compatibility, but `ResearchLoop` always passes config values explicitly.
-
-#### Atomic Write Protection
-
-Two critical files now use write-to-temp-then-rename to prevent corruption on crash:
-
-- `state.json`: `_update_state()` writes to `.tmp` then `replace()`
-- `MEMORY_LOG.md`: `_write_log()` writes to `.tmp` then `replace()` (was already fixed)
-
-#### Initialization Order (v16.1)
-
-`AdaptiveThresholds` was removed in v16.1. `ExperimentVerifier` and `ExperimentEvaluator` now receive hardcoded thresholds directly:
+## 8. File Tree
 
 ```
-Before v16.1:  Memory → Monitor → Dispatcher → AdaptiveThresholds → Verifier → Evaluator → ...
-After v16.1:   Memory → Monitor → Dispatcher → Verifier(thresholds hardcoded) → Evaluator(thresholds hardcoded) → ...
-```
-
-#### Anthropic Max-Turns Consistency
-
-`_call_anthropic` max-turns-reached fallback changed from hardcoded `"Max turns reached"` string to `_find_last_assistant_text()`, matching the OpenAI-compatible path behavior.
-
-#### Quality Alert Streak Fix (BUG-6 detail)
-
-The `_quality_alert_streak` counter tracks consecutive cycles with domain metric degradation. The bug caused it to increment every cycle regardless of actual quality, triggering false alerts:
-
-```
-Before:
-  if current_metric is not None and _best_metric_ever < inf:
-      ... update experiment value ...
-      self._quality_alert_streak += 1      # ← ALWAYS incremented
-
-After:
-  if current_metric is not None and _best_metric_ever < inf:
-      ... update experiment value ...
-      if quality_degraded:                  # ← Only increment when actual degradation
-          self._quality_alert_streak += 1
-      else:
-          self._quality_alert_streak = 0   # ← Reset when no degradation
+auto_research_agent/
+├── api.py                  # CLI + Python API entry point
+├── config.yaml             # default config (copy into your project)
+├── requirements.txt
+├── install.py              # optional: deploy skills into Claude Code / Cursor
+│
+├── core/                   # the system (hard constraints + loop)
+│   ├── loop.py             #   research cycle orchestrator
+│   ├── agents.py           #   Leader-Worker dispatch, ToolTrace, failover
+│   ├── tools.py            #   tool layer + safety constraints
+│   ├── verifier.py         #   12-layer VERIFY
+│   ├── methodology_gates.py#   4 methodology gates (fact layer)
+│   ├── constraint_engine.py#   rule generation + context pruning
+│   ├── memory.py           #   3-tier memory + SQLite
+│   ├── monitor.py          #   zero-LLM-cost experiment monitoring
+│   ├── fact_scanner.py     #   disk-to-SQLite fact spine
+│   ├── training_log_parser.py
+│   └── garbage_collector.py
+│
+├── agents/                 # LLM prompts (research methodology)
+│   ├── leader.md           #   THINK + REFLECT prompts
+│   ├── code_agent.md       #   implementation + training
+│   ├── idea_agent.md       #   literature + hypothesis
+│   ├── researcher_agent.md #   deep search
+│   └── writing_agent.md
+│
+├── skills/                 # optional slash-commands for Claude Code / Cursor
+├── gpu/                    # GPU detection (used by install.py deployments)
+├── tests/                  # 255+ automated tests
+├── examples/               # toy_experiment (MNIST), single_gpu guide
+└── docs/
+    ├── architecture.md     # this file (English)
+    ├── architecture_CN.md  # Chinese version
+    └── DATA_CONTRACT.md    # SQLite table read/write contract
 ```
 
 ---
 
-## Code Review Lessons Knowledge Base (v13)
+## 9. Configuration Reference
 
-### Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│          Code Review Lessons Pipeline             │
-│                                                   │
-│  REFLECT phase ends                               │
-│       │                                           │
-│       ▼                                           │
-│  _post_reflect_code_review()                      │
-│       │                                           │
-│       ├── _extract_lesson_from_verify_failure()   │
-│       ├── _extract_lesson_from_dead_end()         │
-│       │       (keyword-based pattern extraction)  │
-│       ├── _extract_lesson_from_module_failure()   │
-│       │       (keyword-based pattern extraction)  │
-│       └── _llm_extract_lesson()                   │
-│               (fast model semantic analysis)      │
-│       │                                           │
-│       ▼                                           │
-│  memory.record_code_review_lesson()               │
-│       │                                           │
-│       ▼                                           │
-│  ┌──────────────────────────────┐                 │
-│  │  SQLite: code_review_lessons  │                │
-│  │  - pattern (dedup key)       │                 │
-│  │  - severity (HIGH/MEDIUM/LOW)│                 │
-│  │  - hit_count + last_hit_cycle│                 │
-│  │  - category + description    │                 │
-│  └──────────────────────────────┘                 │
-│       │                                           │
-│       ▼  (next THINK cycle)                       │
-│  memory.search_relevant_lessons()                 │
-│       │  (keyword match on model code)            │
-│       ▼                                           │
-│  context["relevant_code_review_lessons"]          │
-│       │                                           │
-│       ▼                                           │
-│  Leader THINK (avoids past mistakes)              │
-└──────────────────────────────────────────────────┘
-```
-
-### HARD GATE Dead-Loop Prevention
-
-```
-Cycle N:   code_review detects HIGH issue → HARD GATE blocks
-Cycle N+1: code agent fixes → same regex triggers (false positive) → HARD GATE blocks
-Cycle N+2: code agent fixes again → same regex → HARD GATE blocks
-                                                    │
-                          _hard_gate_consecutive_blocks > 2
-                                                    │
-                                                    ▼
-                          Auto-downgrade to SOFT GATE
-                          (warning only, training proceeds)
-```
-
-### Comment-Aware Regex
-
-`_strip_comments_and_strings()` removes:
-- Full-line comments (`# ...`)
-- Inline comments (before `#`)
-- Triple-quoted strings (`"""..."""`, `'''...'''`)
-- Single/double quoted strings
-
-All regex code review checks operate on stripped content only.
-
-### SQLite Schema
-
-```sql
-CREATE TABLE IF NOT EXISTS code_review_lessons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pattern TEXT UNIQUE NOT NULL,     -- dedup key (content-derived keywords)
-    severity TEXT NOT NULL,           -- HIGH / MEDIUM / LOW
-    category TEXT DEFAULT 'architecture',
-    description TEXT,
-    evidence TEXT,
-    fix_suggestion TEXT,
-    hit_count INTEGER DEFAULT 1,
-    last_hit_cycle INTEGER,
-    source TEXT DEFAULT 'reflect',    -- reflect / verify / manual
-    timestamp REAL
-);
-```
-
-### Ordered Gate Pipeline (v12.4)
-
-Three gates execute in strict priority order. A hard-gate (full rewrite of `think_result`) causes subsequent gates to skip entirely:
-
-```
-┌─────────────────────────────────────────────────┐
-│              Gate Pipeline (v12.4)                │
-│                                                  │
-│  Gate 1: PRE-VERIFY                              │
-│    Critical preconditions (synthetic data,       │
-│    missing data, broken imports)                 │
-│    → HARD GATE (blocks execution)                │
-│                                                  │
-│  Gate 2: CODE REVIEW (v12.3+, enhanced v13)      │
-│    Phase 1: Zero-LLM regex checks                │
-│      - Routing without aux supervision           │
-│      - Input channel asymmetry (>10x ratio)      │
-│      - 1×1 conv router (no spatial context)      │
-│    Phase 2: LLM semantic review                  │
-│      - Uses cheap fast model                     │
-│      - Only runs when Phase 1 has no HIGH issues │
-│    → HIGH: HARD GATE (with dead-loop detection)  │
-│    → MEDIUM/LOW: SOFT GATE (injected as warning) │
-│                                                  │
-│  Gate 3: FALSIFIABILITY                          │
-│    Hypothesis quality check (soft gate)          │
-│    → Never blocks, only injects warning          │
-│                                                  │
-│  Anti-Deadloop (v13):                            │
-│    _hard_gate_consecutive_blocks > 2             │
-│    → Auto-downgrade HARD → SOFT                  │
-└─────────────────────────────────────────────────┘
-```
-
-### Log Fallback Parser (v12.3)
-
-When `training_log.json` is unavailable, `_parse_log_text_to_json()` extracts structured data from raw log text:
-
-### 33. Strategic Architecture Intelligence — v14
-
-**Prevents the #1 failure mode: spending dozens of cycles patching a fundamentally wrong architecture.**
-
-In a 64-cycle run, the agent spent ALL cycles patching EPINet without ever switching architectures. Root causes and fixes:
-
-#### Architecture Survey Gate
-Forces a 3+ candidate architecture survey in cycles 1-2 before committing to any baseline. Prevents blind use of PROJECT_BRIEF's suggested architecture.
-
-```
-THINK phase (cycle ≤ 2, no survey exists):
-  → Inject "ARCHITECTURE SURVEY GATE" context
-  → Agent MUST survey 3+ architectures
-  → Output: workspace/ARCHITECTURE_SURVEY.md
-  → Survey completion detected automatically
-```
-
-#### Architecture-Level Direction Signature
-Detects the underlying architecture (EPINet, U-Net, Transformer, etc.) regardless of direction keywords. Architecture stagnation accumulates across all directions on the same architecture.
-
-```
-_extract_architecture_name():
-  "EPINet + edge loss" → "epi"
-  "EPINet + angular conv" → "epi"  (SAME architecture!)
-  "LFNet + multi-scale" → "lfnet"  (DIFFERENT architecture → reset)
-```
-
-Architecture stagnation is NOT reset by paper_research — only by actually switching to a different architecture.
-
-#### Dead End Synthesis Engine
-Clusters dead ends by architecture and auto-detects when 5+ dead ends trace to the same architecture:
-
-```
-_build_cross_experiment_insights():
-  → _synthesize_architecture_dead_ends()
-  → Cluster dead ends by architecture pattern
-  → If 5+ dead ends for same architecture:
-    → [ARCHITECTURE BOTTLENECK] warning
-    → Lists attempted components (loss, attention, conv, etc.)
-    → Diagnosis: architecture is the bottleneck
-```
-
-#### Architecture Switch Enforcer
-When architecture stagnation reaches threshold (5 cycles), forces `architecture_switch` action:
-
-```
-_apply_no_progress_fallback():
-  if architecture_stagnation >= 5:
-    if dead_end_synthesis confirms bottleneck:
-      → action: "architecture_switch"
-      → MANDATORY: switch to fundamentally different architecture
-      → NOT allowed: improved variant of current architecture
-      → Pilot experiment first (2-5 epochs)
-```
-
-#### Known Architecture Patterns
-```python
-_ARCHITECTURE_PATTERNS = {
-    "epi": ["epi", "epinet", "epipolar", "epi_net", "epi slope", "epi branch"],
-    "unet": ["unet", "u-net", "u_net"],
-    "transformer": ["transformer", "vit", "self_attention"],
-    "cnn": ["resnet", "vgg", "mobilenet", "efficientnet"],
-    "graph": ["gnn", "graph", "gcn", "gat"],
-    "lfnet": ["lfnet", "lf_net", "lfanet"],
-    "oacc": ["oacc", "occlusion_aware"],
-    "mvsnet": ["mvsnet", "multi_view_stereo"],
-    "dpt": ["dpt", "dense_prediction_transformer"],
-}
-```
-
-Easily extensible — adding a new entry automatically enables detection for all projects.
-
-- **Routing weights**: `routing_weights: [0.xxx, 0.xxx]` patterns
-- **Aux losses**: `aux_loss=X.XXXX` patterns
-- **Per-domain MAE**: Dynamic domain discovery via `DOMAIN_NAME: MAE=X.XXX` or `MAE_DOMAIN: X.XXX` patterns (no hardcoded domain names)
-
-### 34. Research ROADMAP — Module-Level State Machine (v15)
-
-**Prevents premature model training and enforces structured theory verification before committing GPU resources.**
-
-#### Module: `core/research_roadmap.py` (~500 lines)
-
-A module-level state machine that tracks research phases per module:
-
-```
-State Machine:
-  theory_verification → module_design → module_validation → integrated
-                                                                              ↓
-                                                                          dead_end
-```
-
-**Per-Module Tracking**: Each research module (e.g., "angular_frequency_analysis", "dual_mask_modeling") has its own state in the ROADMAP. A module can only advance to the next state when milestone conditions are met.
-
-**Phase-Gated Research**: During `theory_verification` phase, the system blocks training tasks. Only analysis and research actions are allowed. This forces the agent to validate assumptions before committing GPU time.
-
-**3-Strike Hard Gate**: When the agent deviates from the ROADMAP phase:
-```
-Strike 1: Warning injected into THINK context
-Strike 2: Stronger warning + deviation logged
-Strike 3: Force override action to paper_research
-          → Sync-reset both _deviation_count and _phase_violation_count
-```
-
-**Circuit Breaker Priority**: During `theory_verification`, ROADMAP circuit breaker takes priority over direction and architecture circuit breakers. This ensures phase constraints are enforced even when other mechanisms would allow training.
-
-#### Integration Points
-
-```
-THINK phase:
-  → roadmap.check_alignment(planned_action, task_description)
-  → _enforce_roadmap_alignment() in loop.py
-  → Direction circuit breaker checks roadmap.is_theory_verification_phase
-  → roadmap.active_module_names replaces private _get_active_modules()
-
-REFLECT phase:
-  → roadmap.update_from_reflect(reflect_result)
-  → Markdown parser extracts module milestones from reflect output
-  → Milestone keywords: "designed"/"implemented"/"coded"/"built" → MODULE_DESIGN → MODULE_VALIDATION
-
-VERIFY phase:
-  → Method count enforcement: 3-6 methods (min 3, max 7) per module
-  → All methods must fail independently before dead_end marking
-```
-
-#### Key Design Decisions
-
-- **Dual counter sync**: `_deviation_count` (ROADMAP) and `_phase_violation_count` (ResearchLoop) are synchronized on every reset event. Hard gate trigger resets both to 0.
-- **Single responsibility**: `check_alignment()` returns phase information only. Loop.py controls enforcement (3-strike mechanism) independently.
-- **Sub-token matching**: `_is_task_related` uses `re.split(r"[_\s]+")` for robust matching of compound names like "freq_analyzer" against "analyze frequency spectrum".
-- **Strong/weak training indicators**: `_is_training_task` distinguishes real training ("train the model", "epoch") from research discussions ("information loss", "loss of detail").
-- **Flexible method count**: 3-6 methods with hard ceiling at 7. Supports both quick 3-method disproval and thorough 6-method analysis.
-
-#### v15.5 Hardening (8 Fixes from Code Review)
-
-| # | Fix | Impact |
-|---|-----|--------|
-| 1 | `check_alignment()` no longer returns `should_force_paper_research` | Single responsibility: loop.py controls enforcement |
-| 2 | Public properties `active_module_names`, `is_theory_verification_phase` | Clean API replacing private method access |
-| 3 | `_is_training_task` strong/weak indicators | Eliminates false positives on "loss of detail" |
-| 4 | `_is_task_related` sub-token matching + dynamic threshold | Better matching for compound method names |
-| 5 | `MODULE_DESIGN` milestone keywords | Supports natural progression through design phase |
-| 6 | Cross-assumption consistency check in method suggestions | Ensures verification methods cover inter-assumption interactions |
-| 7 | Markdown parser regex `\[\\w_-+\]` + evidence extraction | Handles hyphenated module names in reflect output |
-| 8 | Removed orphan `roadmap_alignment_warning` ContextKey | Clean context key registry |
-
-### 35. v16.1 — Runtime-Grounded Gate Overhaul & Dead Module Cleanup
-
-**Root Cause**: v16's gates were all text-based — they relied on matching LLM-generated task descriptions against blocked patterns. But LLMs generate abstract descriptions ("frequency analysis") that don't contain concrete keywords (`train`, `epoch`, `Conv`). The result: 0 gate triggers in 11 production cycles, 26 training launches despite Phase 1 being PARTIAL.
-
-#### 6 Fixes
-
-**Fix 1: Phase Gate v2 — Code File Scanning**
-
-`_check_phase_blocked()` rewritten from text-matching to code-scanning:
-- Extracts model file path from task → reads actual `.py` file
-- Extracts training script content from Code agent output
-- `re.search()` scans real code against `blocked_patterns`
-- Reports matched patterns + files checked for debugging
-
-**Fix 2: FORBIDDEN Rules + Rule Preservation**
-
-- Created `STRATEGY_RULES.json` with 3 human FORBIDDEN rules:
-  1. `human_phase1_no_training`: No neural network training before Phase 1 validated
-  2. `human_no_skip_validation`: Must validate data before modeling
-  3. `human_no_architecture_switch`: No architecture switching during Phase 1
-- Fixed `generate_rules_from_history()`: preserves rules with `source=human` instead of overwriting all
-
-**Fix 3: Metrics Pipeline Extension**
-
-`monitor._extract_metrics()` extended with:
-- AUC, FGD, FID, val_MAE regex patterns
-- Generic `key=value` fallback when domain-specific patterns don't match
-- Enables `_update_phase_status_from_results()` to auto-advance phase status
-
-**Fix 4: Phase-Aware PRE-EXECUTE Downgrade**
-
-Before v16.1: After 3 consecutive HARD blocks → always downgrade to SOFT
-After v16.1: After 3 consecutive HARD blocks:
-- If phase is VALIDATED → downgrade (legitimate false positive)
-- If phase is NOT VALIDATED → no downgrade, cap streak at 2
-
-**Fix 5: Dead Module Removal (~793 lines)**
-
-| Module | Lines | Score | Removal Reason |
-|--------|-------|-------|----------------|
-| PlannerChecker | ~250 | 2/10 | AST compliance check never useful |
-| QuickBenchmark | ~288 | 1/10 | Never triggered, conditions too strict |
-| AdaptiveThresholds | ~78 | 3/10 | Insufficient data for calibration |
-| ImplementationTracker | ~145 | 2/10 | Overlapped with research_roadmap |
-
-Replaced with hardcoded thresholds: `severe_degradation=0.35`, `improvement_threshold=0.005`.
-
-**Fix 6: Context Engineering**
-
-- Removed `scope_prefix` injection (pure text, LLM ignored it)
-- Removed `sandbox_design_guidance` context injection
-- Added `PERSISTENT_CONSTRAINTS.md` loading in `_think()` (project-level hard rules)
-- ContextPruner MAX_KEYS: 20 → 14 (reduces information dilution)
-- Updated TIER lists: `persistent_constraints` in TIER_1_ALWAYS, removed dead module keys
+| Section | Key fields | Purpose |
+|---|---|---|
+| `project` | `name`, `brief`, `workspace` | Project identity; `workspace="."` puts artifacts in the project dir |
+| `goals.metrics` | `key`, `target`, `direction` | Config-driven targets (replaces hardcoded `val_MAE`) |
+| `agent` | `provider`, `model`, `max_cycles`, `max_steps_per_cycle` | LLM provider (`glm_token_plan`/`ali_token_plan`/`anthropic`/`openai`), `model="auto"` for task-tier selection |
+| `memory` | `brief_chars`, `log_chars`, `milestone_chars`, `rolling_decisions` | Context-budget caps (keeps LLM context ~5000 chars) |
+| `monitor` | `poll_interval`, `max_runtime_hours`, `zero_llm` | Training poll cadence; `zero_llm=true` = no LLM cost during monitoring |
+| `gpu` | `auto_detect`, `reserve_last` | GPU selection |
+| `sandbox` | `gpu_memory_budget`, `input_shape`, `timeout` | PRE-VERIFY GPU feasibility check |
+| `safety` | `mandatory_dry_run`, `naming.forbidden_root_py`, `garbage_collection` | Hard safety switches |
+| `multimodal_mcp` | `@z_ai/mcp-server` | Vision analysis + citation exploration (needs `npx`) |
 
 ---
 
-### 36. v17 — Systemic Architecture Fixes (5 root causes, 97 tests)
+## 10. Testing
 
-A function-level code review identified that the codebase had **5 structural
-diseases** (not 40 isolated bugs). Each disease had one root cause and one
-systemic fix. All fixes are test-protected (97 tests, up from 0).
+**255+ automated tests** in `tests/`. Key categories:
 
-#### Disease A: Signal Disconnect — Context Schema (P0, highest impact)
+| Test file | What it covers |
+|---|---|
+| `test_db_read_write_contract.py` | **L3 contract test** — asserts every table has a writer + reader, every SQL column exists in DDL; catches orphan tables and column drift |
+| `test_tools_security.py` / `test_tool_safety.py` | Sandbox escape attempts, blocked commands, path traversal |
+| `test_phase3_gates.py` / `test_phase4_gates.py` | Methodology gates (falsifiability, dead-end, spec) |
+| `test_v20_reform.py` / `test_phase2_reform.py` | Reform validation |
+| `test_memory_tables.py` | SQLite write then read then consume for 6 tables |
+| `test_reflect_parser_fix.py` | REFLECT JSON parsing |
+| `test_dispatch_contract.py` | Leader-Worker dispatch contract |
+| `test_enforcement.py` | Constraint enforcement |
 
-**Root cause**: Context key injection (loop.py, 48 keys), pruning
-(constraint_engine.py), and serialization (agents.py `_format_leader_input`)
-were three independent hardcoded processes with no synchronization. Result:
-**37 of 48 injected keys were silently dropped** — 77% of context computation
-wasted. DomainKnowledgeMixin (650 lines), IdeaPlanner, TrainingCurveAnalysis,
-ExperimentEvaluator all computed output that never reached the Leader LLM.
-
-**Fix**: `core/context_keys.py` became the **single source of truth** — every
-`ContextKey` declares its own `serializer` function. `_format_leader_input`
-shrank from 170 lines of hardcoded if-blocks to 8 lines calling
-`serialize_context()`. Adding a key now requires exactly ONE change (the
-registry); injection, pruning, and serialization all pick it up automatically.
-
-**Measured improvement**: Leader prompt sections 13→21 (+62%); keys reaching
-LLM 19%→98%; `_format_leader_input` 170→8 lines (-95%).
-
-#### Disease B: Execution Disconnect — Advisory→Enforced
-
-**Root cause**: Two subsystems detected problems but couldn't change behavior:
-1. **Audit escalation** wrote `DIRECTIVE.md` text the LLM could ignore forever.
-2. **Constraint engine** `FORBIDDEN` hard gate was unreachable (auto-rules only
-   produced `high`/`medium` priority, never `forbidden`).
-
-**Fix**:
-- Audit: per-signature monotonic enforcement counter (`_audit_enforcement`).
-  After 2 uncorrected escalations → forced targeted-fix task; after 3 →
-  `pause_human`. Same model as Phase 4's `_consecutive_failed_launches`.
-- Constraint engine: dead-end rules with `count >= 5` now set
-  `priority="forbidden"`, making the FORBIDDEN hard gate reachable.
-
-#### Disease C: Code Duplication — Shared Primitives
-
-**Root cause**: 15+ copies of `ast.walk`→`nn.Module` scanning and 4 copies of
-loss-parsing regex with 3 divergent thresholds, spread across verifier.py,
-experiment_evaluator.py, simulation_sandbox.py, model_analyzer.py.
-
-**Fix**: Two shared modules:
-- `core/training_log_parser.py`: one `parse_loss_series` + one
-  `classify_loss_trend` (unified thresholds) + `extract_metrics`.
-- `core/model_structure_scanner.py`: one `scan_model_file` that finds modules,
-  collects init-assignments, detects dead branches, and estimates params.
-  **Also fixes the kwargs bug**: `_estimate_params` now reads keyword arguments
-  (`Conv2d(in_channels=3, out_channels=64)`), not just positional — the old
-  estimator returned 0 for modern PyTorch style.
-
-#### Disease D: Dead Code (~200 lines)
-
-Deleted: `_resolve_model_for_provider` (0 callers), `_extract_first_decision_json`
-unreachable tail, 6 dead `memory.py` methods (`get_metric_trend`,
-`get_full_context`, `resolve_active_problem`, `get_log_summary`,
-`log_roadmap_update`, `get_roadmap_history`), `WORKER_CONFIGS["tools"]`
-(never-read divergent field). `roadmap_history` table DDL flagged for removal.
-
-#### Disease E: Structural Bloat — Deferred
-
-`loop.py` (5018 lines) is a god-object, but 0 dead methods and the split is
-pure maintainability (no runtime impact). Deferred until A+B produce runtime
-baseline data proving the split is worth the regression risk.
-
-#### IdeaScout Integration (cross-domain idea discovery)
-
-`core/idea_scout_bridge.py` integrates the [research-idea-scout](https://github.com/YangyangQu/research-idea-scout)
-toolkit into the `paper_research` phase. When `idea_scout.enabled=true` in
-config, the pipeline: gathers papers (via `search_papers`) → rule-filters
-(profile-guided keyword scoring) → LLM-scores for cross-domain transferability
-(via ProviderRouter, not codex CLI) → writes a ranked Markdown report. A
-`Profile` is auto-generated from `PROJECT_BRIEF.md`. Disabled by default
-(zero behavior change).
+Run: `python -m pytest tests/ -q`
 
 ---
 
-### 37. v18 — Architecture Reform (4 phases, principle-driven)
+## 11. Appendix: Version History Highlights
 
-A 25-dimension system audit identified that the agent had **8 structural root
-causes**, not isolated bugs. The reform follows 5 design principles:
+This section condenses the design evolution. (Detailed historical docs have been retired — the code is the source of truth.)
 
-```
-P1. 安全是工具的契约，不是一个组件 (Safety is a tool property, not a layer)
-P2. 信息是被查询的，不是被注入的 (Information is queried, not injected)
-P3. LLM 在认知循环里自主工作 (LLM works autonomously in a cognitive loop)
-P4. 记忆是核心 (Memory is the core — effective memory replaces enforcement)
-P5. prompt 定义研究方法论框架 (Prompt defines methodology, not control)
-```
+- **v1–v10**: Core loop, Leader-Worker, 3-tier memory, anti-deception ToolTrace, 12-layer VERIFY, deterministic GC, provider failover.
+- **v11–v13**: Fact spine (`fact_scanner.py` — disk truth survives crashes), code review lessons knowledge base, AST-based model structure scanner (dead-branch detection).
+- **v14–v15**: Strategic architecture intelligence, research ROADMAP (module-level state machine).
+- **v16.1**: Gate overhaul — methodology gates refactored to FACT-layer-only (never reinterpret), dead module removal, context engineering (tier-based pruning).
+- **v17** *(current)*: dead_end data-flow unification (single source of truth in `memory_entries`), orphan table cleanup, L3 anti-regression contract test, `monitor_result` UnboundLocalError fix.
+- **v18**: Architecture reform — config-driven metrics, fact-spine milestone fallback, constraint engine hardening.
 
-#### Phase 1: Knowledge Loop Closure + Structured Memory
-
-**Problem**: 89 code_review_lessons, 102 causal_chains, 48 experiment_values
-accumulated in SQLite but **0% consumed** by THINK. The agent was amnesic —
-it repeated errors because it never saw its own history.
-
-**Fixes**:
-- `causal_history`: inject ALL links (not just verified), marking status.
-  Previously the `verified` filter made it always empty (0/102 verified).
-- `code_review_lessons`: fallback to memory-log search when `models/` absent.
-- `experiment_value`: inject low-VOI directions (`information_value < 0.01`).
-  Fixed SQL column names (`voi` → `information_value`).
-- Structured memory: system writes `[Cycle N] val_MAE=X status=Y` to
-  MEMORY_LOG.md deterministically (not via LLM free text). Re-extracts from
-  training log when monitor metrics are empty (covers the 60% empty case).
-- Goal tracking: parse targets from PROJECT_BRIEF, track best vs target,
-  inject `goal_progress` context key, auto-stop when achieved.
-- `training_log_parser` + `model_structure_scanner` integrated into
-  monitor/verifier/model_analyzer (replacing 4 duplicated regex + kwargs bug).
-
-#### Phase 2: Tool-Level Safety Contracts
-
-**Problem**: Safety rules were scattered across run(), constraint_engine,
-prompt suggestions. Naming conventions were advisory (tools/ had 117 files).
-
-**Fixes**:
-- `write_file`: enforces naming (root `.py` rejected, `train_*.py` must be in
-  `scripts/`, `debug_*`/`diag_*`/`_check_*` must be in `tools/`).
-- `launch_experiment`: optional mandatory dry-run gate (config-controlled).
-- `core/garbage_collector.py`: deterministic GC (no LLM, no quota cost) —
-  archives temp files and old output dirs; never touches protected files.
-- `config.yaml`: new `safety` section (naming rules, GC thresholds).
-
-#### Phase 3: Remove Research-Decision Enforcement
-
-**Problem**: 7-layer enforcement chain in run() (arbiter → phase gate →
-roadmap → no-progress fallback → launch enforcement → audit enforcement →
-arbitrate). 9 stagnation counters had **0 triggers** in 23 production cycles.
-Circuit breakers injected advisory text the LLM ignored.
-
-**Fixes**:
-- Deleted `_apply_no_progress_fallback` (159 lines), `_extract_direction_signature`,
-  `_extract_architecture_name`, `_analyze_architecture_dead_ends` (90 lines) —
-  all research decisions, not safety constraints.
-- Disabled 4 circuit breaker conditions (`if False and`) — idea_guardian,
-  direction_circuit_breaker, architecture_circuit_breaker, quality_alert.
-- run() enforcement chain: **7 → 3 layers** (arbiter → phase_gate → roadmap).
-- Retained: `_check_phase_blocked` (safety), `_enforce_launch_after_failure`
-  (behavior constraint), `_enforce_roadmap_alignment` (deviation detection),
-  `constraint_engine` FORBIDDEN.
-
-#### Phase 4 (partial): Domain Generalization + Prompt Trimming
-
-**Fixes**:
-- Metric keys config-driven (`config.yaml goals.metrics`), not hardcoded
-  `val_MAE`. `memory.py` and `loop.py` read from config.
-- `leader.md`: Idea Guardian → Research Direction Self-Assessment (methodology,
-  not enforcement). 673→658 lines.
-- `code_agent.md`: naming rules simplified (enforced by write_file). 376→361 lines.
-
-**Deferred** (pending runtime validation):
-- `code_review` extraction to `core/code_review.py` (854 lines)
-- Non-blocking execution model (training async + experiment registry)
-- Plugin → tool conversion (sandbox/idea_planner/visual_analyzer)
-
-#### Signal Arbitration System
-
-`core/signal_arbiter.py` provides a unified enforcement decision point.
-Collects signals from launch failures, audit escalations, and forbidden
-constraints. Produces a `CycleDirective` with either a `forced_action`
-(bypassing LLM) or a budgeted context for normal THINK.
-
-#### Context Schema (single source of truth)
-
-`core/context_keys.py` registers every context key with its serializer,
-tier, and phase. `ContextPruner` derives tiers from the registry (not a
-separate hardcoded list). Adding a key requires exactly ONE change (the
-registry); injection, pruning, and serialization all pick it up.
-
-Previously 37/48 keys were silently dropped (77% waste). Now 98% reach the
-LLM. `_format_leader_input` shrank from 170 to 8 lines.
-
-#### Garbage Collection
-
-`core/garbage_collector.py` — deterministic, no LLM. Archives `debug_*`/
-`diag_*`/`_check_*`/`dryrun_*` from `tools/` to `archive/temp/`. Old output
-dirs (>10) archived unless they contain `best_model.pth`. Protected files
-(models/, datasets/, scripts/, PROJECT_BRIEF.md) never touched.
-
-#### Test Coverage: 0 → 134 tests
-
-14 test files covering: error classification, dispatch contracts, cycle state,
-context schema, signal arbitration, knowledge consumption, tool safety,
-garbage collection, shared primitives, IdeaScout bridge, security.
+**Current data-flow health** (see [DATA_CONTRACT.md](DATA_CONTRACT.md)): 4 tables LIVE, 3 tables KNOWN-BROKEN with documented root causes (pareto_matrix, experiment_value, experiment_facts — tracked for separate fix).
