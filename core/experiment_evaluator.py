@@ -14,9 +14,7 @@ Design principle: The model should NOT evaluate itself. IndependentProbe uses
 a separate lightweight model to cross-validate the main model's outputs.
 """
 
-import ast
 import json
-import re
 import logging
 import subprocess
 import sys
@@ -25,29 +23,6 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("autoresearcher.experiment_evaluator")
-
-
-@dataclass
-class FailureDiagnosis:
-    """Structured diagnosis of why an experiment failed or underperformed."""
-    failure_type: str  # "architecture", "data", "training", "alignment", "capacity"
-    severity: str  # "critical", "high", "medium", "low"
-    root_cause: str
-    evidence: list[str] = field(default_factory=list)
-    fix_suggestion: str = ""
-    module_involved: str = ""
-    plan_phase_failed: str = ""  # Which of the 9 plan phases this relates to
-
-
-@dataclass
-class IterationGuidance:
-    """Specific guidance for the next iteration."""
-    action: str  # "fix_architecture", "adjust_training", "change_data", "pivot_method", "iterate"
-    priority: str  # "critical", "high", "medium"
-    specific_changes: list[str] = field(default_factory=list)
-    modules_to_modify: list[str] = field(default_factory=list)
-    expected_improvement: str = ""
-    risk_if_ignored: str = ""
 
 
 @dataclass

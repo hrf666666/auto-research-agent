@@ -9,7 +9,6 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -36,16 +35,19 @@ class TestDefaultProvider:
         sig = inspect.signature(AgentDispatcher.__init__)
         assert sig.parameters["model"].default == "auto"
 
-    def test_call_anthropic_removed(self):
-        """The dead Anthropic code path must be gone."""
-        assert not hasattr(AgentDispatcher, "_call_anthropic")
+    def test_anthropic_explicit_provider_supported(self):
+        """Anthropic is available only when explicitly configured, not by default."""
+        assert hasattr(AgentDispatcher, "_call_anthropic")
+        d = AgentDispatcher(model="auto", provider="anthropic", tools=None)
+        assert d.provider == "anthropic"
+        assert d._resolve_anthropic_model() == "claude-sonnet-4-6"
 
-    def test_openai_fallback_still_present(self):
-        """OpenAI fallback branch must survive (only Anthropic was removed)."""
+    def test_openai_and_anthropic_fallback_branches_present(self):
+        """Legacy OpenAI and explicit Anthropic branches must both survive."""
         src = inspect.getsource(AgentDispatcher._call_llm)
         assert 'self.provider == "openai"' in src
-        # Anthropic branch must be gone
-        assert '_call_anthropic' not in src
+        assert 'self.provider == "anthropic"' in src
+        assert '_call_anthropic' in src
 
 
 # ═════════════════════════════════════════════════════════════

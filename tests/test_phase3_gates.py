@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -25,9 +24,7 @@ from core.methodology_gates import (
     check_control_coverage,
     check_dead_end_signature,
     run_all_gates,
-    _normalize_metric_name,
     _build_method_signature,
-    MethodologyVerdict,
 )
 
 

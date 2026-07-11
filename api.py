@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import time
+import signal
 from pathlib import Path
 from typing import Optional
 
@@ -60,7 +61,8 @@ class AutoResearcher:
         """
         self.project_dir = Path(project_dir).resolve()
         self.config_path = config_path
-        self.workspace = Path(workspace).resolve() if workspace else self.project_dir
+        self._workspace_override = workspace
+        self.workspace = self._resolve_workspace(self._load_config())
         self._daemon_process: Optional[subprocess.Popen] = None
         self._daemon_log = None
 
@@ -82,12 +84,18 @@ class AutoResearcher:
         from core.loop import ResearchLoop
 
         config = self._load_config()
-        config.setdefault("agent", {})["max_cycles"] = 1
+        self.workspace = self._resolve_workspace(config)
+        start_cycle = self._read_cycle_counter()
 
-        loop = ResearchLoop(config=config, project_dir=str(self.project_dir))
-        loop.run()
+        loop = ResearchLoop(
+            config=config,
+            project_dir=str(self.project_dir),
+            workspace=str(self.workspace),
+        )
+        loop.run(max_new_cycles=1)
 
-        return self._extract_last_result()
+        results = self._get_results_since(start_cycle)
+        return results[-1] if results else {"cycle": start_cycle, "action": "unknown"}
 
     def run_n_cycles(self, n: int = 5) -> list[dict]:
         """Run N cycles and return results.
@@ -100,13 +108,20 @@ class AutoResearcher:
         """
         from core.loop import ResearchLoop
 
+        if n < 1:
+            raise ValueError("n must be >= 1")
         config = self._load_config()
-        config.setdefault("agent", {})["max_cycles"] = n
+        self.workspace = self._resolve_workspace(config)
+        start_cycle = self._read_cycle_counter()
 
-        loop = ResearchLoop(config=config, project_dir=str(self.project_dir))
-        loop.run()
+        loop = ResearchLoop(
+            config=config,
+            project_dir=str(self.project_dir),
+            workspace=str(self.workspace),
+        )
+        loop.run(max_new_cycles=n)
 
-        return self._get_all_results(limit=n)
+        return self._get_results_since(start_cycle)
 
     # ── Daemon (background process) API ───────────────────────────
 
@@ -123,16 +138,23 @@ class AutoResearcher:
         if self._daemon_process and self._daemon_process.poll() is None:
             raise RuntimeError(f"Daemon already running (PID {self._daemon_process.pid})")
 
-        cmd = [sys.executable, "-m", "core.loop", "--project", str(self.project_dir)]
-        if gpu:
-            cmd.extend(["--gpu", gpu])
-        if max_cycles > 0:
-            cmd.extend(["--max-cycles", str(max_cycles)])
+        config = self._load_config()
+        self.workspace = self._resolve_workspace(config)
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()), "daemon-run",
+            "--project", str(self.project_dir),
+            "--config", self.config_path,
+            "--workspace", str(self.workspace),
+            "--max-cycles", str(max_cycles),
+        ]
+        if gpu is not None:
+            cmd.extend(["--gpu", str(gpu)])
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(_REPO_DIR)
 
-        self._daemon_log = open(self.project_dir / "autoresearcher.log", "a")
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self._daemon_log = open(self.workspace / "autoresearcher.log", "a")
         self._daemon_process = subprocess.Popen(
             cmd,
             cwd=str(_REPO_DIR),
@@ -141,6 +163,18 @@ class AutoResearcher:
             stderr=self._daemon_log,
         )
 
+        time.sleep(0.5)
+        if self._daemon_process.poll() is not None:
+            code = self._daemon_process.returncode
+            if self._daemon_log and not self._daemon_log.closed:
+                self._daemon_log.close()
+            raise RuntimeError(
+                f"Daemon exited during startup with code {code}. "
+                f"See log: {self.workspace / 'autoresearcher.log'}"
+            )
+
+        pid_file = self.workspace / "autoresearcher.pid"
+        pid_file.write_text(str(self._daemon_process.pid))
         logger.info(f"Daemon started: PID {self._daemon_process.pid}")
         return self._daemon_process.pid
 
@@ -180,12 +214,8 @@ class AutoResearcher:
         }
 
         # Read cycle counter
-        counter_path = self.project_dir / ".cycle_counter"
-        if counter_path.exists():
-            try:
-                result["cycle"] = int(counter_path.read_text().strip())
-            except ValueError:
-                pass
+        result["workspace"] = str(self.workspace)
+        result["cycle"] = self._read_cycle_counter()
 
         # Read memory log
         from core.memory import MemoryManager
@@ -240,6 +270,38 @@ class AutoResearcher:
 
     # ── Internal helpers ──────────────────────────────────────────
 
+    def _resolve_workspace(self, config: dict) -> Path:
+        from core.workspace import resolve_workspace
+        return resolve_workspace(self.project_dir, config, self._workspace_override)
+
+    def _read_cycle_counter(self) -> int:
+        counter_path = self.workspace / ".cycle_counter"
+        if counter_path.exists():
+            try:
+                return int(counter_path.read_text().strip())
+            except ValueError:
+                logger.warning("Invalid cycle counter at %s", counter_path)
+        return 0
+
+    def _normalize_history_row(self, row: dict) -> dict:
+        result = dict(row)
+        metrics_json = result.get("metrics_json", "{}")
+        try:
+            result["metrics"] = json.loads(metrics_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            result["metrics"] = {}
+        return result
+
+    def _get_results_since(self, start_cycle: int) -> list[dict]:
+        try:
+            from core.memory import MemoryManager
+            mm = MemoryManager(project_dir=self.project_dir, workspace=self.workspace)
+            rows = mm.get_experiment_history(limit=1000)
+            selected = [self._normalize_history_row(r) for r in rows if int(r.get("cycle", 0)) > start_cycle]
+            return sorted(selected, key=lambda r: r.get("cycle", 0))
+        except Exception:
+            return []
+
     def _load_config(self) -> dict:
         """Load YAML config from project dir."""
         import yaml
@@ -273,7 +335,7 @@ class AutoResearcher:
     def _check_training_running(self) -> bool:
         """Check if a training process is currently running."""
         try:
-            state_file = self.project_dir / "state.json"
+            state_file = self.workspace / "state.json"
             if state_file.exists():
                 with open(state_file) as f:
                     state = json.load(f)
@@ -320,6 +382,15 @@ def cli():
 
     # stop daemon
     p = sub.add_parser("stop", help="Stop background daemon")
+    p.add_argument("--project", required=True)
+
+    # internal daemon foreground runner
+    p = sub.add_parser("daemon-run", help=argparse.SUPPRESS)
+    p.add_argument("--project", required=True)
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--workspace", default=None)
+    p.add_argument("--gpu", default=None)
+    p.add_argument("--max-cycles", type=int, default=-1)
 
     # lessons
     p = sub.add_parser("lessons", help="Show learned code review lessons")
@@ -344,15 +415,23 @@ def cli():
         print(f"Daemon started: PID {pid}")
 
     elif args.command == "stop":
-        # Find and stop running daemon
-        result = subprocess.run(
-            ["pgrep", "-f", "core.loop.*--project"],
-            capture_output=True, text=True
-        )
-        for pid_str in result.stdout.strip().split("\n"):
-            if pid_str.strip():
-                os.kill(int(pid_str.strip()), 15)
-                print(f"Stopped PID {pid_str.strip()}")
+        r = AutoResearcher(args.project)
+        pid_file = r.workspace / "autoresearcher.pid"
+        if not pid_file.exists():
+            print("No daemon pid file found")
+            return
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"Stopped PID {pid}")
+
+    elif args.command == "daemon-run":
+        from core.loop import ResearchLoop
+        r = AutoResearcher(args.project, config_path=args.config, workspace=args.workspace)
+        config = r._load_config()
+        if args.max_cycles != -1:
+            config.setdefault("agent", {})["max_cycles"] = args.max_cycles
+        loop = ResearchLoop(config=config, project_dir=str(r.project_dir), workspace=str(r.workspace))
+        loop.run(max_new_cycles=None if args.max_cycles == -1 else args.max_cycles)
 
     elif args.command == "lessons":
         r = AutoResearcher(args.project)

@@ -15,7 +15,6 @@ One-command setup:
     python install.py --uninstall  # remove from all
 """
 
-import os
 import shutil
 import sys
 from pathlib import Path

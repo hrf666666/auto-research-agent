@@ -27,7 +27,6 @@ import json
 import logging
 import sqlite3
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -175,7 +174,6 @@ def scan_single(
     log_file = manifest.get("log_file", "")
 
     # Locate train.log — prefer manifest's log_file, fall back to standard names
-    workspace = manifest_path.parent.parent  # outputs/<dir> -> outputs/
     log_path = None
     if log_file:
         candidate = Path(log_file)

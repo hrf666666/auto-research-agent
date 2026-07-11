@@ -16,8 +16,9 @@ import re
 import subprocess
 import threading
 import time
+import selectors
+import signal
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("autoresearcher.tools")
 
@@ -43,15 +44,54 @@ class MCPClientMixin:
         for name, session in list(self._mcp_sessions.items()):
             try:
                 if session.get("transport") == "stdio":
-                    proc = session.get("proc")
-                    if proc and proc.poll() is None:
-                        proc.kill()
-                        proc.wait(timeout=5)
+                    self._terminate_stdio_session(name, session)
                 elif session.get("stop_event"):
                     session["stop_event"].set()
             except Exception:
                 pass
         self._mcp_sessions.clear()
+
+    def _terminate_stdio_session(self, service_name: str, session: dict | None):
+        if not session:
+            return
+        proc = session.get("proc")
+        try:
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        proc.kill()
+                    proc.wait(timeout=5)
+        except Exception:
+            pass
+        if proc:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(proc, stream_name, None)
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+        self._mcp_sessions.pop(service_name, None)
+
+    @staticmethod
+    def _readline_with_timeout(stream, timeout: float) -> bytes | None:
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(stream, selectors.EVENT_READ)
+            events = selector.select(timeout)
+            if not events:
+                return None
+            return stream.readline()
+        finally:
+            selector.close()
 
     @property
     def mcp_available(self) -> dict:
@@ -63,23 +103,6 @@ class MCPClientMixin:
         return self._mcp_available or {}
 
     # ── MCP SSE Dual-Connection Protocol ──
-
-    @staticmethod
-    def _parse_sse_response(raw_text: str) -> dict | None:
-        """Parse an SSE (Server-Sent Events) response into a JSON-RPC result."""
-        data_payload = None
-        for line in raw_text.split("\n"):
-            line = line.strip()
-            if line.startswith("data:"):
-                candidate = line[5:].strip()
-                if candidate.startswith("{"):
-                    data_payload = candidate
-        if data_payload:
-            try:
-                return json.loads(data_payload)
-            except json.JSONDecodeError:
-                pass
-        return None
 
     @staticmethod
     def _parse_mcp_text(raw_text: str) -> list | None:
@@ -387,8 +410,9 @@ class MCPClientMixin:
                 ["npx", "-y", "@z_ai/mcp-server"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 env={**os.environ, "Z_AI_API_KEY": glm_key, "Z_AI_MODE": "ZHIPU"},
+                start_new_session=True,
             )
         except FileNotFoundError:
             logger.debug("MCP stdio: npx not found, cannot start zai-mcp-server")
@@ -408,18 +432,18 @@ class MCPClientMixin:
         try:
             proc.stdin.write(init_msg.encode())
             proc.stdin.flush()
-            resp_line = proc.stdout.readline()
+            resp_line = self._readline_with_timeout(proc.stdout, 15)
             if not resp_line:
-                proc.kill()
+                self._terminate_stdio_session(service_name, {"transport": "stdio", "proc": proc})
                 return None
             resp = json.loads(resp_line.decode())
             if "error" in resp:
                 logger.debug(f"MCP stdio: initialize error: {resp['error']}")
-                proc.kill()
+                self._terminate_stdio_session(service_name, {"transport": "stdio", "proc": proc})
                 return None
         except Exception as e:
             logger.debug(f"MCP stdio: initialize failed: {e}")
-            proc.kill()
+            self._terminate_stdio_session(service_name, {"transport": "stdio", "proc": proc})
             return None
 
         notif_msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) + "\n"
@@ -434,7 +458,7 @@ class MCPClientMixin:
 
     def _mcp_stdio_call(self, service_name: str, tool_name: str,
                         arguments: dict, timeout: int = 30) -> str | None:
-        """Call an MCP tool via stdio subprocess."""
+        """Call an MCP tool via stdio subprocess with bounded reads."""
         session = self._mcp_sessions.get(service_name)
         if not session or session.get("transport") != "stdio":
             return None
@@ -443,9 +467,13 @@ class MCPClientMixin:
         lock = session["lock"]
 
         with lock:
+            if proc.poll() is not None:
+                logger.warning(f"MCP stdio {service_name}: process exited with code {proc.returncode}")
+                self._terminate_stdio_session(service_name, session)
+                return None
+
             session["next_id"] += 1
             rpc_id = session["next_id"]
-
             payload = json.dumps({
                 "jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
@@ -455,48 +483,38 @@ class MCPClientMixin:
                 proc.stdin.write(payload.encode())
                 proc.stdin.flush()
             except BrokenPipeError:
-                logger.warning(f"MCP stdio {service_name}: process died, attempting restart")
-                self._mcp_sessions.pop(service_name, None)
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                logger.warning(f"MCP stdio {service_name}: process died")
+                self._terminate_stdio_session(service_name, session)
                 return None
 
-        if proc.poll() is not None:
-            logger.warning(f"MCP stdio {service_name}: process exited with code {proc.returncode}")
-            self._mcp_sessions.pop(service_name, None)
-            return None
-
-        try:
             buf = b""
             deadline = time.time() + timeout
             data = None
             while time.time() < deadline:
-                line = proc.stdout.readline()
+                line = self._readline_with_timeout(proc.stdout, max(0.0, deadline - time.time()))
+                if line is None:
+                    logger.warning(f"MCP stdio {service_name}: timeout reading response")
+                    self._terminate_stdio_session(service_name, session)
+                    return None
                 if not line:
-                    break
+                    logger.warning(f"MCP stdio {service_name}: stdout closed")
+                    self._terminate_stdio_session(service_name, session)
+                    return None
                 buf += line
                 try:
-                    data = json.loads(buf.decode())
-                    if data.get("id") == rpc_id:
-                        break
-                    else:
-                        buf = b""
-                        data = None
-                        continue
+                    candidate = json.loads(buf.decode())
                 except json.JSONDecodeError:
                     continue
-            else:
-                logger.warning(f"MCP stdio {service_name}: timeout reading response")
-                return None
+                if candidate.get("id") != rpc_id:
+                    buf = b""
+                    continue
+                data = candidate
+                break
 
             if data is None:
                 logger.warning(f"MCP stdio {service_name}: no valid response received")
+                self._terminate_stdio_session(service_name, session)
                 return None
-        except Exception as e:
-            logger.warning(f"MCP stdio {service_name}: read failed: {e}")
-            return None
 
         if "error" in data:
             err = data["error"]
@@ -516,7 +534,6 @@ class MCPClientMixin:
                 text_parts.append(block.get("text", ""))
             elif isinstance(block, str):
                 text_parts.append(block)
-
         raw_text = "\n".join(text_parts)
         return raw_text if raw_text.strip() else None
 

@@ -7,14 +7,13 @@ bug that made analyze_model produce garbage.
 """
 from __future__ import annotations
 
-import pytest
 
 from core.training_log_parser import (
     parse_loss_series, has_nan_loss, classify_loss_trend,
-    extract_metrics, load_training_log, LossTrend,
+    extract_metrics,
 )
 from core.model_structure_scanner import (
-    scan_model_file, find_dead_branches, ModelStructure,
+    scan_model_file, find_dead_branches,
 )
 
 

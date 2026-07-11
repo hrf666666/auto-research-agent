@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-ALLOWED_NAME="Xiangyue-Zhang"
-ALLOWED_EMAIL="85532891+Xiangyue-Zhang@users.noreply.github.com"
+ALLOWED_NAME="Huang Ruifeng"
+ALLOWED_EMAIL="hrf666666@users.noreply.github.com"
 
 check_commit() {
   sha="$1"

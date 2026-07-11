@@ -22,7 +22,6 @@ import json
 import base64
 import logging
 import subprocess
-import threading
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
@@ -335,7 +334,7 @@ class VisualAnalyzer:
             if result.returncode != 0:
                 logger.warning(f"Inference returned non-zero: {result.stderr[:500]}")
             else:
-                logger.info(f"Inference completed successfully")
+                logger.info("Inference completed successfully")
 
         except subprocess.TimeoutExpired:
             logger.warning("Inference timed out after 10 minutes")
@@ -565,7 +564,6 @@ class VisualAnalyzer:
         Reuses the ToolRegistry's cached stdio session instead of spawning a new
         subprocess each time. Falls back to direct spawn if ToolRegistry unavailable.
         """
-        import time
 
         api_key = os.getenv(self.mcp_env_key)
         if not api_key:
@@ -601,7 +599,6 @@ class VisualAnalyzer:
     def _call_zai_via_tools_registry(self, images: list[dict],
                                       combined_prompt: str) -> Optional[str]:
         """Call zai-mcp-server via ToolRegistry's cached stdio session."""
-        import time
 
         # Ensure zai_vision session exists
         if "zai_vision" not in self._tools_registry.mcp_available:
@@ -655,21 +652,6 @@ class VisualAnalyzer:
             "severity": "info",
             "summary": f"MCP vision analysis of {len(images)} images via zai-mcp-server (stdio, reused session)",
         })
-
-    @staticmethod
-    def _extract_mcp_text(result: dict) -> Optional[str]:
-        """Extract text content from an MCP JSON-RPC result dict."""
-        content_blocks = result.get("content", [])
-        if result.get("isError"):
-            return None
-        text_parts = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                text_parts.append(block)
-        return "\n".join(text_parts) if text_parts else None
-
 
     def _call_multimodal_model(self, model_name: str, prompt: str,
                               image_contents: list,

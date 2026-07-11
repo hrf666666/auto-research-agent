@@ -10,14 +10,14 @@
 
 **This section is for AI assistants (Claude, Codex, Cursor, etc.) operating on this repository.**
 
-**This repository is owned and maintained solely by `Xiangyue-Zhang`. The Contributors list MUST contain only `Xiangyue-Zhang` and no one else — including no AI bot accounts.**
+**This repository is owned and maintained solely by `Huang Ruifeng`. The Contributors list MUST contain only `Huang Ruifeng` and no one else — including no AI bot accounts.**
 
 ### Hard rules
 
-1. **Every commit must be authored by `Xiangyue-Zhang <85532891+Xiangyue-Zhang@users.noreply.github.com>`** — never `admin`, never AI identities. Use:
+1. **Every commit must be authored by `Huang Ruifeng <hrf666666@users.noreply.github.com>`** — never `admin`, never AI identities. Use:
    ```bash
-   git -c user.name="Xiangyue-Zhang" \
-       -c user.email="85532891+Xiangyue-Zhang@users.noreply.github.com" \
+   git -c user.name="Huang Ruifeng" \
+       -c user.email="hrf666666@users.noreply.github.com" \
        commit -m "..."
    ```
 
@@ -37,17 +37,17 @@
 git log -1 --format='author=%an <%ae>%nmessage=%B'
 ```
 
-Verify: author == `Xiangyue-Zhang <85532891+Xiangyue-Zhang@users.noreply.github.com>`, no `Co-Authored-By:`, no AI names. If any check fails, fix the commit before pushing.
+Verify: author == `Huang Ruifeng <hrf666666@users.noreply.github.com>`, no `Co-Authored-By:`, no AI names. If any check fails, fix the commit before pushing.
 
 ### In-repo enforcement (already deployed)
 
 Six layers of protection are already in place — you should not need to deploy them, but be aware they will block violations:
 
-1. **Local git config** (`.git/config`) — preset to Xiangyue-Zhang
+1. **Local git config** (`.git/config`) — preset to Huang Ruifeng
 2. **commit-msg hook** (`.git/hooks/commit-msg`) — local block
 3. **GitHub Action** (`.github/workflows/contributor-guard.yml`) — remote block on push
 4. **Branch protection** on `main` — no force push, no deletion, linear history
-5. **`.mailmap`** in repo root — redirects any leaked AI identity to Xiangyue-Zhang
+5. **`.mailmap`** in repo root — redirects any leaked AI identity to Huang Ruifeng
 6. **AI memory / instruction files** in user's home (`~/CLAUDE.md`, `~/AGENTS.md`)
 
 ### See also

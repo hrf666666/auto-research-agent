@@ -10,9 +10,7 @@ fallback) and Phase 2 (convergence_failed flag) are observable changes.
 """
 from __future__ import annotations
 
-import json
 
-import pytest
 
 from core.agents import AgentDispatcher, ToolTrace
 from tests.conftest import make_trace
@@ -226,7 +224,7 @@ class TestHardTurnGate:
     def test_explore_tool_blocked_past_60pct_budget(self, monkeypatch):
         """A read_file call at turn ≥ 60% of max_turns must return a budget
         error instead of executing."""
-        from core.agents import AgentDispatcher, _CODE_EXPLORE_TOOLS
+        from core.agents import _CODE_EXPLORE_TOOLS
 
         # Verify the explore set includes read_file (the dominant waste in logs)
         assert "read_file" in _CODE_EXPLORE_TOOLS

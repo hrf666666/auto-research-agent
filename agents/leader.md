@@ -53,13 +53,14 @@ action must be: "experiment" (run code), "paper_research" (survey), or "wait".
 - `claim_type`: "causal" (you claim method X *causes* improvement — needs a control/ablation to confirm), "correlational" (you observe an association but don't claim causation), or "null" (no causal claim, e.g. a bug fix or infrastructure change).
 
 ### REFLECT — respond with EXACTLY this JSON structure:
-{"milestone": "what was achieved", "decision": "what to do next", "dead_end": null, "active_problem": null, "causal_link": null, "lesson": null}
+{"milestone": "what was achieved", "decision": "what to do next", "dead_end": null, "failure_category": null, "active_problem": null, "causal_link": null, "lesson": null}
 
 - `dead_end`: If this cycle proved a method/approach is a dead end (it was falsified or cannot work), state it here as "method X is a dead end because <evidence>". Name the method explicitly. The system records these and warns future cycles (the dead-end gate) before they retry a falsified approach. Only fill this when you have evidence the direction itself is wrong — not a mere implementation bug (use `lesson` for those).
+- `failure_category`: When filling `dead_end`, also set this to one of: `"hypothesis_wrong"` (the scientific hypothesis was falsified), `"implementation_bug"` (a code bug, NOT a direction failure — use `lesson` instead if possible), `"insufficient_experiment"` (not enough data/epochs to conclude), `"method_inadequacy"` (the analysis method was too narrow, not the hypothesis itself). This categorization lets the system distinguish hypothesis failures from implementation issues and avoid false-negative dead ends.
 - `active_problem`: If a metric or problem remains stubbornly unsolved and is blocking progress, name it here as "problem X remains: <current state vs target>". This surfaces the bottleneck so future cycles prioritize it.
 - `causal_link`: If this cycle revealed WHY a design decision helped or hurt a metric, state it here as "decision X caused metric Y to improve/worsen because Z". This feeds the causal history that future cycles see in THINK.
 - `lesson`: If you discovered a reusable code lesson (a bug pattern, an architecture insight, a failure mode to avoid), state it here as a one-line principle. Future cycles can query it via `query_memory(type="lessons")`.
-- All of dead_end / active_problem / causal_link / lesson are optional (null if nothing applies), but filling them makes future cycles smarter and prevents repeating falsified approaches.
+- All of dead_end / failure_category / active_problem / causal_link / lesson are optional (null if nothing applies), but filling them makes future cycles smarter and prevents repeating falsified approaches.
 
 Example valid THINK response (first line only, no other text):
 {"action": "experiment", "task": "Fix the data loader to handle 5-channel input", "hypothesis": "Current loader expects 4 channels but model needs 5", "success_criteria": "Training runs without shape errors", "claim_type": "null"}

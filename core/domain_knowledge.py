@@ -17,10 +17,8 @@ which catalogs known method assumptions (e.g., "EPI assumes Lambertian").
 This is scientific knowledge, not hardcoded project logic.
 """
 
-import json
 import logging
 import re
-from pathlib import Path
 
 logger = logging.getLogger("autoresearcher.domain_knowledge")
 
@@ -288,7 +286,7 @@ class DomainKnowledgeMixin:
         we extract domain information from the brief and use the method's
         assumption to determine compatibility.
         """
-        brief_lower = brief_text.lower()
+        brief_text.lower()
 
         # Extract domain names from brief (look for common patterns)
         domain_names = self._extract_domain_names(brief_text)
@@ -299,7 +297,7 @@ class DomainKnowledgeMixin:
         violated_conditions = props.get("violated_when", [])
 
         for domain in domain_names:
-            domain_lower = domain.lower()
+            domain.lower()
             # Check if any violation condition mentions this domain's characteristics
             domain_keywords = self._get_domain_keywords(domain)
             is_weak = False

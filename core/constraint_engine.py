@@ -10,16 +10,10 @@ P3 (referee-not-player): constraints fire inside tools as safety contracts,
 not as overrides on the LLM's decisions.
 """
 
-import ast
 import json
-import re
-import math
 import logging
-import subprocess
-import sys
 from pathlib import Path
-from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger("autoresearcher.constraint_engine")
 
@@ -358,18 +352,6 @@ class ContextPruner:
     @property
     def TIER_1_ALWAYS(self):
         return self._tier_sets.get(1, set())
-
-    @property
-    def TIER_2_SITUATIONAL(self):
-        return self._tier_sets.get(2, set())
-
-    @property
-    def TIER_3_CONDITIONAL(self):
-        return self._tier_sets.get(3, set())
-
-    @property
-    def TIER_4_RARE(self):
-        return self._tier_sets.get(4, set())
 
     def prune(self, context: dict, phase: str) -> dict:
         """Select most relevant context keys, dropping low-priority ones.

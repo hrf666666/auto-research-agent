@@ -20,7 +20,6 @@ interpretation stays with the LLM.
 """
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import operator
@@ -28,7 +27,6 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
 
 logger = logging.getLogger("autoresearcher.methodology_gates")
 
@@ -643,7 +641,7 @@ class MethodologyVerdict:
         elif f.parseable:
             parts.append(f"criteria(unresolvable: {f.detail[:40]})")
         else:
-            parts.append(f"criteria(unparseable)")
+            parts.append("criteria(unparseable)")
 
         c = self.control_coverage
         if c.marked_inconclusive:

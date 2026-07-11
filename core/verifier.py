@@ -14,15 +14,13 @@ If not, it pinpoints WHERE the failure occurred so REFLECT can diagnose WHY.
 """
 
 import ast
-import os
 import re
 import sys
 import json
 import logging
-from .training_log_parser import parse_loss_series, has_nan_loss, classify_loss_trend
+from .training_log_parser import parse_loss_series, has_nan_loss
 import subprocess
 from pathlib import Path
-from typing import Optional
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("autoresearcher.verifier")
@@ -595,7 +593,7 @@ class ExperimentVerifier:
                             category="execution",
                             status="pass",
                             detail=f"Process PID={pid} finished normally: {normal_completion}",
-                            evidence=f"PID dead but completion artifacts found",
+                            evidence="PID dead but completion artifacts found",
                             module_path="training_process",
                         ))
                     else:
@@ -1495,7 +1493,7 @@ class ExperimentVerifier:
             for ds_name, ds_info in datasets.items():
                 scenes = ds_info.get("scenes", {})
                 grid_size = ds_info.get("grid_size", [9, 9])
-                grid_str = f"{grid_size[0]}×{grid_size[1]}" if isinstance(grid_size, list) and len(grid_size) >= 2 else "?"
+                f"{grid_size[0]}×{grid_size[1]}" if isinstance(grid_size, list) and len(grid_size) >= 2 else "?"
 
                 for scene_name, scene_info in scenes.items():
                     split = scene_info.get("split", "unknown")
@@ -2451,7 +2449,7 @@ class ExperimentVerifier:
                 category="integrity",
                 status="warn",
                 detail=(
-                    f"Per-domain MAE REGRESSED vs baseline:\n"
+                    "Per-domain MAE REGRESSED vs baseline:\n"
                     + "\n".join(f"  - {r}" for r in regressions)
                     + "\n\nThe new model makes some domains WORSE. "
                     + "REFLECT must investigate WHY before iterating."

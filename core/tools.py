@@ -5,7 +5,6 @@ Each agent gets a minimal tool set (3-5 tools) instead of all tools.
 This reduces token overhead per API call significantly.
 """
 
-import ast
 import os
 import re
 import sys
@@ -13,9 +12,10 @@ import time
 import subprocess
 import json
 import logging
-import threading
+import hashlib
+import fcntl
+import shlex
 from pathlib import Path
-from typing import Optional
 
 from .mcp_client import MCPClientMixin
 from .model_analyzer import ModelAnalyzerMixin
@@ -42,11 +42,23 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
     - web_fetch: MCP web_reader → urllib direct fetch
     """
 
+    _launched_processes: dict[int, subprocess.Popen] = {}
+
     def __init__(self, workspace: Path, memory=None, config: dict = None):
         self.workspace = Path(workspace).resolve()
         self._memory = memory  # Optional MemoryManager reference for log_memory tool
-        # Phase 2: safety config (tool-level contracts)
-        self._mandatory_dry_run = (config or {}).get("safety", {}).get("mandatory_dry_run", False)
+        self.config = config or {}
+        safety_cfg = self.config.get("safety", {}) or {}
+        experiment_cfg = self.config.get("experiment", {}) or {}
+        # Canonical key is safety.mandatory_dry_run; keep experiment.* as a
+        # compatibility fallback for older/example configs.
+        self._mandatory_dry_run = safety_cfg.get(
+            "mandatory_dry_run", experiment_cfg.get("mandatory_dry_run", False)
+        )
+        self._max_parallel = int(experiment_cfg.get("max_parallel", 1) or 1)
+        self._runtime_dir = self.workspace / ".autoresearcher"
+        self._dry_run_receipt_path = self._runtime_dir / "dry_run_receipts.json"
+        self._active_registry_path = self._runtime_dir / "active_experiments.json"
 
         # Protected files and directories — always initialized
         self._protected_files = {
@@ -588,6 +600,138 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
 
         return resolved
 
+    def _is_protected_path(self, path: str | Path) -> bool:
+        try:
+            resolved = self._resolve_workspace_path(str(path))
+            rel = resolved.relative_to(self.workspace)
+        except Exception:
+            return True
+        parts = rel.parts
+        if resolved.name in self._protected_files:
+            return True
+        if parts and parts[0] in self._protected_dirs:
+            # scripts/*.py is writable via write_file for experiment scripts, but
+            # shell mutators should not bypass write_file's content checks.
+            return True
+        return False
+
+    def _extract_shell_targets(self, cmd: str) -> list[str]:
+        targets: list[str] = []
+        # Redirection targets: > file, >> file, 1> file, 2> file.
+        for m in re.finditer(r"(?:^|\s)(?:\d?>|>>|&>)\s*([^\s;&|]+)", cmd):
+            targets.append(m.group(1).strip("'\""))
+        try:
+            tokens = shlex.split(cmd, posix=True)
+        except ValueError:
+            return targets
+        mutators = {"rm", "mv", "cp", "install", "truncate", "tee"}
+        for i, tok in enumerate(tokens):
+            base = Path(tok).name
+            if base in mutators:
+                for nxt in tokens[i + 1:]:
+                    if nxt.startswith("-"):
+                        continue
+                    if nxt in {"&&", "||", ";", "|"}:
+                        break
+                    targets.append(nxt)
+            if base == "git" and i + 1 < len(tokens) and tokens[i + 1] in {"restore", "checkout", "reset"}:
+                targets.extend(t for t in tokens[i + 2:] if not t.startswith("-"))
+        return targets
+
+    def _validate_shell_file_targets(self, cmd: str):
+        for target in self._extract_shell_targets(cmd):
+            if self._is_protected_path(target):
+                raise ValueError(f"Blocked: shell command modifies protected path: {target}")
+
+    def _script_hash(self, script_name: str) -> str:
+        path = self._resolve_workspace_path(script_name)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _load_dry_run_receipts(self) -> dict:
+        try:
+            return json.loads(self._dry_run_receipt_path.read_text())
+        except Exception:
+            return {}
+
+    def _save_dry_run_receipts(self, data: dict):
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._dry_run_receipt_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self._dry_run_receipt_path)
+
+    def _record_dry_run_receipt(self, command: str, returncode: int):
+        if returncode != 0 or "dry" not in command.lower():
+            return
+        script = self._extract_script_name(command)
+        if not script:
+            return
+        try:
+            receipt = {
+                "script": script,
+                "sha256": self._script_hash(script),
+                "timestamp": time.time(),
+                "command": command,
+                "returncode": returncode,
+            }
+        except Exception as e:
+            logger.debug(f"dry-run receipt skipped: {e}")
+            return
+        receipts = self._load_dry_run_receipts()
+        receipts[script] = receipt
+        receipts[Path(script).name] = receipt
+        self._save_dry_run_receipts(receipts)
+
+    def _consume_dry_run_receipt(self, script_name: str):
+        receipts = self._load_dry_run_receipts()
+        receipts.pop(script_name, None)
+        receipts.pop(Path(script_name).name, None)
+        self._save_dry_run_receipts(receipts)
+
+    def _is_pid_alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            # Linux zombie check.
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists():
+                parts = stat.read_text(errors="ignore").split()
+                if len(parts) > 2 and parts[2] == "Z":
+                    return False
+            return True
+        except OSError:
+            return False
+
+    def _with_registry_lock(self):
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._runtime_dir / "active_experiments.lock"
+        fh = open(lock_path, "a+")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return fh
+
+    def _load_active_registry(self) -> list[dict]:
+        try:
+            data = json.loads(self._active_registry_path.read_text())
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_active_registry(self, entries: list[dict]):
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._active_registry_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entries, indent=2))
+        tmp.replace(self._active_registry_path)
+
+    def _admit_experiment_slot(self) -> tuple[object, list[dict]]:
+        lock = self._with_registry_lock()
+        entries = [e for e in self._load_active_registry() if self._is_pid_alive(int(e.get("pid", -1)))]
+        if len(entries) >= self._max_parallel:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+            raise RuntimeError(f"max_parallel={self._max_parallel} reached; active experiments={len(entries)}")
+        return lock, entries
+
+    def get_launched_process(self, pid: int):
+        return self._launched_processes.get(int(pid))
+
     def _validate_command(self, command: str) -> str:
         """Validate a shell command for safety before execution with shell=True.
 
@@ -652,6 +796,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             if re.search(pattern, cmd):
                 raise ValueError(f"Blocked: {reason}")
 
+        self._validate_shell_file_targets(cmd)
         return cmd
 
     def _exec_run_shell(self, command: str, timeout: int = 120) -> str:
@@ -667,6 +812,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 shell=True,
                 cwd=str(self.workspace),
             )
+            self._record_dry_run_receipt(validated_cmd, result.returncode)
             return json.dumps({
                 "stdout": result.stdout[-2000:],  # Cap output
                 "stderr": result.stderr[-500:],
@@ -770,9 +916,11 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         # When config safety.mandatory_dry_run is true, require that a dry-run
         # of this script was recently performed (within 10 minutes).
         # Default: OFF (does not change existing behavior).
+        script_name = self._extract_script_name(command)
         if getattr(self, '_mandatory_dry_run', False):
-            script_name = self._extract_script_name(command)
-            if script_name and not self._has_recent_dry_run(script_name):
+            if not script_name:
+                return json.dumps({"error": "Dry-run required but training script could not be identified."})
+            if not self._has_recent_dry_run(script_name):
                 return json.dumps({
                     "error": (
                         f"Dry-run required before launching '{script_name}'. "
@@ -800,6 +948,11 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             except Exception:
                 pass  # Don't block launch if constraint check fails
 
+        try:
+            registry_lock, registry_entries = self._admit_experiment_slot()
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
         env = os.environ.copy()
         if gpu:
             env["CUDA_VISIBLE_DEVICES"] = gpu
@@ -818,6 +971,19 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
                 start_new_session=True,
                 cwd=str(self.workspace),
             )
+
+        self._launched_processes[proc.pid] = proc
+        registry_entries.append({
+            "pid": proc.pid,
+            "command": command,
+            "log_file": str(log_path),
+            "timestamp": time.time(),
+        })
+        self._save_active_registry(registry_entries)
+        fcntl.flock(registry_lock.fileno(), fcntl.LOCK_UN)
+        registry_lock.close()
+        if script_name:
+            self._consume_dry_run_receipt(script_name)
 
         # Write a structured manifest alongside the log. This is the single
         # source of truth for "an experiment was launched" — replacing the
@@ -973,36 +1139,19 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         return m.group(1) if m else ""
 
     def _has_recent_dry_run(self, script_name: str, max_age_seconds: int = 600) -> bool:
-        """Check if a dry-run of this script was performed recently.
-
-        Looks for experiment_manifest.json entries with a dry-run marker
-        within the last max_age_seconds (default 10 minutes).
-        """
-        import time
-        # Check outputs/*/experiment_manifest.json for dry-run records
-        outputs_dir = self.workspace / "outputs"
-        if not outputs_dir.exists():
+        """Check for a recent successful dry-run receipt matching script hash."""
+        receipts = self._load_dry_run_receipts()
+        receipt = receipts.get(script_name) or receipts.get(Path(script_name).name)
+        if not receipt:
             return False
-        script_basename = Path(script_name).name
-        now = time.time()
-        for manifest_path in outputs_dir.glob("*/experiment_manifest.json"):
-            try:
-                data = json.loads(manifest_path.read_text())
-                cmd = data.get("command", "")
-                ts = data.get("timestamp", "")
-                # Parse timestamp and check age
-                from datetime import datetime
-                dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S") if ts else None
-                if dt:
-                    age = now - dt.timestamp()
-                    if age > max_age_seconds:
-                        continue
-                # Check if this is a dry-run of the same script
-                if script_basename in cmd and ("--dry" in cmd or "dry_run" in cmd or "dryrun" in cmd):
-                    return True
-            except Exception:
-                continue
-        return False
+        try:
+            if time.time() - float(receipt.get("timestamp", 0)) > max_age_seconds:
+                return False
+            if int(receipt.get("returncode", 1)) != 0:
+                return False
+            return receipt.get("sha256") == self._script_hash(script_name)
+        except Exception:
+            return False
 
     def _exec_list_files(self, path: str = ".") -> str:
         """List directory contents."""
@@ -1080,7 +1229,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             name = ao.get("display_name") or ""
             if name:
                 authors.append(name)
-        ids = work.get("ids") or {}
+        work.get("ids") or {}
         return {
             "openalex_id": (work.get("id") or "").split("/")[-1],
             "doi": re.sub(r"^https?://(dx\.)?doi\.org/", "", (work.get("doi") or "")),
@@ -1102,7 +1251,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         3. arXiv ID → try arXiv DataCite DOI (10.48550/arXiv.<id>), then DOI-path.
         Returns the W-ID or None.
         """
-        import urllib.request
         seed = (seed or "").strip()
         if not seed:
             return None
@@ -1249,49 +1397,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         }, ensure_ascii=False, indent=2)
 
 
-    def _parse_arxiv_page(self, content: str, paper_id: str) -> dict | None:
-        """Parse arXiv page content to extract paper metadata."""
-
-        title = ""
-        # Try to find title in markdown headings or bold text
-        title_match = re.search(r"#+\s*(.+?)(?:\n|$)", content)
-        if title_match:
-            title = title_match.group(1).strip()
-        if not title:
-            title_match = re.search(r"\*\*(.+?)\*\*", content)
-            if title_match:
-                title = title_match.group(1).strip()
-
-        # Extract abstract
-        abstract = ""
-        abs_match = re.search(r"Abstract[:\s]*(.*?)(?:\n\n|\n#|$)", content, re.DOTALL)
-        if abs_match:
-            abstract = abs_match.group(1).strip()[:1000]
-
-        # Extract authors
-        authors = []
-        author_match = re.search(r"Authors?[:\s]*(.*?)(?:\n|$)", content)
-        if author_match:
-            authors = [{"name": a.strip()} for a in author_match.group(1).split(",") if a.strip()][:10]
-
-        # Extract year from arXiv ID
-        year = None
-        year_match = re.match(r"(?:arXiv:)?(\d{2})(\d{2})\.", paper_id)
-        if year_match:
-            year = int("20" + year_match.group(1))
-
-        if not title and not abstract:
-            return None
-
-        return {
-            "title": title or "Unknown",
-            "abstract": abstract,
-            "authors": authors,
-            "year": year,
-            "url": f"https://arxiv.org/abs/{paper_id.replace('arXiv:', '')}",
-            "paperId": paper_id,
-        }
-
     def _exec_web_search(self, query: str, max_results: int = 5) -> str:
         """Web search via MCP."""
         mcp_result = self._mcp_web_search(query, max_results)
@@ -1309,70 +1414,82 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
         return json.dumps({"error": "MCP web search returned no results."})
 
 
-    def _exec_web_fetch(self, url: str, fetch_info: str) -> str:
-        """Fetch a URL with fallback chain: MCP web_reader → urllib direct."""
-        # SSRF protection: block internal/private URLs
+    def _validate_public_http_url(self, url: str) -> tuple[bool, str]:
+        """Validate URL scheme/host/IP for SSRF protection."""
+        from urllib.parse import urlparse
+        import socket
+        import ipaddress
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False, f"Blocked: unsupported URL scheme '{parsed.scheme}'"
+        hostname = parsed.hostname
+        if not hostname:
+            return False, "Blocked: URL must include a hostname"
         try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https"):
-                return json.dumps({"error": f"Blocked: unsupported URL scheme '{parsed.scheme}'"})
-            hostname = parsed.hostname or ""
-            _blocked_host_patterns = [
-                r"^(localhost)$",
-                r"^127\.",
-                r"^0\.0\.0\.0$",
-                r"^10\.",
-                r"^172\.(1[6-9]|2\d|3[01])\.",
-                r"^192\.168\.",
-                r"^169\.254\.",
-                r"^\[::1\]$",
-                r"^\[::ffff:",
-            ]
-            for pat in _blocked_host_patterns:
-                if re.search(pat, hostname):
-                    return json.dumps({"error": "Blocked: internal/private URL not allowed"})
-            # Resolve hostname and check IP to catch DNS rebinding / hex IPs
-            import socket
-            import ipaddress
-            try:
-                resolved_ips = socket.getaddrinfo(hostname, parsed.port, proto=socket.IPPROTO_TCP)
-                for _, _, _, _, addr in resolved_ips:
-                    ip = ipaddress.ip_address(addr[0])
-                    if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-                        return json.dumps({"error": "Blocked: internal/private URL not allowed"})
-            except (socket.gaierror, ValueError):
-                pass  # DNS resolution failure — let urllib handle it
-        except Exception:
-            return json.dumps({"error": "Invalid URL"})
+            infos = socket.getaddrinfo(hostname, parsed.port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            return False, "Blocked: hostname could not be resolved"
+        try:
+            for _, _, _, _, addr in infos:
+                ip = ipaddress.ip_address(addr[0])
+                if not ip.is_global:
+                    return False, "Blocked: internal/private URL not allowed"
+        except ValueError:
+            return False, "Blocked: invalid resolved IP address"
+        return True, ""
 
-        # ── Level 1: Try MCP web_reader ──
-        mcp_result = self._mcp_web_fetch(url, fetch_info)
-        if mcp_result:
-            try:
-                parsed = json.loads(mcp_result)
-                content = parsed.get("content_snippet", "")
-                if content and len(content) > 30:
-                    parsed["source"] = "mcp_web_reader"
-                    return json.dumps(parsed, ensure_ascii=False, indent=2)
-            except (json.JSONDecodeError, KeyError):
-                pass
-            logger.info("web_fetch: MCP result invalid, falling back to urllib")
+    def _exec_web_fetch(self, url: str, fetch_info: str) -> str:
+        """Fetch a public URL with redirect-aware SSRF protection."""
+        ok, error = self._validate_public_http_url(url)
+        if not ok:
+            return json.dumps({"error": error})
 
-        # ── Level 2: Direct urllib fetch ──
+        # Use local urllib path for user-provided URLs so we can validate every
+        # redirect hop. Remote MCP readers may follow redirects server-side.
         return self._web_fetch_urllib(url, fetch_info)
 
     def _web_fetch_urllib(self, url: str, fetch_info: str) -> str:
-        """Direct urllib fetch with HTML parsing. Always returns a result."""
+        """Direct urllib fetch with manual redirect validation."""
         try:
+            import urllib.error
             import urllib.request
+            from urllib.parse import urljoin
 
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; AutoResearcher/1.0)"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            opener = urllib.request.build_opener(_NoRedirect)
+            current_url = url
+            html = ""
+            for _ in range(6):
+                ok, error = self._validate_public_http_url(current_url)
+                if not ok:
+                    return json.dumps({"error": error, "url": current_url})
+                req = urllib.request.Request(
+                    current_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; AutoResearcher/1.0)"},
+                )
+                try:
+                    with opener.open(req, timeout=15) as resp:
+                        html = resp.read().decode("utf-8", errors="replace")
+                        final_url = resp.geturl()
+                        ok, error = self._validate_public_http_url(final_url)
+                        if not ok:
+                            return json.dumps({"error": error, "url": final_url})
+                        current_url = final_url
+                        break
+                except urllib.error.HTTPError as e:
+                    if e.code in (301, 302, 303, 307, 308):
+                        location = e.headers.get("Location")
+                        if not location:
+                            return json.dumps({"error": "Redirect without Location", "url": current_url})
+                        current_url = urljoin(current_url, location)
+                        continue
+                    raise
+            else:
+                return json.dumps({"error": "Too many redirects", "url": current_url})
 
             title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
             title = title_match.group(1).strip() if title_match else "Unknown"
@@ -1397,7 +1514,7 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
 
             result = {
                 "source": "urllib_direct",
-                "url": url,
+                "url": current_url,
                 "title": title,
                 "description": description[:500],
                 "content_snippet": body[:1000],
@@ -1406,7 +1523,6 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             return json.dumps(result, ensure_ascii=False, indent=2)
         except Exception as e:
             return json.dumps({"error": f"Web fetch failed: {str(e)}", "url": url})
-
 
     @property
     def _tool_query_memory(self) -> dict:
@@ -1715,8 +1831,13 @@ class ToolRegistry(MCPClientMixin, ModelAnalyzerMixin):
             analysis["structural_soundness"] = structural
 
             # Layer 6: Data feasibility + GPU memory
-            manifest_path = self.workspace / dataset_manifest
+            try:
+                manifest_path = self._resolve_workspace_path(dataset_manifest)
+            except ValueError as e:
+                return json.dumps({"error": str(e)})
             if manifest_path.exists():
+                if manifest_path.stat().st_size > 5 * 1024 * 1024:
+                    return json.dumps({"error": "Dataset manifest too large (max 5MB)"})
                 analysis["data_feasibility"] = self._analyze_data_feasibility(manifest_path, analysis)
 
             h, w = self._parse_target_size(target_size)

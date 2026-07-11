@@ -12,27 +12,12 @@ import json
 import logging
 import os
 import re
-import signal
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("autoresearcher.agents")
-
-
-class _LLMCallTimeout(Exception):
-    """Raised when a single LLM API call exceeds its wall-clock budget.
-
-    GLM's streaming mode (for chunk in response_stream) is NOT protected by
-    the socket timeout — if the server stops sending chunks, the client blocks
-    forever (verified: process stuck in do_poll for 4+ min). This exception
-    is raised by SIGALRM to break out of that block so failover can kick in.
-    """
-
-
-def _llm_timeout_handler(signum, frame):
-    raise _LLMCallTimeout("LLM call exceeded wall-clock timeout (stream hung)")
 
 
 # Agent definitions directory
@@ -158,6 +143,17 @@ class ToolTrace:
                     pass
         return facts
 
+
+    @property
+    def side_effect_tool_names(self) -> set[str]:
+        return {
+            c.name for c in self.calls
+            if c.name in {"write_file", "launch_experiment", "run_shell"}
+        }
+
+    def has_side_effects(self) -> bool:
+        return bool(self.side_effect_tool_names)
+
     def to_dict(self) -> dict:
         return {
             "total_calls": len(self.calls),
@@ -271,6 +267,9 @@ _CODE_EXPLORE_TOOLS = frozenset({
 })
 
 
+# Quota-window signals. A 429 whose error body matches any of these is a
+# window-exhaustion (permanent-until-reset), not a per-minute rate-limit.
+# GLM uses code 1308 + "使用上限"; other providers use "quota"/"reset".
 _QUOTA_CODE_PATTERNS = {"1308", "1220"}  # GLM quota codes observed in production
 _QUOTA_KEYWORDS = ("使用上限", "配额", "quota", "exhausted", "limit reached",
                    "will reset", "将在", "重置")
@@ -372,6 +371,14 @@ def _is_permanent_error(exc: Exception) -> bool:
 
     # 1. Structured status_code attribute (openai/anthropic APIStatusError).
     if status is not None:
+        # GLM code 1220 on a 403 is a model entitlement failure, not an
+        # account-wide provider failure. Let the model chain try the next model.
+        if status == 403:
+            body = _extract_error_body(exc)
+            err_obj = body.get("error", body) if isinstance(body, dict) else {}
+            code = str(err_obj.get("code", "")) if isinstance(err_obj, dict) else ""
+            if code == "1220":
+                return False
         # 4xx client errors are permanent (bad request/auth/forbidden/not found).
         # 5xx server errors are transient.
         if isinstance(status, int) and 400 <= status < 500:
@@ -472,7 +479,7 @@ class AgentDispatcher:
 
     def __init__(self, model: str = "auto", provider: str = "glm_token_plan", max_steps: int = 3, tools=None):
         self.model = model
-        self.provider = provider  # "glm_token_plan", "ali_token_plan", "openai", "qwen"
+        self.provider = provider  # "anthropic", "openai", "qwen", "ali_token_plan", "glm_token_plan"
         self.max_steps = max_steps
         self._leader_history = []
         self.tools = tools  # ToolRegistry instance for executing tools
@@ -560,10 +567,8 @@ class AgentDispatcher:
         result = self._parse_leader_response(response_text, task=task)
 
         # Phase 2a (Reform v21): THINK parse-failure retry with feedback.
-        # Phase 0 probe showed GLM usually outputs valid JSON (often in ```json
-        # fences) but occasionally outputs prose. A single feedback retry
-        # recovers most of these. REFLECT failures are handled by the fact
-        # spine (Phase 2b), so we only retry THINK here.
+        # REFLECT has a different schema and uses the fact spine fallback, so
+        # only retry THINK decisions here.
         if (
             task == "think"
             and result.get("action") == "wait"
@@ -588,7 +593,6 @@ class AgentDispatcher:
                     task_tier=task,
                 )
                 retry_result = self._parse_leader_response(retry_response, task=task)
-                # Only accept retry if it actually parsed (not another default wait)
                 if "Unparseable" not in retry_result.get("reason", ""):
                     logger.info(
                         f"THINK retry succeeded after parse failure. "
@@ -600,8 +604,7 @@ class AgentDispatcher:
                     if retry_trace is not None and retry_trace.calls:
                         retry_result["leader_trace"] = retry_trace.to_dict()
                     return retry_result
-                else:
-                    logger.warning("THINK retry also failed to parse. Defaulting to wait.")
+                logger.warning("THINK retry also failed to parse. Defaulting to wait.")
             except Exception as e:
                 logger.warning(f"THINK retry call failed: {e}")
 
@@ -759,6 +762,20 @@ class AgentDispatcher:
                         quota_cooled_this_provider = True
                         break  # exit model loop → next provider in outer loop
 
+                    # If a side-effect tool already ran in this attempt, do NOT
+                    # transparently replay the original prompt on another
+                    # model/provider: that can duplicate file writes or launches.
+                    if trace.has_side_effects():
+                        logger.error(
+                            f"Provider {provider_key} model {model} failed after "
+                            f"side-effect tool execution ({type(e).__name__}): {e}. "
+                            f"Aborting transparent failover to avoid duplicate effects."
+                        )
+                        raise RuntimeError(
+                            "LLM call failed after executing side-effect tools; "
+                            "not retrying automatically to avoid duplicate writes/launches"
+                        ) from e
+
                     # ── Other permanent errors: abort the whole matrix ──
                     if _is_permanent_error(e):
                         logger.error(
@@ -795,7 +812,9 @@ class AgentDispatcher:
         else:
             logger.error(f"All token_plan providers failed. Last error: {last_error}")
 
-        if self.provider == "openai":
+        if self.provider == "anthropic":
+            text = self._call_anthropic(system, messages, tools, max_turns, trace, task_tier=task_tier)
+        elif self.provider == "openai":
             # OPENAI_API_KEY resolved here — _call_openai_compatible now raises
             # on missing api_key (B2 rework), so we must supply a real key.
             _openai_key = os.environ.get("OPENAI_API_KEY")
@@ -883,7 +902,6 @@ class AgentDispatcher:
 
         queue = []
         primary = self.provider
-        primary_skipped = False
         # Try primary first, but respect cooldown. A quota-exhausted primary
         # must not block the queue every cycle.
         if primary in TOKEN_PLAN_PROVIDERS:
@@ -893,7 +911,6 @@ class AgentDispatcher:
                     f"Primary {primary} in cooldown"
                     f"{' (quota-exhausted)' if is_quota else ''}; trying failovers first."
                 )
-                primary_skipped = True
             else:
                 queue.append((primary, TOKEN_PLAN_PROVIDERS[primary]))
 
@@ -1057,19 +1074,10 @@ class AgentDispatcher:
                         f"require '/api/coding/paas/v4'. Aborting to avoid "
                         f"billing the wrong quota."
                     )
-                    return json.dumps({
-                        "error": (
-                            "GLM Coding Plan endpoint misconfigured: base_url must "
-                            "contain '/coding/'. Check TOKEN_PLAN_PROVIDERS."
-                        )
-                    })
-                # CRITICAL: pass an explicit timeout. Without it, ZhipuAiClient
-                # (httpx under the hood) has NO read timeout — if the server
-                # half-closes the socket (CLOSE-WAIT), the client polls forever
-                # and the whole agent hangs indefinitely (verified: process
-                # stuck in do_poll for 4+ min, no log, no crash). 120s matches
-                # the openai.OpenAI path below; thinking-mode calls can be slow
-                # so keep it generous, but it MUST be bounded.
+                    raise RuntimeError(
+                        "GLM Coding Plan endpoint misconfigured: base_url must "
+                        "contain '/coding/'. Check TOKEN_PLAN_PROVIDERS."
+                    )
                 client = ZhipuAiClient(
                     api_key=api_key,
                     base_url=base_url,
@@ -1158,14 +1166,6 @@ class AgentDispatcher:
 
                     if is_glm:
                         # ── GLM Streaming Mode ──
-                        # Wall-clock protection: streaming reads are NOT covered
-                        # by socket timeout. If the server stops sending chunks,
-                        # the for-loop blocks forever. SIGALRM breaks it so
-                        # failover can kick in. 120s = generous for thinking mode
-                        # (normal calls take 10-30s), but bounded.
-                        _LLM_WALL_CLOCK = 120
-                        signal.signal(signal.SIGALRM, _llm_timeout_handler)
-                        signal.alarm(_LLM_WALL_CLOCK)
                         response_stream = client.chat.completions.create(**create_kwargs)
                         reasoning_parts = []
                         content_parts = []
@@ -1217,20 +1217,10 @@ class AgentDispatcher:
                                                     base_fn.arguments = (getattr(base_fn, 'arguments', None) or "") + fn.arguments
 
                                 # Capture finish_reason from last chunk
-                                fr = getattr(chunk.choices[0], "finish_reason", None)
+                                fr = getattr(chunk.choices[0], 'finish_reason', None)
                                 if fr:
                                     finish_reason = fr
-                            signal.alarm(0)  # cancel wall-clock timer — stream completed
-                        except _LLMCallTimeout:
-                            signal.alarm(0)
-                            partial_content = "".join(content_parts)
-                            logger.warning(
-                                f"GLM stream hung >{_LLM_WALL_CLOCK}s (wall-clock timeout). "
-                                f"Partial: {partial_content[:150]!r}... Triggering failover."
-                            )
-                            raise  # Re-raise for failover
                         except Exception as stream_err:
-                            signal.alarm(0)
                             partial_content = "".join(content_parts)
                             logger.warning(
                                 f"GLM stream interrupted: {stream_err}. "
@@ -1249,7 +1239,7 @@ class AgentDispatcher:
 
                         # Warn on completely empty response
                         if not stream_content and not final_tool_calls:
-                            logger.warning(f"GLM stream returned empty: no content, no tool_calls")
+                            logger.warning("GLM stream returned empty: no content, no tool_calls")
 
                         # Build a synthetic response-like object for downstream logic
                         syn_msg = _SyntheticMessage()
@@ -1533,6 +1523,129 @@ class AgentDispatcher:
             raise
 
     # ─────────────────────────────────────────────────
+    # Anthropic provider (different protocol)
+    # ─────────────────────────────────────────────────
+
+    def _call_anthropic(self, system: str, messages: list, tools: list = None, max_turns: int = 10, trace: ToolTrace = None, task_tier: str = None) -> str:
+        """Call Anthropic Claude API with tool execution support."""
+        # Use the shared class-level token map (B5 fix: previously this was a
+        # local copy where 'code' was only 8192 vs 16384 elsewhere, causing
+        # disproportionate write_file truncation on Claude).
+        effective_max_tokens = self._MAX_TOKENS_MAP.get(task_tier, self._MAX_TOKENS_DEFAULT)
+
+        effective_model = self._resolve_anthropic_model(task_tier)
+
+        logger.info(f"Calling Anthropic Claude API: model={effective_model}, messages={len(messages)}, tools={bool(tools)}")
+        try:
+            import anthropic
+
+            # R8 fix: explicit timeout/retries to match the OpenAI-compatible
+            # path. The SDK defaults (600s timeout, 2 retries) would block a
+            # whole cycle for 10+ minutes on a hung Claude call with no
+            # failover. Anthropic path has no provider-level failover, so a
+            # bounded timeout is the only protection against indefinite hangs.
+            client = anthropic.Anthropic(timeout=120.0, max_retries=1)
+
+            api_messages = []
+            for msg in messages:
+                api_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"],
+                })
+
+            kwargs = {
+                "model": effective_model,
+                "max_tokens": effective_max_tokens,
+                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                "messages": api_messages,
+            }
+
+            if tools:
+                kwargs["tools"] = [{"name": t["name"], "description": t.get("description", ""), "input_schema": t.get("input_schema", {"type": "object", "properties": {}})} for t in tools]
+                tool_map = {t["name"]: t for t in tools}
+
+                for turn in range(max_turns):
+                    response = client.messages.create(**kwargs)
+                    content = response.content
+
+                    # Check if ANY block is tool_use (not just the first one)
+                    has_tool_use = any(
+                        hasattr(block, "type") and block.type == "tool_use"
+                        for block in (content or [])
+                    )
+
+                    if not has_tool_use:
+                        # No tool calls — extract text from content blocks
+                        text_parts = [
+                            block.text for block in (content or [])
+                            if hasattr(block, "type") and block.type == "text"
+                        ]
+                        return "\n".join(text_parts) if text_parts else ""
+
+                    # Has tool_use: the Anthropic Messages API requires every
+                    # tool_result user message to be preceded by the matching
+                    # assistant tool_use turn. Append the assistant turn FIRST
+                    # (right after receiving it), then append tool_result
+                    # messages. This keeps ordering naturally correct without
+                    # any peel-off/re-insert gymnastics. Serialize SDK blocks
+                    # to plain dicts so they round-trip through the next request.
+                    assistant_blocks = []
+                    for block in content:
+                        if hasattr(block, "type") and block.type == "text":
+                            assistant_blocks.append({"type": "text", "text": block.text})
+                        elif hasattr(block, "type") and block.type == "tool_use":
+                            assistant_blocks.append({
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            })
+                    api_messages.append({"role": "assistant", "content": assistant_blocks})
+
+                    # Now execute each tool_use and append tool_result messages
+                    for block in content:
+                        if not (hasattr(block, "type") and block.type == "tool_use"):
+                            continue
+                        func_name = block.name
+                        func_args = block.input
+                        logger.info(f"Executing tool: {func_name}")
+
+                        if func_name in tool_map:
+                            tool_result = self._execute_tool_with_trace(func_name, func_args, trace)
+                            result_content = str(tool_result)[:8000]
+                        else:
+                            result_content = json.dumps({"error": f"Unknown tool: {func_name}"})
+                        api_messages.append({"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_content,
+                        }]})
+
+                    continue
+
+                # Max turns reached — find last assistant text
+                return self._find_last_assistant_text(api_messages, "Max turns reached")
+            else:
+                response = client.messages.create(**kwargs)
+                # No-tools path: extract text from content blocks (handles
+                # thinking blocks gracefully by only joining text blocks).
+                text_parts = [
+                    block.text for block in (response.content or [])
+                    if hasattr(block, "type") and block.type == "text"
+                ]
+                return "\n".join(text_parts) if text_parts else ""
+
+        except ImportError:
+            # R7 fix: previously fell back to _call_openai_compatible with
+            # api_key=None, which returned an error JSON that downstream code
+            # mistook for a valid leader response (B2 chain). Raise so the
+            # caller sees a real, actionable error.
+            raise RuntimeError(
+                "anthropic package not installed but provider='anthropic'. "
+                "Install with: pip install anthropic"
+            )
+
+    # ─────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────
 
@@ -1640,6 +1753,13 @@ class AgentDispatcher:
                 last_comma = i
         return last_comma
 
+    def _resolve_anthropic_model(self, task_tier: str = None) -> str:
+        """Map auto/default to a concrete Anthropic model."""
+        if self.model in ("auto", "default"):
+            # Keep the explicit Anthropic path cost-bounded by default.
+            return "claude-sonnet-4-6"
+        return self.model
+
     @staticmethod
     def _find_last_assistant_text(api_messages: list, fallback: str) -> str:
         """Find the last assistant message with text content.
@@ -1652,9 +1772,18 @@ class AgentDispatcher:
         for msg in reversed(api_messages):
             if msg.get("role") != "assistant":
                 continue
-            # Direct text content
-            if msg.get("content"):
-                return msg["content"]
+            # Direct text content. Anthropic messages store content as a list
+            # of blocks; return only text blocks so callers always receive str.
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+            if isinstance(content, list):
+                text_parts = [
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                if text_parts:
+                    return "\n".join(text_parts)
             # Tool calls message — extract text from tool arguments as last resort
             tool_calls = msg.get("tool_calls", [])
             if tool_calls:
@@ -1821,30 +1950,25 @@ class AgentDispatcher:
     def _parse_leader_response(self, response: str, task: str = "think") -> dict:
         """Parse Leader's response into structured action.
 
-        task selects the schema key used to accept a parsed JSON object:
-          - "think"   requires an ``action`` key (decision schema)
-          - "reflect" requires a ``milestone`` or ``decision`` key (reflection
-            schema, which legitimately has NO ``action`` key — see leader.md)
-
-        Reform v21 root-cause fix: previously this method always demanded an
-        ``action`` key, but REFLECT's schema (milestone/decision/dead_end/
-        active_problem/causal_link/lesson) contains no ``action`` key. So every
-        valid REFLECT JSON was rejected as "Unparseable", REFLECT was reported as
-        "100% failing", and the wrong root cause ("LLM writes prose") was logged.
-        Black-box testing (Reform v21 angle-3 probe) proved GLM returns valid
-        REFLECT JSON 3/3 — the parser was the bug, not the model.
+        THINK and REFLECT have different schemas: THINK must contain an
+        ``action`` key, while REFLECT legitimately contains ``milestone`` /
+        ``decision`` and no ``action``.
         """
+        if not isinstance(response, str):
+            response = str(response)
+
         parsed = self._extract_first_decision_json(response, task=task)
         if parsed is not None:
             return parsed
 
+        # Text fallback is only safe for THINK. REFLECT parse failures should
+        # return the safe default shell so the fact spine can fill factual data.
+        response_lower = response.lower()
+        if task == "think" and ("wait" in response_lower or "no experiment" in response_lower):
+            return {"action": "wait", "reason": response[:200]}
 
-        # Parse failure must NEVER auto-trigger an experiment. A confused,
-        # truncated, or empty leader response used as a task description would
-        # send the code agent off to modify code on garbage instructions. Wait
-        # is the safe default — the next cycle can retry with fresh context.
         logger.warning(
-            f"Leader response unparseable (no decision JSON found). "
+            f"Leader response unparseable for task={task!r}. "
             f"Defaulting to wait. Response head: {response[:200]!r}"
         )
         return {
@@ -1854,35 +1978,18 @@ class AgentDispatcher:
 
     @staticmethod
     def _extract_first_decision_json(response: str, task: str = "think") -> Optional[dict]:
-        """Find the first balanced {...} in `response` that parses to a dict
-        matching the expected schema for `task`.
+        """Find the first balanced JSON object matching the schema for task.
 
-        B6 fix: the old walker counted braces without tracking string context,
-        so a brace inside a JSON string value (e.g. ``"task": "apply {x:1}"``)
-        made depth hit 0 at the wrong offset and the real JSON was never
-        extracted. This version is string-aware: it tracks ``in_string`` and
-        handles ``\\`` escapes, and it also strips ``` ```json ``` fences first.
-
-        Schema selection (Reform v21 root-cause fix): a parsed JSON object is
-        accepted only if it carries a key that identifies its schema.
-          - task="think"   → must contain ``action`` (decision schema)
-          - task="reflect" → must contain ``milestone`` or ``decision`` (the
-            reflection schema has no ``action`` key; demanding one rejected
-            every valid REFLECT output — see _parse_leader_response docstring).
-        Returns None if no matching JSON is found.
+        ``task=think`` accepts decision JSON with ``action``. ``task=reflect``
+        accepts reflection JSON with ``milestone`` or ``decision``. The scanner
+        is string-aware so braces inside JSON string values do not break depth
+        tracking, and it strips a surrounding markdown code fence.
         """
         if not response:
             return None
 
-        # Which key(s) identify the expected schema for this task.
-        # A parsed dict must contain at least one of these to be accepted.
-        if task == "reflect":
-            schema_keys = ("milestone", "decision")
-        else:
-            schema_keys = ("action",)
+        schema_keys = ("milestone", "decision") if task == "reflect" else ("action",)
 
-        # Strip markdown code fences so fenced JSON is parsed directly.
-        # Keep this conservative: only strip a leading fence and a trailing fence.
         stripped = response.strip()
         if stripped.startswith("```"):
             first_nl = stripped.find("\n")
@@ -1905,7 +2012,6 @@ class AgentDispatcher:
                 elif ch == '"':
                     in_string = False
                 continue
-            # Not inside a string
             if ch == '"':
                 in_string = True
             elif ch == '{':
@@ -1919,11 +2025,8 @@ class AgentDispatcher:
                         candidate = stripped[start:i + 1]
                         try:
                             parsed = json.loads(candidate)
-                            if isinstance(parsed, dict) and any(
-                                k in parsed for k in schema_keys
-                            ):
+                            if isinstance(parsed, dict) and any(k in parsed for k in schema_keys):
                                 return parsed
-                            # Balanced & valid JSON but wrong schema — keep scanning.
                         except json.JSONDecodeError:
                             pass
                         start = None

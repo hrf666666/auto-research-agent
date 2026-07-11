@@ -19,7 +19,6 @@ the memory layer.
 """
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -145,7 +144,9 @@ class TestReflectSuccessPersistsCognitiveFields:
         loop._reflect(execute_result, verify_report=None)
 
         loop.memory.log_dead_end.assert_called_once_with(
-            "FFT aggregation diverges on sparse Lambertian"
+            "FFT aggregation diverges on sparse Lambertian",
+            cycle=7,
+            failure_category="",
         )
 
     def test_causal_link_persisted(self, reflect_loop):

@@ -11,10 +11,7 @@ Two systems changed:
 """
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock
 
-import pytest
 
 from core.loop import ResearchLoop
 from core.constraint_engine import StrategyConstraintEngine, StrategyRule

@@ -44,7 +44,7 @@ class ExperimentMonitor:
         self.max_runtime = (max_runtime_hours or self.DEFAULT_MAX_RUNTIME_HOURS) * 3600
         self._active_experiments: dict[int, dict] = {}
 
-    def register_experiment(self, pid: int, log_file: str, command: str = "", start_time: float = None):
+    def register_experiment(self, pid: int, log_file: str, command: str = "", start_time: float = None, process=None):
         """Register an externally-launched experiment for tracking.
 
         Call this when a process is launched outside of launch_experiment()
@@ -58,6 +58,7 @@ class ExperimentMonitor:
                 "start_time": start_time or time.time(),
                 "command": command,
                 "status": "running",
+                "process": process,
             }
             logger.info(f"Registered experiment PID={pid} for monitoring")
 
@@ -101,62 +102,86 @@ class ExperimentMonitor:
         logger.info(f"Launched experiment: PID={process.pid}, cmd={command[:80]}...")
         return experiment
 
-    def wait_for_completion(self, pid: int, log_file: str, notify: bool = True, start_time: float = None) -> dict:
-        """Wait for experiment to complete. ZERO LLM calls during wait.
-
-        This is the core cost-saving mechanism. Instead of asking the LLM
-        "is training done?", we just check if the process is alive.
-
-        Args:
-            start_time: When the experiment was launched (epoch seconds).
-                        If None, falls back to _active_experiments or current time.
-        """
+    def wait_for_completion(self, pid: int, log_file: str, notify: bool = True,
+                            start_time: float = None, process=None) -> dict:
+        """Wait for experiment to complete. ZERO LLM calls during wait."""
         logger.info(f"Monitoring PID={pid}, polling every {self.poll_interval}s")
 
-        # Resolve start_time: explicit param > tracked experiment > now
-        effective_start = start_time
-        if effective_start is None:
-            effective_start = self._active_experiments.get(pid, {}).get("start_time", time.time())
+        tracked = self._active_experiments.get(pid, {})
+        effective_start = start_time or tracked.get("start_time", time.time())
+        process = process or tracked.get("process")
+        timed_out = False
+        exit_code = None
+        status = "completed"
 
-        while self._is_process_alive(pid):
-            time.sleep(self.poll_interval)
+        while True:
+            if process is not None:
+                exit_code = process.poll()
+                alive = exit_code is None
+            else:
+                alive = self._is_process_alive(pid)
 
-            # Log current status (no LLM involved)
+            if not alive:
+                break
+
+            elapsed = time.time() - effective_start
+            if elapsed > self.max_runtime:
+                timed_out = True
+                logger.warning(
+                    f"PID={pid} exceeded max runtime "
+                    f"({elapsed/3600:.1f}h > {self.max_runtime/3600:.1f}h) — killing"
+                )
+                self._kill_process(pid, process=process)
+                if process is not None:
+                    try:
+                        exit_code = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        exit_code = process.poll()
+                break
+
             gpu_info = self._get_gpu_status()
             log_tail = self._tail_file(log_file, lines=5)
-            elapsed = time.time() - effective_start
-
             logger.info(
                 f"PID={pid} alive | elapsed={elapsed/3600:.1f}h | "
                 f"GPU={gpu_info.get('utilization', 'N/A')} | "
                 f"last_log: {log_tail[-1] if log_tail else 'N/A'}"
             )
+            time.sleep(min(self.poll_interval, max(self.max_runtime - elapsed, 0.1)))
 
-            # Hard timeout: kill process if it exceeds max allowed runtime
-            if elapsed > self.max_runtime:
-                logger.warning(
-                    f"PID={pid} exceeded max runtime "
-                    f"({elapsed/3600:.1f}h > {self.max_runtime/3600:.1f}h) — killing"
-                )
-                self._kill_process(pid)
-                break
+        if process is not None and exit_code is None:
+            try:
+                exit_code = process.wait(timeout=0)
+            except Exception:
+                exit_code = process.poll()
 
-        # Experiment finished
+        if timed_out:
+            status = "timed_out"
+        elif exit_code is None:
+            status = "completed"  # recovered non-child PID; no exit code available
+        elif exit_code == 0:
+            status = "completed"
+        else:
+            status = "failed"
+
         elapsed = time.time() - effective_start
         log_tail = self._tail_file(log_file, lines=50)
 
         if pid in self._active_experiments:
-            self._active_experiments[pid]["status"] = "completed"
+            self._active_experiments[pid]["status"] = status
+            self._active_experiments[pid]["exit_code"] = exit_code
+            self._active_experiments[pid]["timed_out"] = timed_out
 
         result = {
             "pid": pid,
-            "status": "completed",
+            "status": status,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
             "elapsed_hours": elapsed / 3600,
             "log_tail": "\n".join(log_tail),
             "metrics": self._extract_metrics(log_tail),
         }
 
-        logger.info(f"Experiment PID={pid} completed after {result['elapsed_hours']:.1f}h")
+        logger.info(f"Experiment PID={pid} finished status={status} exit_code={exit_code}")
 
         if notify:
             self._notify_completion(result)
@@ -183,6 +208,11 @@ class ExperimentMonitor:
         """Check if process is still running (zero cost)."""
         try:
             os.kill(pid, 0)
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists():
+                parts = stat.read_text(errors="ignore").split()
+                if len(parts) > 2 and parts[2] == "Z":
+                    return False
             return True
         except OSError:
             return False
@@ -203,7 +233,7 @@ class ExperimentMonitor:
         if stale_pids:
             logger.debug(f"Cleaned up {len(stale_pids)} stale experiment(s) from tracker")
 
-    def _kill_process(self, pid: int) -> bool:
+    def _kill_process(self, pid: int, process=None) -> bool:
         """Force-kill a process and its entire process group.
 
         Uses SIGTERM first, then SIGKILL to ensure ALL child processes
@@ -228,6 +258,11 @@ class ExperimentMonitor:
         try:
             os.kill(pid, signal.SIGKILL)
             logger.info(f"Killed process PID={pid}")
+            if process is not None:
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
             return True
         except OSError:
             return False

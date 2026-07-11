@@ -10,7 +10,6 @@ Pipeline:
   REFLECT → Evaluate results, update memory, decide next action
 """
 
-import os
 import re
 import math
 import time
@@ -18,7 +17,6 @@ import json
 import signal
 import logging
 from pathlib import Path
-from typing import Optional
 
 from .memory import MemoryManager
 from .monitor import ExperimentMonitor
@@ -29,6 +27,12 @@ from .visual_analyzer import VisualAnalyzer
 from .domain_knowledge import DomainKnowledgeMixin
 from .constraint_engine import ContextPruner
 from .simulation_sandbox import SimulationSandbox
+from .workspace import WorkspaceLock, atomic_write_text, resolve_workspace
+from .metrics import (
+    MetricSpec, canonicalize_metrics,
+    is_domain_metric, domain_name_from_metric, parse_metric_specs,
+    metric_value, metric_improved, best_metric, goal_achieved,
+)
 
 logger = logging.getLogger("autoresearcher")
 
@@ -59,12 +63,13 @@ class ResearchLoop(DomainKnowledgeMixin):
     - REFLECT: Evaluate results, update memory, decide next action
     """
 
-    def __init__(self, config: dict, project_dir: str):
+    def __init__(self, config: dict, project_dir: str, workspace: str = None):
         self.config = config
         self.project_dir = Path(project_dir).resolve()
-        self.workspace = self.project_dir / config.get("project", {}).get("workspace", "workspace")
+        self.workspace = resolve_workspace(self.project_dir, config, workspace)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.state_path = self.workspace / "state.json"
+        self._workspace_lock = None
 
         # Ensure file logging is always set up, regardless of how the loop is started
         self._setup_file_logging()
@@ -90,7 +95,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         logger.info(f"Agent Configuration: provider={provider}, model={model}")
         logger.debug(f"Full agent config: {agent_config}")
         
-        self.tools = ToolRegistry(self.workspace, memory=self.memory)
+        self.tools = ToolRegistry(self.workspace, memory=self.memory, config=config)
         self.dispatcher = AgentDispatcher(
             model=model,
             provider=provider,
@@ -119,6 +124,8 @@ class ResearchLoop(DomainKnowledgeMixin):
         self.max_cycles = config.get("agent", {}).get("max_cycles", -1)
         self.no_progress_fallback_threshold = config.get("agent", {}).get("no_progress_fallback_threshold", 3)
         self._running = True
+        _saved_state = self._load_state()
+        self._consecutive_failed_launches = int(_saved_state.get("consecutive_failed_launches", 0))
         self._no_progress_streak = 0
         self._last_no_progress_signature = ""
         self._consecutive_wait_count = 0
@@ -130,6 +137,10 @@ class ResearchLoop(DomainKnowledgeMixin):
         # Visual analysis should fire when METRICS stop improving,
         # not just when experiments fail to launch.
         self._best_metric_ever: float = float('inf')  # Best val_MAE ever seen
+        self._metric_specs: list[MetricSpec] = parse_metric_specs(config)
+        self._best_metrics: dict[str, float] = {}  # canonical key -> best value
+        self._failed_launch_advisory: int = 0
+        self._failed_launch_pause: int = 0
         self._metric_no_progress_streak: int = 0       # Cycles since last metric improvement
         self._visual_trigger_threshold: int = (config or {}).get(
             "visual_analysis", {}
@@ -216,400 +227,419 @@ class ResearchLoop(DomainKnowledgeMixin):
         root.addHandler(file_handler)
         logger.info(f"File logging enabled: {log_path}")
 
-    def run(self, directive: str = ""):
+    def run(self, directive: str = "", max_new_cycles: int = None):
         """Main entry point. Runs the THINK → EXECUTE → VERIFY → REFLECT loop."""
         logger.info(f"AutoResearcher starting | project={self.project_dir} | cycle={self.cycle_count}")
+        start_cycle = self.cycle_count
+        self._workspace_lock = WorkspaceLock(self.workspace)
+        self._workspace_lock.acquire()
+        try:
+            while self._running:
+                # Stop when all configured goals are achieved (if stop_on_achieved is set)
+                if self._check_all_goals_achieved():
+                    logger.info("All goals achieved. Stopping (stop_on_achieved).")
+                    break
 
-        while self._running:
-            # Phase 1: Stop when all goals are achieved
-            if self.max_cycles > 0 and self.cycle_count >= self.max_cycles:
-                logger.info(f"Reached max cycles ({self.max_cycles}). Stopping.")
-                break
+                # Phase 1: Stop when max_cycles reached
+                if self.max_cycles > 0 and self.cycle_count >= self.max_cycles:
+                    logger.info(f"Reached max cycles ({self.max_cycles}). Stopping.")
+                    break
+                if max_new_cycles is not None and (self.cycle_count - start_cycle) >= max_new_cycles:
+                    logger.info(f"Reached requested new cycles ({max_new_cycles}). Stopping.")
+                    break
 
-            self.cycle_count += 1
-            logger.info(f"=== Cycle {self.cycle_count} ===")
-            # Save counter immediately at cycle start for crash recovery
-            self._save_cycle_counter()
+                self.cycle_count += 1
+                logger.info(f"=== Cycle {self.cycle_count} ===")
+                # Save counter immediately at cycle start for crash recovery
+                self._save_cycle_counter()
 
-            # Phase 1 (Reform v21): Deterministic fact spine.
-            # Scan disk for experiment facts BEFORE any LLM call. This is the
-            # single source of truth for "what experiments happened" — it reads
-            # files that survive reboots, independent of REFLECT or agent liveness.
-            # Idempotent (INSERT OR IGNORE), safe to call every cycle.
-            try:
-                fact_stats = self.memory.scan_experiment_facts()
-                if fact_stats.get("inserted", 0) > 0:
-                    logger.info(
-                        f"[fact_spine] scanned={fact_stats['scanned']} "
-                        f"inserted={fact_stats['inserted']} "
-                        f"skipped={fact_stats['skipped']}"
-                    )
-            except Exception as e:
-                logger.warning(f"[fact_spine] scan failed (non-fatal): {e}")
-
-            try:
-                # Keep leader context bounded to one cycle.
-                self.dispatcher.reset_leader_history()
-
-                # Check for human directive
-                self._update_state(
-                    {
-                        "cycle": self.cycle_count,
-                        "status": "planning",
-                        "updated_at": time.time(),
-                        "last_directive": directive or "",
-                    }
-                )
-
-                # MANDATORY HALT: If directive contains ⛔ STOP, force the
-                # agent to execute only the directive's tasks (no training).
-                if directive and "⛔ STOP" in directive:
-                    logger.info("⛔ MANDATORY HALT detected in directive. Forcing directive-only execution.")
-                    think_result = {
-                        "action": "experiment",
-                        "agent": "code",
-                        "task": (
-                            f"⛔ MANDATORY HALT — You MUST NOT launch any training.\n\n"
-                            f"Execute the following tasks IN ORDER. Do NOT skip any task.\n\n"
-                            f"--- HUMAN DIRECTIVE ---\n{directive}\n--- END DIRECTIVE ---\n\n"
-                            f"Complete ALL tasks listed in the directive before doing anything else."
-                        ),
-                    }
-                else:
-                    # DATASET UNDERSTANDING: First cycle or when manifest missing
-                    if self.cycle_count == 1:
-                        logger.info("DATASET UNDERSTANDING phase — scanning data/ directory")
-
-                    # ── ROADMAP INIT (v15): Generate research roadmap on first cycle ──
-
-                    # THINK: Analyze and plan
-                    think_result = self._think(directive)
-
-
-                # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
-                # failed launches. Stops burning quota on a stuck pattern and
-                # requires human intervention to resume.
-
-                if think_result.get("action") == "wait":
-                    self._consecutive_wait_count += 1
-                    logger.info(
-                        f"THINK decided to wait ({self._consecutive_wait_count}/{self._max_consecutive_waits})."
-                    )
-
-                    # If no experiment is running and we've waited too many times,
-                    # force the agent to take action instead of idling.
-                    if (
-                        self._consecutive_wait_count >= self._max_consecutive_waits
-                        and not self.monitor.has_active_experiments()
-                    ):
-                        reason = (
-                            f"Forced experiment: {self._consecutive_wait_count} consecutive waits "
-                            "with no active experiments. Agent must propose a concrete experiment."
+                # Phase 1 (Reform v21): Deterministic fact spine.
+                # Scan disk for experiment facts BEFORE any LLM call. This is the
+                # single source of truth for "what experiments happened" — it reads
+                # files that survive reboots, independent of REFLECT or agent liveness.
+                # Idempotent (INSERT OR IGNORE), safe to call every cycle.
+                try:
+                    fact_stats = self.memory.scan_experiment_facts()
+                    if fact_stats.get("inserted", 0) > 0:
+                        logger.info(
+                            f"[fact_spine] scanned={fact_stats['scanned']} "
+                            f"inserted={fact_stats['inserted']} "
+                            f"skipped={fact_stats['skipped']}"
                         )
-                        logger.warning(reason)
-                        self.memory.log_decision(reason)
-                        # v18: System is referee — record but don't override.
-                        # LLM sees idle warning in memory and self-corrects.
+                except Exception as e:
+                    logger.warning(f"[fact_spine] scan failed (non-fatal): {e}")
+
+                try:
+                    # Keep leader context bounded to one cycle.
+                    self.dispatcher.reset_leader_history()
+
+                    # Check for human directive
+                    self._update_state(
+                        {
+                            "cycle": self.cycle_count,
+                            "status": "planning",
+                            "updated_at": time.time(),
+                            "last_directive": directive or "",
+                        }
+                    )
+
+                    # MANDATORY HALT: If directive contains ⛔ STOP, force the
+                    # agent to execute only the directive's tasks (no training).
+                    if directive and "⛔ STOP" in directive:
+                        logger.info("⛔ MANDATORY HALT detected in directive. Forcing directive-only execution.")
+                        think_result = {
+                            "action": "experiment",
+                            "agent": "code",
+                            "task": (
+                                f"⛔ MANDATORY HALT — You MUST NOT launch any training.\n\n"
+                                f"Execute the following tasks IN ORDER. Do NOT skip any task.\n\n"
+                                f"--- HUMAN DIRECTIVE ---\n{directive}\n--- END DIRECTIVE ---\n\n"
+                                f"Complete ALL tasks listed in the directive before doing anything else."
+                            ),
+                        }
                     else:
+                        # DATASET UNDERSTANDING: First cycle or when manifest missing
+                        if self.cycle_count == 1:
+                            logger.info("DATASET UNDERSTANDING phase — scanning data/ directory")
+
+                        # ── ROADMAP INIT (v15): Generate research roadmap on first cycle ──
+
+                        # THINK: Analyze and plan
+                        think_result = self._think(directive)
+
+
+                    # ── Phase 4: PAUSE-HUMAN — stop the loop and surface for inspection ──
+                    # failed launches. Stops burning quota on a stuck pattern and
+                    # requires human intervention to resume.
+
+                    if think_result.get("action") == "wait":
+                        self._consecutive_wait_count += 1
+                        logger.info(
+                            f"THINK decided to wait ({self._consecutive_wait_count}/{self._max_consecutive_waits})."
+                        )
+
+                        # If no experiment is running and we've waited too many times,
+                        # record an idle warning so the LLM self-corrects on the next
+                        # cycle. NEVER fall through to _execute with a wait plan —
+                        # that would dispatch a code agent with an empty/garbage task.
+                        if (
+                            self._consecutive_wait_count >= self._max_consecutive_waits
+                            and not self.monitor.has_active_experiments()
+                        ):
+                            reason = (
+                                f"IDLE WARNING: {self._consecutive_wait_count} consecutive waits "
+                                "with no active experiments. The next cycle MUST propose a concrete "
+                                "experiment or paper research."
+                            )
+                            logger.warning(reason)
+                            self.memory.log_decision(reason)
+
                         self._update_state(
                             {
                                 "cycle": self.cycle_count,
                                 "status": "waiting",
                                 "updated_at": time.time(),
+                                "consecutive_waits": self._consecutive_wait_count,
                                 "suggested_next_step": think_result.get("reason", ""),
                             }
                         )
                         continue
 
-                # PAPER RESEARCH: Execute deep literature search instead of experiment
-                if think_result.get("action") == "paper_research":
-                    self._consecutive_wait_count = 0
-                    logger.info("PAPER RESEARCH triggered — executing deep literature search.")
-                    self._update_state(
-                        {
-                            "cycle": self.cycle_count,
-                            "status": "paper_research",
-                            "updated_at": time.time(),
-                        }
-                    )
-                    execute_result = self._execute_paper_research(think_result)
+                    # PAPER RESEARCH: Execute deep literature search instead of experiment
+                    if think_result.get("action") == "paper_research":
+                        self._consecutive_wait_count = 0
+                        logger.info("PAPER RESEARCH triggered — executing deep literature search.")
+                        self._update_state(
+                            {
+                                "cycle": self.cycle_count,
+                                "status": "paper_research",
+                                "updated_at": time.time(),
+                            }
+                        )
+                        execute_result = self._execute_paper_research(think_result)
 
-                    # VERIFY: Check paper research produced useful output
+                        # VERIFY: Check paper research produced useful output
+                        verify_report = self._verify(self.cycle_count, think_result, execute_result)
+                        execute_result["verify_summary"] = self._verify_summary(verify_report)
+
+                        # REFLECT on research findings (no training to monitor)
+                        reflect_result = self._reflect(execute_result, verify_report=verify_report, think_result=think_result)
+                        self._update_state(
+                            {
+                                "cycle": self.cycle_count,
+                                "updated_at": time.time(),
+                                "last_milestone": reflect_result.get("milestone", ""),
+                                "last_decision": reflect_result.get("decision", ""),
+                                "suggested_next_step": reflect_result.get("decision", "")
+                                or reflect_result.get("reason", ""),
+                            }
+                        )
+                        self._record_cycle_outcome(think_result, execute_result, reflect_result,
+                                                    verify_report_dict=verify_report.to_dict() if verify_report else None)
+                        self._gc.run()  # Phase 2: deterministic GC
+                        # Post-reflect code review: learn from mistakes
+                        # Paper research is meaningful work — persist cycle counter
+                        self._save_cycle_counter()
+                        continue
+
+                    # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
+                    # This is triggered when the architecture stagnation threshold is reached.
+                    # The agent researches alternative architectures AND starts implementing.
+                    # Gate 1: PRE-VERIFY — referee only. Detect issues, tell LLM, let LLM decide.
+                    pre_verify_report = self._pre_verify(self.cycle_count, think_result)
+                    critical_pre_issues = pre_verify_report.critical_failures
+                    if critical_pre_issues:
+                        issues_text = "; ".join(c.detail for c in critical_pre_issues)
+                        logger.warning(f"PRE-VERIFY found issues: {issues_text}")
+                        # Record as active problem — LLM will see it in next THINK's memory_log
+                        self.memory.log_active_problem(f"PRE-VERIFY: {issues_text}")
+                        # Inject into current context so LLM sees it immediately
+                        think_result["pre_verify_warning"] = issues_text
+
+                    # EXECUTE: Run the plan
+                    self._consecutive_wait_count = 0
+                    execute_result = self._execute(think_result)
+
+                    # Phase 4: update the consecutive-failed-launch counter so the
+                    # next cycle's THINK can force a re-dispatch or pause_human.
+                    self._update_launch_counter(execute_result)
+
+                    # Pre-initialize monitor_result so the post-VERIFY metrics
+                    # alignment below is safe even when no experiment was launched.
+                    # Previously this was only assigned inside the
+                    # `if experiment_launched` branch, so a non-launched cycle raised
+                    # UnboundLocalError at the `monitor_result.get(...)` call below.
+                    monitor_result = {"metrics": {}, "log_tail": "", "elapsed_hours": None}
+
+                    if execute_result.get("experiment_launched"):
+                        self._update_state(
+                            {
+                                "cycle": self.cycle_count,
+                                "status": "running",
+                                "pid": execute_result.get("pid"),
+                                "log_file": execute_result.get("log_file", ""),
+                                "started_at": time.time(),
+                                "updated_at": time.time(),
+                            }
+                        )
+                        # Monitor experiment (zero LLM cost)
+                        monitor_result = self._monitor_experiment(execute_result)
+                        execute_result["training_logs"] = monitor_result.get("log_tail", "")
+                        execute_result["final_metrics"] = monitor_result.get("metrics", {})
+                        self._update_state(
+                            {
+                                "status": "completed",
+                                "pid": execute_result.get("pid"),
+                                "log_file": execute_result.get("log_file", ""),
+                                "updated_at": time.time(),
+                                "last_training_logs": monitor_result.get("log_tail", ""),
+                                "last_metrics": monitor_result.get("metrics", {}),
+                                "elapsed_hours": monitor_result.get("elapsed_hours"),
+                            }
+                        )
+
+                    # VERIFY: Reverse-engineer whether each module actually worked
                     verify_report = self._verify(self.cycle_count, think_result, execute_result)
                     execute_result["verify_summary"] = self._verify_summary(verify_report)
 
-                    # REFLECT on research findings (no training to monitor)
-                    reflect_result = self._reflect(execute_result, verify_report=verify_report, think_result=think_result)
+                    # Phase 4c (Reform v21): Align last_metrics with fact spine.
+                    # monitor's metrics come from tail-50-lines (may be incomplete).
+                    # If monitor returned empty metrics, try fact_scanner as fallback.
+                    monitor_metrics = monitor_result.get("metrics", {})
+                    if not monitor_metrics and execute_result.get("log_file"):
+                        try:
+                            log_dir = str(Path(execute_result["log_file"]).parent)
+                            fact = self.memory.get_fact_for_output_dir(log_dir)
+                            if fact and fact.get("metrics_json"):
+                                import json as _json
+                                monitor_metrics = _json.loads(fact["metrics_json"])
+                        except Exception:
+                            pass
+                    execute_result["final_metrics"] = monitor_metrics or execute_result.get("final_metrics", {})
+
+                    # VISUAL ANALYSIS: When METRICS stop improving for N consecutive cycles
+                    # (OR when experiments keep failing to launch), run inference → multimodal
+                    # visual analysis to diagnose WHY the model is failing.
+                    # This catches problems invisible to numeric metrics alone
+                    # (e.g., uniform depth maps, domain collapse, structural failures).
+                    visual_analysis_result = None
+
+                    # Fix 3 (结果分析): Force visual analysis when domain-specific metrics
+                    # are severely degraded — the agent MUST look at its own outputs.
+                    domain_metrics_raw = (execute_result.get("final_metrics") or {})
+                    force_visual = False
+                    severe_threshold = 0.35  # v16.1: hardcoded (AdaptiveThresholds removed)
+                    for key, val in canonicalize_metrics(domain_metrics_raw).items():
+                        if is_domain_metric(key):
+                            try:
+                                val = float(val)
+                                if val > severe_threshold:
+                                    force_visual = True
+                                    logger.warning(
+                                        f"FORCE VISUAL ANALYSIS: {key} = {val:.4f} > {severe_threshold:.4f}. "
+                                        f"Agent must visually inspect predictions."
+                                    )
+                                    break
+                            except (TypeError, ValueError):
+                                pass
+
+                    # Use MAX of launch-streak and metric-streak so either condition triggers analysis.
+                    effective_streak = max(self._no_progress_streak, self._metric_no_progress_streak)
+                    if force_visual or self.visual_analyzer.should_trigger(effective_streak):
+                        logger.warning(
+                            f"VISUAL ANALYSIS TRIGGERED: effective streak={effective_streak} "
+                            f"(launch={self._no_progress_streak}, metric={self._metric_no_progress_streak}), "
+                            f"threshold={self.visual_analyzer.trigger_threshold}. "
+                            f"Running inference + multimodal diagnosis..."
+                        )
+                        visual_analysis_result = self.visual_analyzer.analyze(
+                            no_progress_streak=effective_streak,
+                            experiment_info={
+                                "cycle": self.cycle_count,
+                                "streak": effective_streak,
+                                "best_metric_ever": self._best_metric_ever,
+                                "current_metric": (execute_result.get("final_metrics") or {}).get(
+                                    "val_MAE", execute_result.get("final_metrics", {}).get(
+                                        "val_MAE_overall", "N/A")
+                                ),
+                                "model": think_result.get("task", "")[:200],
+                            },
+                        )
+                        if visual_analysis_result.triggered and visual_analysis_result.diagnosis:
+                            logger.info(
+                                f"Visual analysis found {len(visual_analysis_result.diagnosis)} issue(s), "
+                                f"severity={visual_analysis_result.severity}"
+                            )
+                            # Log diagnosis to memory so it persists across cycles
+                            for diag in visual_analysis_result.diagnosis[:3]:
+                                desc = diag.get("description", str(diag)) if isinstance(diag, dict) else str(diag)
+                                self.memory.log_active_problem(
+                                    f"[VISUAL Cycle {self.cycle_count}] {desc[:300]}"
+                                )
+                            if visual_analysis_result.recommended_actions:
+                                self.memory.log_decision(
+                                    f"[VISUAL] Actions: {'; '.join(visual_analysis_result.recommended_actions[:3])}"
+                                )
+
+                    # REFLECT: Evaluate and update (now with VERIFY diagnosis)
+                    reflect_result = self._reflect(
+                        execute_result, verify_report=verify_report,
+                        think_result=think_result,
+                    )
                     self._update_state(
                         {
                             "cycle": self.cycle_count,
                             "updated_at": time.time(),
                             "last_milestone": reflect_result.get("milestone", ""),
                             "last_decision": reflect_result.get("decision", ""),
-                            "suggested_next_step": reflect_result.get("decision", "")
-                            or reflect_result.get("reason", ""),
-                        }
-                    )
-                    self._record_cycle_outcome(think_result, execute_result, reflect_result,
-                                                verify_report_dict=verify_report.to_dict() if verify_report else None)
-                    self._gc.run()  # Phase 2: deterministic GC
-                    # Post-reflect code review: learn from mistakes
-                    # Paper research is meaningful work — persist cycle counter
-                    self._save_cycle_counter()
-                    continue
-
-                # ARCHITECTURE SWITCH (v14): Execute architecture switch instead of experiment
-                # This is triggered when the architecture stagnation threshold is reached.
-                # The agent researches alternative architectures AND starts implementing.
-                # Gate 1: PRE-VERIFY — referee only. Detect issues, tell LLM, let LLM decide.
-                pre_verify_report = self._pre_verify(self.cycle_count, think_result)
-                critical_pre_issues = pre_verify_report.critical_failures
-                if critical_pre_issues:
-                    issues_text = "; ".join(c.detail for c in critical_pre_issues)
-                    logger.warning(f"PRE-VERIFY found issues: {issues_text}")
-                    # Record as active problem — LLM will see it in next THINK's memory_log
-                    self.memory.log_active_problem(f"PRE-VERIFY: {issues_text}")
-                    # Inject into current context so LLM sees it immediately
-                    think_result["pre_verify_warning"] = issues_text
-
-                # EXECUTE: Run the plan
-                self._consecutive_wait_count = 0
-                execute_result = self._execute(think_result)
-
-                # Phase 4: update the consecutive-failed-launch counter so the
-                # next cycle's THINK can force a re-dispatch or pause_human.
-                self._update_launch_counter(execute_result)
-
-                # Pre-initialize monitor_result so the post-VERIFY metrics
-                # alignment below is safe even when no experiment was launched.
-                # Previously this was only assigned inside the
-                # `if experiment_launched` branch, so a non-launched cycle raised
-                # UnboundLocalError at the `monitor_result.get(...)` call below.
-                monitor_result = {"metrics": {}, "log_tail": "", "elapsed_hours": None}
-
-                if execute_result.get("experiment_launched"):
-                    self._update_state(
-                        {
-                            "cycle": self.cycle_count,
-                            "status": "running",
-                            "pid": execute_result.get("pid"),
-                            "log_file": execute_result.get("log_file", ""),
-                            "started_at": time.time(),
-                            "updated_at": time.time(),
-                        }
-                    )
-                    # Monitor experiment (zero LLM cost)
-                    monitor_result = self._monitor_experiment(execute_result)
-                    execute_result["training_logs"] = monitor_result.get("log_tail", "")
-                    execute_result["final_metrics"] = monitor_result.get("metrics", {})
-                    self._update_state(
-                        {
-                            "status": "completed",
-                            "pid": execute_result.get("pid"),
-                            "log_file": execute_result.get("log_file", ""),
-                            "updated_at": time.time(),
-                            "last_training_logs": monitor_result.get("log_tail", ""),
-                            "last_metrics": monitor_result.get("metrics", {}),
-                            "elapsed_hours": monitor_result.get("elapsed_hours"),
+                            "suggested_next_step": reflect_result.get("decision")
+                            or reflect_result.get("reason")
+                            or reflect_result.get("task", ""),
+                            "last_error": "",
                         }
                     )
 
-                # VERIFY: Reverse-engineer whether each module actually worked
-                verify_report = self._verify(self.cycle_count, think_result, execute_result)
-                execute_result["verify_summary"] = self._verify_summary(verify_report)
-
-                # Phase 4c (Reform v21): Align last_metrics with fact spine.
-                # monitor's metrics come from tail-50-lines (may be incomplete).
-                # If monitor returned empty metrics, try fact_scanner as fallback.
-                monitor_metrics = monitor_result.get("metrics", {})
-                if not monitor_metrics and execute_result.get("log_file"):
+                    # ── v16: Update phase status from experiment results ──
+                    # Auto-compare experiment results against phase targets
                     try:
-                        log_dir = str(Path(execute_result["log_file"]).parent)
-                        fact = self.memory.get_fact_for_output_dir(log_dir)
-                        if fact and fact.get("metrics_json"):
-                            import json as _json
-                            monitor_metrics = _json.loads(fact["metrics_json"])
+                        execute_result.get("final_metrics") or {}
+                    except Exception as e:
+                        logger.debug(f"Phase status update skipped: {e}")
+                    self._record_cycle_outcome(think_result, execute_result, reflect_result,
+                                                verify_report_dict=verify_report.to_dict())
+
+                    # Post-reflect code review: learn from mistakes
+
+                    # Only count as meaningful cycle if experiment was launched or progress was made
+                    if execute_result.get("experiment_launched") or reflect_result.get("milestone"):
+                        self._save_cycle_counter()
+
+                    # AUTO CODE-CLEANUP: Check trigger conditions after each cycle
+                    self._gc.run()  # Phase 2: deterministic GC
+
+                    # AUDIT ESCALATION: Check if VERIFY failures are recurring
+                    [
+                        f"[{c.category}] {c.name}: {c.detail}"
+                        for c in verify_report.all_failures
+                    ]
+                    # SMART CIRCUIT BREAKER: If pre-verify AND verify both have
+                    # critical failures, force paper_research next cycle instead
+                    # of repeating the same failed experiment pattern.
+                    if (
+                        critical_pre_issues
+                        and verify_report.critical_failures
+                        and self._no_progress_streak >= 2
+                    ):
+                        reason = (
+                            f"SMART CIRCUIT BREAKER: Pre-verify AND verify both have critical "
+                            f"failures for {self._no_progress_streak} consecutive cycles. "
+                            f"Forcing paper research to find new approaches."
+                        )
+                        logger.warning(reason)
+                        self.memory.log_decision(reason)
+                        # Write a directive for the next cycle to do paper research
+                        directive_path = self.workspace / "DIRECTIVE.md"
+                        directive_path.write_text(
+                            f"🔴 CIRCUIT BREAKER TRIGGERED\n\n"
+                            f"The agent has been stuck for {self._no_progress_streak} cycles "
+                            f"with critical infrastructure failures.\n\n"
+                            f"DO NOT attempt another experiment. Instead:\n"
+                            f"1. Read the current code and identify ALL issues\n"
+                            f"2. Read MEMORY_LOG.md for dead ends and active problems\n"
+                            f"3. Search for papers on the specific failing component\n"
+                            f"4. Write a comprehensive diagnosis to workspace/diagnosis.md\n"
+                        )
+
+                except Exception as e:
+                    err_msg = str(e)
+                    logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
+                    # Direct file write (bypasses logger buffering) for crash diagnosis
+                    import traceback as _tb
+                    try:
+                        crash_path = self.workspace / "last_crash.txt"
+                        crash_path.write_text(
+                            f"Cycle {self.cycle_count} crash:\n{_tb.format_exc()}\n",
+                            encoding="utf-8",
+                        )
                     except Exception:
                         pass
-                execute_result["final_metrics"] = monitor_metrics or execute_result.get("final_metrics", {})
-
-                # VISUAL ANALYSIS: When METRICS stop improving for N consecutive cycles
-                # (OR when experiments keep failing to launch), run inference → multimodal
-                # visual analysis to diagnose WHY the model is failing.
-                # This catches problems invisible to numeric metrics alone
-                # (e.g., uniform depth maps, domain collapse, structural failures).
-                visual_analysis_result = None
-
-                # Fix 3 (结果分析): Force visual analysis when domain-specific metrics
-                # are severely degraded — the agent MUST look at its own outputs.
-                domain_metrics = (execute_result.get("final_metrics") or {})
-                force_visual = False
-                severe_threshold = 0.35  # v16.1: hardcoded (AdaptiveThresholds removed)
-                for key, val in domain_metrics.items():
-                    if key.startswith("MAE_"):
-                        try:
-                            val = float(val)
-                            if val > severe_threshold:
-                                force_visual = True
-                                logger.warning(
-                                    f"FORCE VISUAL ANALYSIS: {key} = {val:.4f} > {severe_threshold:.4f}. "
-                                    f"Agent must visually inspect predictions."
-                                )
-                                break
-                        except (TypeError, ValueError):
-                            pass
-
-                # Use MAX of launch-streak and metric-streak so either condition triggers analysis.
-                effective_streak = max(self._no_progress_streak, self._metric_no_progress_streak)
-                if force_visual or self.visual_analyzer.should_trigger(effective_streak):
-                    logger.warning(
-                        f"VISUAL ANALYSIS TRIGGERED: effective streak={effective_streak} "
-                        f"(launch={self._no_progress_streak}, metric={self._metric_no_progress_streak}), "
-                        f"threshold={self.visual_analyzer.trigger_threshold}. "
-                        f"Running inference + multimodal diagnosis..."
-                    )
-                    visual_analysis_result = self.visual_analyzer.analyze(
-                        no_progress_streak=effective_streak,
-                        experiment_info={
+                    self.memory.log_decision(f"Cycle {self.cycle_count} error: {err_msg[:200]}")
+                    self._update_state(
+                        {
                             "cycle": self.cycle_count,
-                            "streak": effective_streak,
-                            "best_metric_ever": self._best_metric_ever,
-                            "current_metric": (execute_result.get("final_metrics") or {}).get(
-                                "val_MAE", execute_result.get("final_metrics", {}).get(
-                                    "val_MAE_overall", "N/A")
-                            ),
-                            "model": think_result.get("task", "")[:200],
-                        },
+                            "status": "error",
+                            "updated_at": time.time(),
+                            "last_error": err_msg[:500],
+                        }
                     )
-                    if visual_analysis_result.triggered and visual_analysis_result.diagnosis:
-                        logger.info(
-                            f"Visual analysis found {len(visual_analysis_result.diagnosis)} issue(s), "
-                            f"severity={visual_analysis_result.severity}"
+                    # v12.1: Don't backoff for quota errors — retrying won't help
+                    is_quota_error = (
+                        "insufficient_quota" in err_msg
+                        or "quota" in err_msg.lower()
+                    )
+                    if is_quota_error:
+                        logger.warning(
+                            "API quota exhausted — pausing for 30 min before retry. "
+                            "Cycle state preserved for resumption."
                         )
-                        # Log diagnosis to memory so it persists across cycles
-                        for diag in visual_analysis_result.diagnosis[:3]:
-                            desc = diag.get("description", str(diag)) if isinstance(diag, dict) else str(diag)
-                            self.memory.log_active_problem(
-                                f"[VISUAL Cycle {self.cycle_count}] {desc[:300]}"
-                            )
-                        if visual_analysis_result.recommended_actions:
-                            self.memory.log_decision(
-                                f"[VISUAL] Actions: {'; '.join(visual_analysis_result.recommended_actions[:3])}"
-                            )
+                        # Save cycle state for resumption
+                        self._save_cycle_counter()
+                        # Quota recovery: wait longer (30 min) then retry instead of giving up
+                        self._update_state({
+                            "cycle": self.cycle_count,
+                            "status": "quota_recovery",
+                            "updated_at": time.time(),
+                            "last_error": err_msg[:500],
+                        })
+                        time.sleep(1800)  # 30 min cooldown for quota recovery
+                        continue  # Retry the cycle instead of breaking
 
-                # REFLECT: Evaluate and update (now with VERIFY diagnosis)
-                reflect_result = self._reflect(
-                    execute_result, verify_report=verify_report,
-                    think_result=think_result,
-                )
-                self._update_state(
-                    {
-                        "cycle": self.cycle_count,
-                        "updated_at": time.time(),
-                        "last_milestone": reflect_result.get("milestone", ""),
-                        "last_decision": reflect_result.get("decision", ""),
-                        "suggested_next_step": reflect_result.get("decision")
-                        or reflect_result.get("reason")
-                        or reflect_result.get("task", ""),
-                        "last_error": "",
-                    }
-                )
-
-                # ── v16: Update phase status from experiment results ──
-                # Auto-compare experiment results against phase targets
-                try:
-                    final_metrics = execute_result.get("final_metrics") or {}
-                except Exception as e:
-                    logger.debug(f"Phase status update skipped: {e}")
-                self._record_cycle_outcome(think_result, execute_result, reflect_result,
-                                            verify_report_dict=verify_report.to_dict())
-
-                # Post-reflect code review: learn from mistakes
-
-                # Only count as meaningful cycle if experiment was launched or progress was made
-                if execute_result.get("experiment_launched") or reflect_result.get("milestone"):
-                    self._save_cycle_counter()
-
-                # AUTO CODE-CLEANUP: Check trigger conditions after each cycle
-                self._gc.run()  # Phase 2: deterministic GC
-
-                # AUDIT ESCALATION: Check if VERIFY failures are recurring
-                audit_issues = [
-                    f"[{c.category}] {c.name}: {c.detail}"
-                    for c in verify_report.all_failures
-                ]
-                # SMART CIRCUIT BREAKER: If pre-verify AND verify both have
-                # critical failures, force paper_research next cycle instead
-                # of repeating the same failed experiment pattern.
-                if (
-                    critical_pre_issues
-                    and verify_report.critical_failures
-                    and self._no_progress_streak >= 2
-                ):
-                    reason = (
-                        f"SMART CIRCUIT BREAKER: Pre-verify AND verify both have critical "
-                        f"failures for {self._no_progress_streak} consecutive cycles. "
-                        f"Forcing paper research to find new approaches."
-                    )
-                    logger.warning(reason)
-                    self.memory.log_decision(reason)
-                    # Write a directive for the next cycle to do paper research
-                    directive_path = self.workspace / "DIRECTIVE.md"
-                    directive_path.write_text(
-                        f"🔴 CIRCUIT BREAKER TRIGGERED\n\n"
-                        f"The agent has been stuck for {self._no_progress_streak} cycles "
-                        f"with critical infrastructure failures.\n\n"
-                        f"DO NOT attempt another experiment. Instead:\n"
-                        f"1. Read the current code and identify ALL issues\n"
-                        f"2. Read MEMORY_LOG.md for dead ends and active problems\n"
-                        f"3. Search for papers on the specific failing component\n"
-                        f"4. Write a comprehensive diagnosis to workspace/diagnosis.md\n"
-                    )
-
-            except Exception as e:
-                err_msg = str(e)
-                logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
-                # Direct file write (bypasses logger buffering) for crash diagnosis
-                import traceback as _tb
-                try:
-                    crash_path = self.workspace / "last_crash.txt"
-                    crash_path.write_text(
-                        f"Cycle {self.cycle_count} crash:\n{_tb.format_exc()}\n",
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
-                self.memory.log_decision(f"Cycle {self.cycle_count} error: {err_msg[:200]}")
-                self._update_state(
-                    {
-                        "cycle": self.cycle_count,
-                        "status": "error",
-                        "updated_at": time.time(),
-                        "last_error": err_msg[:500],
-                    }
-                )
-                # v12.1: Don't backoff for quota errors — retrying won't help
-                is_quota_error = (
-                    "insufficient_quota" in err_msg
-                    or "quota" in err_msg.lower()
-                )
-                if is_quota_error:
-                    logger.warning(
-                        f"API quota exhausted — pausing for 30 min before retry. "
-                        f"Cycle state preserved for resumption."
-                    )
-                    # Save cycle state for resumption
-                    self._save_cycle_counter()
-                    # Quota recovery: wait longer (30 min) then retry instead of giving up
-                    self._update_state({
-                        "cycle": self.cycle_count,
-                        "status": "quota_recovery",
-                        "updated_at": time.time(),
-                        "last_error": err_msg[:500],
-                    })
-                    time.sleep(1800)  # 30 min cooldown for quota recovery
-                    continue  # Retry the cycle instead of breaking
-
+        finally:
+            if self.tools:
+                self.tools.shutdown()
+            if self._workspace_lock:
+                self._workspace_lock.release()
+                self._workspace_lock = None
         logger.info("AutoResearcher stopped.")
 
     def _think(self, directive: str = "") -> dict:
@@ -714,11 +744,13 @@ class ResearchLoop(DomainKnowledgeMixin):
         # ToolRegistry._exec_launch_experiment starts the process but doesn't register it
         # with the monitor, so we manually register here.
         state = self._load_state()
+        process = self.tools.get_launched_process(pid) if self.tools else None
         self.monitor.register_experiment(
             pid=pid,
             log_file=log_file,
             command=execute_result.get("tool_trace", {}).get("launch_facts", {}).get("command", ""),
             start_time=state.get("started_at"),
+            process=process,
         )
 
         start_time = state.get("started_at")
@@ -729,6 +761,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             log_file=log_file,
             notify=self.config.get("monitor", {}).get("notify_on_complete", True),
             start_time=start_time,
+            process=process,
         )
 
     def _verify(self, cycle: int, think_result: dict, execute_result: dict):
@@ -977,7 +1010,11 @@ class ResearchLoop(DomainKnowledgeMixin):
         if result.get("decision"):
             self.memory.log_decision(result["decision"])
         if result.get("dead_end"):
-            self.memory.log_dead_end(result["dead_end"])
+            self.memory.log_dead_end(
+                result["dead_end"],
+                cycle=self.cycle_count,
+                failure_category=result.get("failure_category", ""),
+            )
         if result.get("active_problem"):
             self.memory.log_active_problem(result["active_problem"])
 
@@ -1074,7 +1111,13 @@ class ResearchLoop(DomainKnowledgeMixin):
 
 
     def _update_launch_counter(self, execute_result: dict):
-        """Update the consecutive-failed-launch counter after EXECUTE."""
+        """Update the consecutive-failed-launch counter after EXECUTE.
+
+        Persists to state.json so daemon restarts don't lose the streak.
+        After 2 failures, records an advisory for the next THINK. After 3,
+        pauses the loop for human intervention (runtime-safety fuse, not a
+        research-direction override — system-as-referee is preserved).
+        """
         if execute_result.get("experiment_launched"):
             self._consecutive_failed_launches = 0
         elif execute_result.get("convergence_failed") or \
@@ -1083,6 +1126,62 @@ class ResearchLoop(DomainKnowledgeMixin):
                  and not execute_result.get("experiment_launched")):
             self._consecutive_failed_launches += 1
 
+        self._update_state({
+            "consecutive_failed_launches": self._consecutive_failed_launches,
+        })
+
+        if self._consecutive_failed_launches == 2:
+            advisory = (
+                "LAUNCH ADVISORY: 2 consecutive failed launches. "
+                "The next THINK must prioritize fixing the launch path."
+            )
+            logger.warning(advisory)
+            self.memory.log_decision(advisory)
+        elif self._consecutive_failed_launches >= 3:
+            logger.error(
+                f"PAUSE-HUMAN: {self._consecutive_failed_launches} consecutive "
+                f"failed launches. Stopping to prevent burning more quota."
+            )
+            self._update_state({
+                "status": "pause_human",
+                "pause_reason": f"{self._consecutive_failed_launches} consecutive failed launches",
+            })
+            self._running = False
+
+
+    def _check_all_goals_achieved(self) -> bool:
+        """Return True if all configured goals have been achieved.
+
+        Fail-safe: returns False (don't stop) when goals are empty,
+        stop_on_achieved is false, or any goal lacks a finite value.
+        """
+        goals_cfg = (self.config.get("goals", {}) or {})
+        if not goals_cfg.get("stop_on_achieved", False):
+            return False
+        specs = self._metric_specs
+        if not specs:
+            return False
+        # Read best metrics from DB for comparison
+        try:
+            history = self.memory.get_experiment_history(limit=200)
+        except Exception:
+            return False
+        if not history:
+            return False
+        for spec in specs:
+            achieved = False
+            for row in history:
+                try:
+                    m = json.loads(row.get("metrics_json", "{}") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                val = metric_value(m, spec.key)
+                if val is not None and goal_achieved(val, spec):
+                    achieved = True
+                    break
+            if not achieved:
+                return False
+        return True
 
     def _extract_method_name(self, think_result: dict) -> str:
         """Extract a short method label from the think_result for Pareto tracking.
@@ -1090,7 +1189,6 @@ class ResearchLoop(DomainKnowledgeMixin):
         Looks for known method keywords in the task/hypothesis text. Falls back
         to 'experiment' (not empty string) so the Pareto matrix is non-degenerate.
         """
-        import re
         text = (think_result.get("task", "") + " " + think_result.get("hypothesis", "")).lower()
         # Common ML/architecture method keywords
         method_keywords = [
@@ -1205,7 +1303,6 @@ class ResearchLoop(DomainKnowledgeMixin):
                         break
                     except (TypeError, ValueError):
                         continue
-        metric_keys = ()  # no longer used
         # System deterministically writes a quantitative result line to
         # MEMORY_LOG.md. Previously, quantitative results (val_MAE=0.184)
         # only existed in SQLite but never reached MEMORY_LOG (the LLM's
@@ -1256,24 +1353,23 @@ class ResearchLoop(DomainKnowledgeMixin):
             except Exception as e:
                 logger.debug(f"Structured metric record skipped: {e}")
 
-        # ── Fix 1: Output quality awareness ──
+        # ── Fix 1: Output quality awareness (canonical lowercase keys) ──
         # Detect domain-specific degradation (e.g., one domain's metric much worse than overall)
         domain_metrics = {}
-        for key in final_metrics:
-            if key.startswith("MAE_"):
+        cfinal = canonicalize_metrics(final_metrics)
+        for ckey, cval in cfinal.items():
+            if is_domain_metric(ckey):
                 try:
-                    domain_metrics[key] = float(final_metrics[key])
+                    domain_metrics[ckey] = float(cval)
                 except (TypeError, ValueError):
                     pass
 
-        quality_degraded = False
         for domain_key, domain_val in domain_metrics.items():
             if domain_key in self._best_domain_metrics:
                 best_val = self._best_domain_metrics[domain_key]
                 # Degradation: > 10% worse than best for that domain
                 # Only flag if best_val > 0.01 to avoid false positives near zero
                 if best_val > 0.01 and domain_val > best_val * 1.10:
-                    quality_degraded = True
                     logger.warning(
                         f"QUALITY DEGRADATION: {domain_key} = {_ff(domain_val)} "
                         f"vs best = {_ff(best_val)} ({(float(domain_val)/float(best_val) - 1)*100:.1f}% worse)"
@@ -1290,7 +1386,7 @@ class ResearchLoop(DomainKnowledgeMixin):
             method_name = self._extract_method_name(think_result)
             exp_type = "pilot" if think_result.get("pilot_experiment") else "full"
             for dk, dv in domain_metrics.items():
-                domain_name = dk.replace("MAE_", "")
+                domain_name = domain_name_from_metric(dk)
                 try:
                     self.memory.record_pareto_entry(
                         cycle=self.cycle_count,
@@ -1323,25 +1419,41 @@ class ResearchLoop(DomainKnowledgeMixin):
             self._architecture_survey_done = True
             logger.info("ARCHITECTURE SURVEY completed — survey file detected.")
 
-        # ── Metric tracking (existing logic) ──
+        # ── Metric tracking (direction-aware via metrics.py) ──
         if current_metric is not None:
             if not math.isfinite(current_metric):
                 logger.warning(f"METRIC INVALID: {current_metric} — skipping metric tracking")
             else:
-                improvement_threshold = 0.005  # v16.1: hardcoded (AdaptiveThresholds removed)
-                if current_metric < (self._best_metric_ever * (1 + improvement_threshold)):
-                    if current_metric < self._best_metric_ever:
-                        logger.info(
-                            f"METRIC IMPROVEMENT: {current_metric:.4f} < "
-                            f"prev_best={self._best_metric_ever:.4f}"
-                        )
-                    self._best_metric_ever = min(self._best_metric_ever, current_metric)
+                # Determine direction: prefer config goal for the matched key,
+                # default to "lower" for unknown metrics (back-compat with MAE).
+                direction = "lower"
+                if self._metric_specs:
+                    matched_spec = None
+                    cfinal = canonicalize_metrics(final_metrics)
+                    for spec in self._metric_specs:
+                        if metric_value(final_metrics, spec.key) is not None:
+                            matched_spec = spec
+                            break
+                    if matched_spec:
+                        direction = matched_spec.direction
+                improvement_threshold = 0.005
+                old_best = self._best_metrics.get(direction, None)
+                if old_best is None:
+                    old_best = float("inf") if direction == "lower" else float("-inf")
+                improved = metric_improved(current_metric, old_best, direction, improvement_threshold)
+                if improved:
+                    new_best = best_metric(old_best, current_metric, direction)
+                    self._best_metrics[direction] = new_best
+                    # Keep _best_metric_ever as lower-direction back-compat
+                    if direction == "lower":
+                        self._best_metric_ever = min(self._best_metric_ever, current_metric)
                     self._metric_no_progress_streak = 0
+                    logger.info(f"METRIC IMPROVEMENT: {current_metric:.4f} dir={direction}")
                 else:
                     self._metric_no_progress_streak += 1
                     logger.info(
-                        f"METRIC NO PROGRESS: {current_metric:.4f} >= "
-                        f"best={self._best_metric_ever:.4f} (streak={self._metric_no_progress_streak})"
+                        f"METRIC NO PROGRESS: {current_metric:.4f} "
+                        f"dir={direction} streak={self._metric_no_progress_streak}"
                     )
         elif made_progress:
             pass
@@ -1360,12 +1472,22 @@ class ResearchLoop(DomainKnowledgeMixin):
     def _load_cycle_counter(self) -> int:
         counter_file = self.workspace / ".cycle_counter"
         if counter_file.exists():
-            return int(counter_file.read_text().strip())
+            try:
+                return int(counter_file.read_text().strip())
+            except (ValueError, OSError) as e:
+                logger.warning(f"Corrupt cycle counter ({e}); recovering from DB")
+                try:
+                    history = self.memory.get_experiment_history(limit=1)
+                    if history:
+                        return int(history[0].get("cycle", 0))
+                except Exception:
+                    pass
+                return 0
         return 0
 
     def _save_cycle_counter(self):
         counter_file = self.workspace / ".cycle_counter"
-        counter_file.write_text(str(self.cycle_count))
+        atomic_write_text(counter_file, str(self.cycle_count))
 
     def _load_state(self) -> dict:
         if self.state_path.exists():
@@ -1380,9 +1502,7 @@ class ResearchLoop(DomainKnowledgeMixin):
         state.update(updates)
         # Atomic write: write to temp file first, then rename
         # This prevents state.json corruption if the process crashes mid-write
-        tmp_path = self.state_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(state, indent=2))
-        tmp_path.replace(self.state_path)
+        atomic_write_text(self.state_path, json.dumps(state, indent=2))
 
     def _handle_signal(self, signum, frame):
         logger.info(f"Received signal {signum}. Initiating graceful shutdown.")

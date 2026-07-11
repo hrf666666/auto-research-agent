@@ -15,7 +15,6 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 
 from core.loop import ResearchLoop
 
@@ -39,7 +38,13 @@ def _make_loop(tmp_workspace: Path) -> ResearchLoop:
     loop.memory = MagicMock()
     loop.memory.log_milestone = MagicMock()
     loop.memory.record_cycle_outcome = MagicMock()
+    loop.memory.get_experiment_history = MagicMock(return_value=[])
     loop._consecutive_failed_launches = 0  # Phase 4 will add this; 0 = absent
+    loop._running = True
+    loop.state_path = tmp_workspace / "state.json"
+    loop._metric_specs = []
+    loop._best_metrics = {}
+    loop._update_state = MagicMock()
     return loop
 
 

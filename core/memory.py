@@ -15,7 +15,6 @@ import json
 import sqlite3
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("autoresearcher.memory")
 
@@ -152,7 +151,8 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
                     entry_type TEXT NOT NULL,  -- milestone, decision, dead_end, active_problem, major_event
                     content TEXT NOT NULL,
                     cycle INTEGER,
-                    in_llm_context INTEGER NOT NULL DEFAULT 0
+                    in_llm_context INTEGER NOT NULL DEFAULT 0,
+                    failure_category TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_entry_type ON memory_entries(entry_type);
@@ -219,6 +219,13 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
                 CREATE INDEX IF NOT EXISTS idx_lesson_severity ON code_review_lessons(severity);
                 CREATE INDEX IF NOT EXISTS idx_lesson_category ON code_review_lessons(category);
             """)
+            self._migrate_db(conn)
+
+    def _migrate_db(self, conn):
+        """Apply additive SQLite migrations for existing workspaces."""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memory_entries)").fetchall()}
+        if "failure_category" not in cols:
+            conn.execute("ALTER TABLE memory_entries ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''")
 
     def record_cycle_outcome(self, cycle: int, think_result: dict,
                               execute_result: dict, reflect_result: dict,
@@ -269,13 +276,15 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
                 (execute_result.get("response") or "")[:500],
             ))
 
-    def _record_memory_entry(self, entry_type: str, content: str, cycle: int = None):
+    def _record_memory_entry(self, entry_type: str, content: str, cycle: int = None,
+                             failure_category: str = ""):
         """Record a memory entry to SQLite."""
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("""
-                INSERT INTO memory_entries (timestamp, entry_type, content, cycle, in_llm_context)
-                VALUES (?, ?, ?, ?, 1)
-            """, (time.time(), entry_type, content, cycle))
+                INSERT INTO memory_entries
+                    (timestamp, entry_type, content, cycle, in_llm_context, failure_category)
+                VALUES (?, ?, ?, ?, 1, ?)
+            """, (time.time(), entry_type, content, cycle, failure_category or ""))
 
     def get_experiment_history(self, limit: int = 20) -> list[dict]:
         """Get recent experiment history from SQLite."""
@@ -576,26 +585,6 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
         except Exception:
             return []
 
-    def _query_best(self, conn, metric_key: str) -> float | None:
-        """Query best metric value for a specific key from metrics_json."""
-        best = None
-        rows = conn.execute(
-            "SELECT metrics_json FROM experiments WHERE metrics_json IS NOT NULL"
-        ).fetchall()
-        for (mj,) in rows:
-            try:
-                d = json.loads(mj) if isinstance(mj, str) else mj
-                if isinstance(d, dict) and metric_key in d:
-                    try:
-                        v = float(d[metric_key])
-                        if best is None or v < best:
-                            best = v
-                    except (ValueError, TypeError):
-                        continue
-            except (json.JSONDecodeError, TypeError):
-                continue
-        return best
-
     def get_method_domain_effect_matrix(self) -> dict:
         """Build method→domain→effect matrix from structured data.
 
@@ -619,7 +608,6 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
             """).fetchall()
 
             # Extract method names from hypothesis text
-            import re
             method_keywords = self.method_keywords
             domain_keys = self.domain_keys
 
@@ -797,23 +785,10 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
         else:
             tagged_entry = f"[{timestamp}] {entry}"
         sections["dead_ends"].append(tagged_entry)
-        # Record to SQLite with category
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""
-                INSERT INTO memory_entries (timestamp, entry_type, content, cycle, in_llm_context)
-                VALUES (?, ?, ?, ?, 1)
-            """, (time.time(), "dead_end", tagged_entry, cycle))
-            # Also update category if column exists (v12 migration)
-            try:
-                conn.execute("""
-                    ALTER TABLE memory_entries ADD COLUMN failure_category TEXT NOT NULL DEFAULT ''
-                """)
-            except Exception:
-                pass  # Column already exists
-            if failure_category:
-                conn.execute("""
-                    UPDATE memory_entries SET failure_category = ? WHERE content = ? AND entry_type = 'dead_end'
-                """, (failure_category, tagged_entry))
+        valid_categories = {"hypothesis_wrong", "implementation_bug",
+                            "insufficient_experiment", "method_inadequacy", "unknown"}
+        category = failure_category if failure_category in valid_categories else ""
+        self._record_memory_entry("dead_end", tagged_entry, cycle, failure_category=category)
         self._write_log(sections)
 
     def log_active_problem(self, entry: str, cycle: int = None):
@@ -822,37 +797,6 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
         timestamp = time.strftime("%m-%d %H:%M")
         sections["active_problems"].append(f"[{timestamp}] {entry}")
         self._record_memory_entry("active_problem", entry, cycle)
-        self._write_log(sections)
-
-    def log_major_event(self, entry: str, cycle: int = None):
-        """Log a major research event (e.g., paper research breakthrough, paradigm shift).
-
-        Major events are stored in milestones (which are preserved during compaction)
-        AND duplicated into decisions with a ★ prefix for easy scanning.
-        This ensures they are never lost even if decisions are trimmed.
-        """
-        sections = self._parse_log()
-        timestamp = time.strftime("%m-%d %H:%M")
-        # Add to milestones — these are preserved during compaction
-        sections["milestones"].append(f"★ [{timestamp}] PAPER_RESEARCH: {entry}")
-        # Also add to decisions for visibility, with ★ prefix
-        sections["decisions"].append(f"★ [{timestamp}] PAPER_RESEARCH: {entry}")
-        # Record to SQLite
-        self._record_memory_entry("major_event", f"PAPER_RESEARCH: {entry}", cycle)
-
-        # Routine decisions are trimmed, but ★-prefixed major events are preserved
-        if len(sections["decisions"]) > self.max_recent:
-            # Keep recent major events (★) + the most recent routine decisions
-            major = [d for d in sections["decisions"] if d.startswith("★")]
-            routine = [d for d in sections["decisions"] if not d.startswith("★")]
-            # Cap major events to half of budget, routine gets the rest
-            max_major = max(self.max_recent // 2, 3)
-            if len(major) > max_major:
-                major = major[-max_major:]  # Keep only the most recent major events
-            remaining = max(0, self.max_recent - len(major))
-            routine = routine[-remaining:]
-            sections["decisions"] = major + routine
-
         self._write_log(sections)
 
     # ─────────────────────────────────────────────────
@@ -944,37 +888,6 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
 
             scored.sort(key=lambda x: x["_relevance_score"], reverse=True)
             return scored[:limit]
-
-    def format_lessons_for_context(self, lessons: list[dict], max_chars: int = 2000) -> str:
-        """Format lessons as a compact string for LLM context injection."""
-        if not lessons:
-            return ""
-
-        lines = ["## Code Review Lessons (PAST MISTAKES TO AVOID)", ""]
-        used = len(lines[0]) + len(lines[1])
-
-        for lesson in lessons:
-            sev = lesson.get("severity", "MEDIUM")
-            hits = lesson.get("hit_count", 1)
-            pattern = lesson.get("pattern", "?")
-            desc = lesson.get("description", "")
-            fix = lesson.get("fix_suggestion", "")
-
-            entry = f"- [{sev}] (hit {hits}x) **{pattern}**: {desc[:200]}"
-            if fix:
-                entry += f" → Fix: {fix[:150]}"
-
-            if used + len(entry) > max_chars:
-                break
-            lines.append(entry)
-            used += len(entry)
-
-        lines.append("")
-        lines.append(
-            "**IMPORTANT**: These are mistakes the agent has made before. "
-            "Check the current code for these patterns BEFORE writing any code."
-        )
-        return "\n".join(lines)
 
     def _init_log(self):
         """Create initial empty memory log."""
@@ -1090,12 +1003,6 @@ CREATE INDEX IF NOT EXISTS idx_cycle ON experiments(cycle);
         from core.fact_scanner import scan_all
 
         return scan_all(self.project_dir, self.db_path, rescan=rescan)
-
-    def get_experiment_facts(self, limit: int = 20) -> list[dict]:
-        """Retrieve experiment facts (newest scan first). For THINK context + gates."""
-        from core.fact_scanner import get_all_facts
-
-        return get_all_facts(self.db_path)[:limit]
 
     def get_fact_for_output_dir(self, output_dir: str) -> dict | None:
         """Retrieve the fact record for a specific experiment output_dir."""

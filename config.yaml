@@ -6,7 +6,7 @@ project:
   brief: "PROJECT_BRIEF.md"
   workspace: "."
 
-# v18 Phase 4: goal definitions (config-driven, replaces hardcoded val_MAE)
+# Goal definitions (config-driven targets)
 goals:
   metrics:
     - key: "val_MAE"
@@ -15,16 +15,14 @@ goals:
   stop_on_achieved: true
 
 agent:
-  # Provider: "anthropic" | "openai" | "qwen" | "ali_token_plan" | "glm_token_plan"
+  # Provider: "glm_token_plan" | "ali_token_plan" | "anthropic" | "openai"
+  #   glm_token_plan: Zhipu GLM Coding Plan (requires GLM_CODING_PLAN_API_KEY) — DEFAULT
+  #   ali_token_plan: Aliyun Token Plan for code agents (requires ALI_TOKEN_PLAN_API_KEY)
   #   anthropic:      Anthropic Claude (requires ANTHROPIC_API_KEY)
   #   openai:         OpenAI Codex/GPT  (requires OPENAI_API_KEY)
-  #   qwen:           Aliyun DashScope  (requires ALI_API_KEY)
-  #   ali_token_plan: Aliyun Token Plan for code agents (requires ALI_TOKEN_PLAN_API_KEY)
   #                   strong: qwen3.6-plus | fast: deepseek-v3.2
   #   glm_token_plan: Zhipu GLM Coding Plan (requires GLM_CODING_PLAN_API_KEY)
-  #                   Primary: strong=glm-5.1 (thinking auto-enabled), fast=glm-5
-  #                   NOTE: glm-5.2 returns 403 (code 1220) on standard Coding Plan
-  #                   tiers as of 2026-06; using glm-5.1 as strong until authorized.
+  #                   Primary: strong=glm-5.2 (thinking auto-enabled), fast=glm-5
   #                   Auto-failover: if primary fails, switches to ali_token_plan
   provider: "glm_token_plan"
 
@@ -34,7 +32,7 @@ agent:
   #   - Explicit model name: use that model for ALL tasks (overrides tier logic)
   #
   # Per-provider models:
-  #   glm_token_plan: glm-5.1 (strong, thinking) | glm-5 (fast) | glm-5-turbo | glm-4.7 | glm-4.6 | glm-4.5
+  #   glm_token_plan: glm-5.2 (strong, thinking) | glm-5 (fast) | glm-5.1 | glm-5-turbo | glm-4.7 | glm-4.6 | glm-4.5
   #   ali_token_plan: qwen3.6-plus (all tasks) | deepseek-v3.2 | glm-5 | MiniMax-M2.5
   #   anthropic:      claude-sonnet-4-6 (fast) | claude-opus-4-6 (strongest)
   #   openai:         codex-5.3 (fast)         | gpt-5.4 (strongest)
@@ -61,6 +59,9 @@ monitor:
   max_runtime_hours: 12           # Hard timeout: kill experiments exceeding 12 hours
   zero_llm: true                  # No LLM calls during monitoring
   notify_on_complete: true        # Log notification on experiment completion
+
+safety:
+  mandatory_dry_run: true         # Always dry-run before real training
 
 experiment:
   max_parallel: 1                 # Max concurrent experiments
@@ -108,17 +109,3 @@ multimodal_mcp:
 # Auto-detected at runtime. Only used when GLM key is available.
 # Provides specialized visual understanding tools via MCP protocol.
 # No manual configuration needed — endpoints are resolved by provider detection.
-
-# Safety — Phase 2: tool-level safety contracts (P1)
-# These are enforced INSIDE the tools (write_file, launch_experiment),
-# not by an external guard layer.
-safety:
-  mandatory_dry_run: false     # When true, launch_experiment requires recent dry-run
-  naming:
-    train_scripts_dir: "scripts/"
-    tools_dir: "tools/"
-    forbidden_root_py: true    # Block .py files in workspace root
-  garbage_collection:
-    temp_patterns: ["debug_", "diag_", "_check_", "dryrun_", "dry_run_"]
-    max_output_dirs: 10
-    archive_dir: "archive/temp/"

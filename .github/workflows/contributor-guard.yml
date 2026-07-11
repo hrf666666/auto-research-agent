@@ -1,0 +1,61 @@
+name: Contributor Guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-contributor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify commit authors
+        run: |
+          ALLOWED_NAME="Huang Ruifeng"
+          ALLOWED_EMAIL="hrf666666@users.noreply.github.com"
+
+          # Get all commits in this push/PR
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COMMITS=$(git rev-list origin/main..HEAD)
+          else
+            COMMITS=$(git rev-list ${{ github.event.before }}..${{ github.event.after }})
+          fi
+
+          for sha in $COMMITS; do
+            author_name=$(git show -s --format='%an' "$sha")
+            author_email=$(git show -s --format='%ae' "$sha")
+            message=$(git show -s --format='%B' "$sha")
+
+            echo "Checking commit $sha:"
+            echo "  author: $author_name <$author_email>"
+
+            if [ "$author_name" != "$ALLOWED_NAME" ]; then
+              echo "::error::Commit $sha has author '$author_name', expected '$ALLOWED_NAME'"
+              exit 1
+            fi
+
+            if [ "$author_email" != "$ALLOWED_EMAIL" ]; then
+              echo "::error::Commit $sha has email '$author_email', expected '$ALLOWED_EMAIL'"
+              exit 1
+            fi
+
+            if printf '%s\n' "$message" | grep -qiE '^Co-Authored-By:'; then
+              echo "::error::Commit $sha contains forbidden Co-Authored-By trailer"
+              exit 1
+            fi
+
+            if printf '%s\n' "$message" | grep -qiE '\b(claude|anthropic|openai|gpt-[0-9]|copilot|cursor|codex)\b'; then
+              echo "::error::Commit $sha contains forbidden AI assistant name in message"
+              exit 1
+            fi
+
+            echo "  OK"
+          done
+
+          echo "All commits passed contributor guard."

@@ -14,7 +14,6 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -164,7 +163,7 @@ class TestActionGatingBoundary:
     def _make_verdict(self, criteria_met, claim_type, marked_inconclusive):
         """Build a MethodologyVerdict with specific gate results."""
         from core.methodology_gates import (
-            FalsificationResult, ControlCoverageResult, DeadEndResult
+            FalsificationResult, ControlCoverageResult
         )
         v = MethodologyVerdict()
         v.falsification = FalsificationResult(

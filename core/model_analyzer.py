@@ -97,7 +97,6 @@ class ModelAnalyzerMixin:
         Enhanced to handle custom class instantiation (e.g., self.fft_branch = AngularFFTBranch(out_channels=32))
         by tracing into the custom class definition to find the final output channel count.
         """
-        import ast
 
         branches = {}
         # Build a lookup of class definitions in the same file for tracing custom classes
@@ -650,7 +649,6 @@ class ModelAnalyzerMixin:
         3. Depth vs width — is the model too deep or too wide for the data?
         4. Overall structural score
         """
-        import ast
 
         soundness = {
             "score": 10,  # Start at 10, deduct for issues

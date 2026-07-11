@@ -130,7 +130,6 @@ class TestQuotaCooldownBehavior:
         monkeypatch.setattr(AgentDispatcher, "_call_openai_compatible", fake_call)
 
         # Both providers will quota-fail; _call_llm should raise RuntimeError.
-        import os
         monkeypatch.setenv("GLM_CODING_PLAN_API_KEY", "fake")
         monkeypatch.setenv("ALI_TOKEN_PLAN_API_KEY", "fake")
 
